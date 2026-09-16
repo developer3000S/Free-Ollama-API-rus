@@ -1537,7 +1537,15 @@ async function runDiscovery() {
   toast('Запуск сканирования через API поисковых сервисов...', 'info');
   try {
     const data = await API.post('/admin/discovery/run');
-    toast(`Discovery завершён: найдено новых: ${data.created || 0}, дедуплицировано: ${data.deduped || 0}`, 'success');
+    let summary = `Discovery: новых: ${data.created || 0}, дедуплицировано: ${data.deduped || 0}`;
+    if (data.source_stats) {
+      const parts = Object.entries(data.source_stats).map(([k, v]) => {
+        if (v.error) return `${k}: (${v.error})`;
+        return `${k}: +${v.count}`;
+      });
+      if (parts.length) summary += ` [${parts.join(' | ')}]`;
+    }
+    toast(summary, data.created > 0 ? 'success' : 'info');
     if (currentPage === 'discovery') renderDiscovery($('#content'));
   } catch (e) { toast(e.message, 'error'); }
 }

@@ -647,6 +647,7 @@ async function fetchFromCensys(): Promise<{ items: DiscoveredRawItem[]; error?: 
   }
 
   const items: DiscoveredRawItem[] = [];
+  let lastError: string | undefined;
 
   // 1a. Try Censys v3 Platform Search Query
   try {
@@ -688,9 +689,16 @@ async function fetchFromCensys(): Promise<{ items: DiscoveredRawItem[]; error?: 
         });
       }
       if (items.length > 0) return { items };
+    } else {
+      let errMsg = `Censys status ${res.status}`;
+      try {
+        const errData = (await res.json()) as any;
+        if (errData.detail || errData.error) errMsg = `Censys: ${errData.detail || errData.error}`;
+      } catch (e) {}
+      lastError = errMsg;
     }
   } catch (e: any) {
-    // fallback to v2 if id+secret available
+    lastError = e.message;
   }
 
   // 1b. Fallback to Censys v2 Hosts API if apiId and apiSecret are available
@@ -721,13 +729,20 @@ async function fetchFromCensys(): Promise<{ items: DiscoveredRawItem[]; error?: 
             service_hint: 'ollama',
           });
         }
+      } else {
+        let errMsg = `Censys v2 status ${res.status}`;
+        try {
+          const errData = (await res.json()) as any;
+          if (errData.error || errData.message) errMsg = `Censys v2: ${errData.error || errData.message}`;
+        } catch (e) {}
+        lastError = errMsg;
       }
     } catch (e: any) {
       return { items, error: e.message };
     }
   }
 
-  return { items };
+  return { items, error: items.length > 0 ? undefined : lastError };
 }
 
 // 2. Shodan Search Engine
@@ -741,7 +756,12 @@ async function fetchFromShodan(): Promise<{ items: DiscoveredRawItem[]; error?: 
       signal: AbortSignal.timeout(12000),
     });
     if (!res.ok) {
-      return { items: [], error: `Shodan status ${res.status}` };
+      let errMsg = `Shodan status ${res.status}`;
+      try {
+        const errData = await res.json() as any;
+        if (errData.error) errMsg = `Shodan: ${errData.error}`;
+      } catch (e) {}
+      return { items: [], error: errMsg };
     }
     const data = (await res.json()) as any;
     const matches = data.matches || [];
@@ -781,7 +801,12 @@ async function fetchFromGreyNoise(): Promise<{ items: DiscoveredRawItem[]; error
       signal: AbortSignal.timeout(12000),
     });
     if (!res.ok) {
-      return { items: [], error: `GreyNoise status ${res.status}` };
+      let errMsg = `GreyNoise status ${res.status}`;
+      try {
+        const errData = await res.json() as any;
+        if (errData.message) errMsg = `GreyNoise: ${errData.message}`;
+      } catch (e) {}
+      return { items: [], error: errMsg };
     }
     const data = (await res.json()) as any;
     const records = data.data || [];
@@ -820,7 +845,12 @@ async function fetchFromZoomEye(): Promise<{ items: DiscoveredRawItem[]; error?:
       signal: AbortSignal.timeout(12000),
     });
     if (!res.ok) {
-      return { items: [], error: `ZoomEye status ${res.status}` };
+      let errMsg = `ZoomEye status ${res.status}`;
+      try {
+        const errData = await res.json() as any;
+        if (errData.message) errMsg = `ZoomEye: ${errData.message}`;
+      } catch (e) {}
+      return { items: [], error: errMsg };
     }
     const data = (await res.json()) as any;
     const matches = data.matches || [];
@@ -884,14 +914,57 @@ async function fetchFromCriminalIP(): Promise<{ items: DiscoveredRawItem[]; erro
   }
 }
 
-// 6. Natlas Search Engine
-async function fetchFromNatlas(): Promise<{ items: DiscoveredRawItem[]; error?: string }> {
-  const endpoint = process.env.NATLAS_API_ENDPOINT;
-  const apiKey = process.env.NATLAS_API_KEY;
-  if (!endpoint || !apiKey) return { items: [] };
+// 6. Netlas / Natlas Search Engine
+async function fetchFromNatlas(): Promise<{ items: DiscoveredRawItem[]; error?: string; source_name?: string }> {
+  const endpoint = process.env.NATLAS_API_ENDPOINT || process.env.NETLAS_API_ENDPOINT || 'https://app.netlas.io/api/';
+  const apiKey = process.env.NATLAS_API_KEY || process.env.NETLAS_API_KEY;
+  if (!apiKey) return { items: [] };
+
+  const cleanUrl = endpoint.replace(/\/$/, '');
+  const isNetlas = cleanUrl.includes('netlas.io') || cleanUrl.includes('netlas');
+
+  if (isNetlas) {
+    try {
+      const res = await fetch(`${cleanUrl}/responses/?q=port:11434&start=0`, {
+        headers: {
+          'X-Api-Key': apiKey,
+          'Accept': 'application/json',
+        },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) {
+        return { items: [], error: `Netlas status ${res.status}`, source_name: 'netlas' };
+      }
+      const data = (await res.json()) as any;
+      const list = data.items || [];
+      const items: DiscoveredRawItem[] = [];
+      for (const item of list) {
+        const d = item.data;
+        if (!d || !d.ip) continue;
+        const dns: string[] = [];
+        if (d.host) dns.push(d.host);
+        if (d.domain && !dns.includes(d.domain)) dns.push(d.domain);
+        if (d.ptr && !dns.includes(d.ptr)) dns.push(d.ptr);
+        const asnNum = d.whois?.asn?.number?.[0] || d.asn;
+        items.push({
+          ip: d.ip,
+          port: d.port || 11434,
+          protocol: d.prot4 || d.protocol || 'tcp',
+          dns_names: dns,
+          country: d.geo?.country || d.country || 'US',
+          asn: asnNum ? `AS${asnNum}` : undefined,
+          source: 'netlas',
+          service_hint: 'ollama',
+          banner: d.http?.body ? String(d.http.body).slice(0, 200) : undefined,
+        });
+      }
+      return { items, source_name: 'netlas' };
+    } catch (e: any) {
+      return { items: [], error: e.message, source_name: 'netlas' };
+    }
+  }
 
   try {
-    const cleanUrl = endpoint.replace(/\/$/, '');
     const res = await fetch(`${cleanUrl}/api/v1/search?query=port:11434`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -900,7 +973,7 @@ async function fetchFromNatlas(): Promise<{ items: DiscoveredRawItem[]; error?: 
       signal: AbortSignal.timeout(12000),
     });
     if (!res.ok) {
-      return { items: [], error: `Natlas status ${res.status}` };
+      return { items: [], error: `Natlas status ${res.status}`, source_name: 'natlas' };
     }
     const data = (await res.json()) as any;
     const results = data.results || [];
@@ -918,15 +991,18 @@ async function fetchFromNatlas(): Promise<{ items: DiscoveredRawItem[]; error?: 
         service_hint: 'ollama',
       });
     }
-    return { items };
+    return { items, source_name: 'natlas' };
   } catch (e: any) {
-    return { items: [], error: e.message };
+    return { items: [], error: e.message, source_name: 'natlas' };
   }
 }
 
 // Discovery Engine Sources Status
 app.get('/admin/discovery/sources', adminAuth, (req, res) => {
   reloadEnv();
+  const natlasUrl = process.env.NATLAS_API_ENDPOINT || process.env.NETLAS_API_ENDPOINT || '';
+  const isNetlas = natlasUrl.includes('netlas.io') || natlasUrl.includes('netlas');
+
   const sources = [
     {
       id: 'censys',
@@ -960,9 +1036,9 @@ app.get('/admin/discovery/sources', adminAuth, (req, res) => {
     },
     {
       id: 'natlas',
-      name: 'Natlas Custom Crawler',
-      configured: !!(process.env.NATLAS_API_ENDPOINT && process.env.NATLAS_API_KEY),
-      query: 'port:11434',
+      name: isNetlas ? 'Netlas Responses API' : 'Natlas Crawler',
+      configured: !!((process.env.NATLAS_API_ENDPOINT || process.env.NETLAS_API_ENDPOINT) && (process.env.NATLAS_API_KEY || process.env.NETLAS_API_KEY)),
+      query: isNetlas ? 'port:11434 (Netlas search)' : 'port:11434',
     },
   ];
   res.json({ sources });
@@ -1019,7 +1095,12 @@ app.post('/admin/discovery/run', adminAuth, async (req, res) => {
   if (process.env.GREYNOISE_API_KEY) configuredSources.push('greynoise');
   if (process.env.ZOOMEYE_API_KEY) configuredSources.push('zoomeye');
   if (process.env.CRIMINAL_IP_API_KEY) configuredSources.push('criminal_ip');
-  if (process.env.NATLAS_API_ENDPOINT && process.env.NATLAS_API_KEY) configuredSources.push('natlas');
+  if (
+    (process.env.NATLAS_API_ENDPOINT || process.env.NETLAS_API_ENDPOINT || process.env.NETLAS_API_KEY) &&
+    (process.env.NATLAS_API_KEY || process.env.NETLAS_API_KEY)
+  ) {
+    configuredSources.push('natlas');
+  }
 
   const rawResults: DiscoveredRawItem[] = [];
   const sourceStats: Record<string, { count: number; error?: string }> = {};
