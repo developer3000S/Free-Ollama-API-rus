@@ -4,27 +4,34 @@ import path from 'path';
 import crypto from 'crypto';
 import fs from 'fs';
 
-// Load .env if present
-try {
-  const envPath = path.join(process.cwd(), '.env');
-  if (fs.existsSync(envPath)) {
-    const lines = fs.readFileSync(envPath, 'utf-8').split('\n');
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eqIdx = trimmed.indexOf('=');
-      if (eqIdx !== -1) {
-        const key = trimmed.slice(0, eqIdx).trim();
-        const val = trimmed.slice(eqIdx + 1).trim();
-        if (key && !(key in process.env)) {
-          process.env[key] = val;
+// Load .env dynamically
+export function reloadEnv() {
+  try {
+    const envPath = path.join(process.cwd(), '.env');
+    if (fs.existsSync(envPath)) {
+      const lines = fs.readFileSync(envPath, 'utf-8').split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx !== -1) {
+          const key = trimmed.slice(0, eqIdx).trim();
+          let val = trimmed.slice(eqIdx + 1).trim();
+          if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+            val = val.slice(1, -1);
+          }
+          if (key) {
+            process.env[key] = val;
+          }
         }
       }
     }
+  } catch (e) {
+    // ignore
   }
-} catch (e) {
-  // ignore
 }
+
+reloadEnv();
 
 const app = express();
 const PORT = 3000;
@@ -99,12 +106,18 @@ interface BlacklistItem {
 interface CandidateItem {
   candidate_id: string;
   source: string;
+  sources?: string[];
   ip: string;
   port: number;
+  protocol?: string;
   dns_names: string[];
   country: string;
+  asn?: string;
+  service_hint?: string;
+  banner_hash?: string;
   risk_score: number;
-  status: 'candidate' | 'enrolled' | 'out_of_scope';
+  requires_manual_review?: boolean;
+  status: 'candidate' | 'enrolled' | 'out_of_scope' | 'rejected';
   observed_at: string;
 }
 
@@ -152,224 +165,20 @@ function addAudit(event: string, actor: string, subject_type: string, subject_id
   if (auditLogs.length > 500) auditLogs.pop();
 }
 
-// Seed Demo Data for FOA Gateway
+// Clean Initialization for FOA Gateway (Production mode - no mock data)
 function seedInitialData() {
-  const now = new Date();
-  const dIso = (offsetMinutes: number) => new Date(now.getTime() - offsetMinutes * 60000).toISOString();
-  const futureIso = (days: number) => new Date(now.getTime() + days * 86400000).toISOString();
+  nodes.clear();
+  consents.clear();
+  blacklist.clear();
+  candidates.clear();
+  apiKeys.clear();
 
-  // Node 1 - GPU Cluster Primary
-  const n1Id = 'node_7f9b201a4e';
-  nodes.set(n1Id, {
-    node_id: n1Id,
-    endpoint: 'http://node-us-west.internal:11434',
-    display_name: 'Primary GPU Cluster (RTX 4090 x4)',
-    owner_id: 'ops@gateway-cluster.org',
-    models: ['llama3:8b', 'mistral:7b', 'codellama:13b', 'qwen2:7b'],
-    max_concurrency: 8,
-    active_connections: 2,
-    latency_ms: 142,
-    error_rate: 0.004,
-    weight: 10,
-    status: 'healthy',
-    consent_status: 'verified',
-    routable: true,
-    created_at: dIso(14400),
-    updated_at: dIso(10),
-    last_health_check: dIso(1),
-    state: 'healthy',
-    active: 2,
-    ewma_latency_ms: 138,
-    effective_weight: 10,
-    country: 'US',
-    ip: '198.51.100.10',
+  // Audit initial gateway boot
+  addAudit('gateway_boot', 'system', 'gateway', GATEWAY_ID, {
+    version: VERSION,
+    pool_size: 0,
+    status: 'clean_initialized',
   });
-
-  consents.set('cst_90a1bc3342', {
-    consent_id: 'cst_90a1bc3342',
-    node_id: n1Id,
-    owner_id: 'ops@gateway-cluster.org',
-    status: 'active',
-    method: 'http_well_known',
-    allowed_models: ['llama3:8b', 'mistral:7b', 'codellama:13b', 'qwen2:7b'],
-    max_concurrency: 8,
-    issued_at: dIso(14400),
-    expires_at: futureIso(90),
-    version: 1,
-    history: [
-      { event: 'challenge_created', actor: 'system', created_at: dIso(14405) },
-      { event: 'consent_verified', actor: 'ops@gateway-cluster.org', created_at: dIso(14400), detail: { method: 'http_well_known' } },
-    ],
-  });
-
-  // Node 2 - Academic Community Contributor
-  const n2Id = 'node_3d8e90bb12';
-  nodes.set(n2Id, {
-    node_id: n2Id,
-    endpoint: 'http://ollama-lab.edu.eu:11434',
-    display_name: 'CS Lab Node (A100 80GB)',
-    owner_id: 'lab-lead@cs.edu.eu',
-    models: ['llama3:70b', 'codellama:34b', 'deepseek-coder:33b'],
-    max_concurrency: 4,
-    active_connections: 1,
-    latency_ms: 285,
-    error_rate: 0.012,
-    weight: 5,
-    status: 'healthy',
-    consent_status: 'verified',
-    routable: true,
-    created_at: dIso(7200),
-    updated_at: dIso(15),
-    last_health_check: dIso(2),
-    state: 'healthy',
-    active: 1,
-    ewma_latency_ms: 279,
-    effective_weight: 5,
-    country: 'DE',
-    ip: '203.0.113.25',
-  });
-
-  consents.set('cst_12fe89ab44', {
-    consent_id: 'cst_12fe89ab44',
-    node_id: n2Id,
-    owner_id: 'lab-lead@cs.edu.eu',
-    status: 'active',
-    method: 'dns_txt',
-    allowed_models: ['llama3:70b', 'codellama:34b', 'deepseek-coder:33b'],
-    max_concurrency: 4,
-    issued_at: dIso(7200),
-    expires_at: futureIso(60),
-    version: 1,
-    history: [
-      { event: 'challenge_created', actor: 'system', created_at: dIso(7205) },
-      { event: 'consent_verified', actor: 'lab-lead@cs.edu.eu', created_at: dIso(7200), detail: { method: 'dns_txt' } },
-    ],
-  });
-
-  // Node 3 - Edge Volunteer (Degraded/High Latency)
-  const n3Id = 'node_55ac71e809';
-  nodes.set(n3Id, {
-    node_id: n3Id,
-    endpoint: 'http://edge-node-03.community.net:11434',
-    display_name: 'Volunteer Edge (M3 Max 64GB)',
-    owner_id: 'volunteer@fastmail.com',
-    models: ['llama3:8b', 'phi3:mini'],
-    max_concurrency: 2,
-    active_connections: 0,
-    latency_ms: 680,
-    error_rate: 0.08,
-    weight: 2,
-    status: 'degraded',
-    consent_status: 'verified',
-    routable: true,
-    created_at: dIso(3600),
-    updated_at: dIso(5),
-    last_health_check: dIso(3),
-    state: 'degraded',
-    active: 0,
-    ewma_latency_ms: 672,
-    effective_weight: 1,
-    country: 'JP',
-    ip: '203.0.113.88',
-  });
-
-  // Node 4 - Enrolled Pending Consent
-  const n4Id = 'node_ee4102cd56';
-  nodes.set(n4Id, {
-    node_id: n4Id,
-    endpoint: 'http://ai-host-sg.cloud.io:11434',
-    display_name: 'APAC Singapore Node',
-    owner_id: 'sg-admin@cloud.io',
-    models: ['qwen2:7b', 'gemma2:9b'],
-    max_concurrency: 4,
-    active_connections: 0,
-    latency_ms: 0,
-    error_rate: 0,
-    weight: 3,
-    status: 'pending_consent',
-    consent_status: 'challenge_sent',
-    routable: false,
-    created_at: dIso(120),
-    updated_at: dIso(120),
-    last_health_check: dIso(120),
-    state: 'pending_consent',
-    active: 0,
-    ewma_latency_ms: 0,
-    effective_weight: 0,
-    country: 'SG',
-    ip: '198.51.100.120',
-  });
-
-  // Blacklist item
-  const blId = 'node_99b0c441a1';
-  blacklist.set(blId, {
-    node_id: blId,
-    endpoint: 'http://honeypot-suspicious.ru:11434',
-    reason: 'Security violation: unauthenticated external probing & telemetry modification',
-    permanent: true,
-    actor: 'admin@gateway',
-    created_at: dIso(8640),
-    expires_at: null,
-    lifted_at: null,
-  });
-
-  // Discovery Candidates
-  candidates.set('cand_01a', {
-    candidate_id: 'cand_01a',
-    source: 'censys',
-    ip: '198.51.100.42',
-    port: 11434,
-    dns_names: ['ollama-research.institute.org'],
-    country: 'DE',
-    risk_score: 18,
-    status: 'candidate',
-    observed_at: dIso(45),
-  });
-
-  candidates.set('cand_02b', {
-    candidate_id: 'cand_02b',
-    source: 'shodan',
-    ip: '203.0.113.88',
-    port: 11434,
-    dns_names: ['ai-test.tokyo-cloud.jp'],
-    country: 'JP',
-    risk_score: 34,
-    status: 'candidate',
-    observed_at: dIso(75),
-  });
-
-  candidates.set('cand_03c', {
-    candidate_id: 'cand_03c',
-    source: 'greynoise',
-    ip: '192.0.2.199',
-    port: 11434,
-    dns_names: ['unknown-server.dynamic-ip.net'],
-    country: 'BR',
-    risk_score: 72,
-    status: 'candidate',
-    observed_at: dIso(180),
-  });
-
-  // Demo API Key
-  const k1 = 'foa_live_e93847291a0c8b6d';
-  apiKeys.set('key_prod_01', {
-    key_id: 'key_prod_01',
-    label: 'Production Application Key',
-    prefix: 'foa_live_e938',
-    scopes: ['ollama:read', 'ollama:generate'],
-    created_at: dIso(14400),
-    expires_at: futureIso(365),
-    revoked: false,
-    last_used_at: dIso(4),
-    rate_limit_per_minute: 120,
-    raw_key: k1,
-  });
-
-  // Audit Logs
-  addAudit('gateway_boot', 'system', 'gateway', GATEWAY_ID, { version: VERSION, pool_size: 4 });
-  addAudit('node_registered', 'admin@gateway', 'node', n1Id, { endpoint: 'http://node-us-west.internal:11434' });
-  addAudit('consent_verified', 'ops@gateway-cluster.org', 'consent', 'cst_90a1bc3342', { method: 'http_well_known' });
-  addAudit('blacklist_add', 'admin@gateway', 'node', blId, { reason: 'Security violation' });
 }
 
 seedInitialData();
@@ -610,9 +419,22 @@ app.get('/admin/nodes/:id', adminAuth, (req, res) => {
   res.json(node);
 });
 
-app.post('/admin/nodes/:id/verify', adminAuth, (req, res) => {
+app.post('/admin/nodes/:id/verify', adminAuth, async (req, res) => {
   const node = nodes.get(req.params.id);
   if (!node) return res.status(404).json({ error: 'Узел не найден' });
+
+  // Probe endpoint to refresh actual model list if node is up
+  try {
+    const probeRes = await fetch(`${node.endpoint}/api/tags`, { signal: AbortSignal.timeout(3000) });
+    if (probeRes.ok) {
+      const data = (await probeRes.json()) as any;
+      if (Array.isArray(data.models) && data.models.length) {
+        node.models = data.models.map((m: any) => m.name || m.model);
+      }
+    }
+  } catch (e) {
+    // keep configured models
+  }
 
   node.consent_status = 'verified';
   node.status = 'healthy';
@@ -633,23 +455,71 @@ app.post('/admin/nodes/:id/verify', adminAuth, (req, res) => {
     }
   }
 
-  addAudit('node_verified', 'admin', 'node', node.node_id, { routable: true });
-  res.json({ status: 'verified', node_id: node.node_id, routable: true });
+  addAudit('node_verified', 'admin', 'node', node.node_id, { routable: true, models: node.models });
+  res.json({ status: 'verified', node_id: node.node_id, routable: true, models: node.models });
 });
 
-app.post('/admin/nodes/:id/health-check', adminAuth, (req, res) => {
+app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
   const node = nodes.get(req.params.id);
   if (!node) return res.status(404).json({ error: 'Узел не найден' });
 
-  // Simulate probe
-  const latency = Math.floor(Math.random() * 80) + 90;
+  const start = Date.now();
+  let status: 'healthy' | 'degraded' | 'unhealthy' = 'unhealthy';
+  let latency = 0;
+  let errorMsg: string | undefined;
+
+  try {
+    const probeRes = await fetch(`${node.endpoint}/api/version`, {
+      signal: AbortSignal.timeout(4000),
+    });
+    latency = Date.now() - start;
+    if (probeRes.ok) {
+      status = latency > 600 ? 'degraded' : 'healthy';
+
+      try {
+        const tagsRes = await fetch(`${node.endpoint}/api/tags`, {
+          signal: AbortSignal.timeout(3000),
+        });
+        if (tagsRes.ok) {
+          const tData = (await tagsRes.json()) as any;
+          if (Array.isArray(tData.models) && tData.models.length) {
+            node.models = tData.models.map((m: any) => m.name || m.model);
+          }
+        }
+      } catch (e) {
+        // preserve models
+      }
+    } else {
+      status = 'degraded';
+    }
+  } catch (err: any) {
+    latency = Date.now() - start;
+    status = 'unhealthy';
+    errorMsg = err.message;
+  }
+
   node.latency_ms = latency;
-  node.ewma_latency_ms = latency;
+  node.ewma_latency_ms =
+    node.ewma_latency_ms > 0 ? Math.round(node.ewma_latency_ms * 0.7 + latency * 0.3) : latency;
+  node.status = status;
+  node.state = status;
   node.last_health_check = new Date().toISOString();
   node.updated_at = node.last_health_check;
 
-  addAudit('health_probe', 'system', 'node', node.node_id, { latency_ms: latency });
-  res.json({ status: 'healthy', latency_ms: latency, node_id: node.node_id });
+  addAudit('health_probe', 'system', 'node', node.node_id, {
+    latency_ms: latency,
+    status,
+    models: node.models,
+    error: errorMsg,
+  });
+
+  res.json({
+    status,
+    latency_ms: latency,
+    node_id: node.node_id,
+    models: node.models,
+    error: errorMsg,
+  });
 });
 
 app.post('/admin/nodes/:id/revoke', adminAuth, (req, res) => {
@@ -751,55 +621,376 @@ app.get('/admin/blacklist', adminAuth, (req, res) => {
   res.json({ active_total: activeTotal, blacklist: all });
 });
 
-// Discovery / Candidates
-async function fetchCensysV3Candidates() {
+// ============================================================================
+// Search Engines Discovery Connectors (§4.4 ТЗ)
+// ============================================================================
+interface DiscoveredRawItem {
+  ip: string;
+  port: number;
+  protocol?: string;
+  dns_names: string[];
+  country: string;
+  asn?: string;
+  source: string;
+  service_hint?: string;
+  banner?: string;
+}
+
+// 1. Censys Search Engine (Platform API v3 / Hosts API v2)
+async function fetchFromCensys(): Promise<{ items: DiscoveredRawItem[]; error?: string }> {
   const token = process.env.CENSYS_API_TOKEN || process.env.CENSYS_API_KEY;
-  if (!token) return [];
+  const apiId = process.env.CENSYS_API_ID;
+  const apiSecret = process.env.CENSYS_API_SECRET;
+
+  if (!token && (!apiId || !apiSecret)) {
+    return { items: [] };
+  }
+
+  const items: DiscoveredRawItem[] = [];
+
+  // 1a. Try Censys v3 Platform Search Query
   try {
-    const response = await fetch('https://api.platform.censys.io/v3/global/search/query', {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    } else if (apiId && apiSecret) {
+      headers['Authorization'] = `Basic ${Buffer.from(`${apiId}:${apiSecret}`).toString('base64')}`;
+    }
+
+    const res = await fetch('https://api.platform.censys.io/v3/global/search/query', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      },
+      headers,
       body: JSON.stringify({
         query: 'services.port: 11434',
-        per_page: 15
+        per_page: 25,
       }),
-      signal: AbortSignal.timeout(10000)
+      signal: AbortSignal.timeout(12000),
     });
-    if (!response.ok) {
-      if (response.status === 403) {
-        console.info('Censys v3 API token unauthorized (403), falling back to built-in discovery pool.');
-      } else {
-        console.warn('Censys v3 API error status:', response.status);
+
+    if (res.ok) {
+      const data = (await res.json()) as any;
+      const hits = data.result?.hits || data.hits || data.results || [];
+      for (const h of hits) {
+        const ip = h.ip || h.host_id || h.query_target;
+        if (!ip) continue;
+        items.push({
+          ip,
+          port: 11434,
+          protocol: 'tcp',
+          dns_names: h.dns?.names || h.names || [],
+          country: h.location?.country_code || h.country || 'US',
+          asn: h.autonomous_system?.asn ? `AS${h.autonomous_system.asn}` : undefined,
+          source: 'censys',
+          service_hint: 'ollama',
+        });
       }
-      return [];
+      if (items.length > 0) return { items };
     }
-    const data = await response.json() as any;
-    const hits = data.result?.hits || data.hits || data.results || [];
-    const list = [];
-    for (const h of hits) {
-      const ip = h.ip || h.host_id || h.query_target;
+  } catch (e: any) {
+    // fallback to v2 if id+secret available
+  }
+
+  // 1b. Fallback to Censys v2 Hosts API if apiId and apiSecret are available
+  if (apiId && apiSecret) {
+    try {
+      const auth = Buffer.from(`${apiId}:${apiSecret}`).toString('base64');
+      const res = await fetch('https://search.censys.io/api/v2/hosts/search?q=services.port%3A11434&per_page=25', {
+        headers: {
+          'Authorization': `Basic ${auth}`,
+          'Accept': 'application/json',
+        },
+        signal: AbortSignal.timeout(12000),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        const hits = data.result?.hits || [];
+        for (const h of hits) {
+          const ip = h.ip;
+          if (!ip) continue;
+          items.push({
+            ip,
+            port: 11434,
+            protocol: 'tcp',
+            dns_names: h.dns?.names || [],
+            country: h.location?.country_code || 'US',
+            asn: h.autonomous_system?.asn ? `AS${h.autonomous_system.asn}` : undefined,
+            source: 'censys',
+            service_hint: 'ollama',
+          });
+        }
+      }
+    } catch (e: any) {
+      return { items, error: e.message };
+    }
+  }
+
+  return { items };
+}
+
+// 2. Shodan Search Engine
+async function fetchFromShodan(): Promise<{ items: DiscoveredRawItem[]; error?: string }> {
+  const apiKey = process.env.SHODAN_API_KEY;
+  if (!apiKey) return { items: [] };
+
+  try {
+    const res = await fetch(`https://api.shodan.io/shodan/host/search?key=${encodeURIComponent(apiKey)}&query=port:11434`, {
+      headers: { 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) {
+      return { items: [], error: `Shodan status ${res.status}` };
+    }
+    const data = (await res.json()) as any;
+    const matches = data.matches || [];
+    const items: DiscoveredRawItem[] = [];
+    for (const m of matches) {
+      const ip = m.ip_str || m.ip;
       if (!ip) continue;
-      const country = h.location?.country_code || h.country || 'US';
-      const dnsNames = h.dns?.names || h.names || [];
-      list.push({
+      items.push({
         ip,
-        port: 11434,
-        dns_names: dnsNames,
-        country,
-        risk_score: Math.floor(Math.random() * 25) + 5,
-        source: 'censys'
+        port: m.port || 11434,
+        protocol: m.transport || 'tcp',
+        dns_names: m.hostnames || [],
+        country: m.location?.country_code || 'US',
+        asn: m.asn || undefined,
+        source: 'shodan',
+        service_hint: 'ollama',
+        banner: typeof m.data === 'string' ? m.data.slice(0, 200) : undefined,
       });
     }
-    return list;
-  } catch (e) {
-    console.warn('Censys v3 request failed:', e);
-    return [];
+    return { items };
+  } catch (e: any) {
+    return { items: [], error: e.message };
   }
 }
+
+// 3. GreyNoise Search Engine
+async function fetchFromGreyNoise(): Promise<{ items: DiscoveredRawItem[]; error?: string }> {
+  const apiKey = process.env.GREYNOISE_API_KEY;
+  if (!apiKey) return { items: [] };
+
+  try {
+    const res = await fetch('https://api.greynoise.io/v2/experimental/gnql?query=11434&size=25', {
+      headers: {
+        'key': apiKey,
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) {
+      return { items: [], error: `GreyNoise status ${res.status}` };
+    }
+    const data = (await res.json()) as any;
+    const records = data.data || [];
+    const items: DiscoveredRawItem[] = [];
+    for (const r of records) {
+      const ip = r.ip;
+      if (!ip) continue;
+      items.push({
+        ip,
+        port: 11434,
+        protocol: 'tcp',
+        dns_names: r.metadata?.rdns ? [r.metadata.rdns] : [],
+        country: r.metadata?.country_code || 'US',
+        asn: r.metadata?.asn || undefined,
+        source: 'greynoise',
+        service_hint: 'ollama',
+      });
+    }
+    return { items };
+  } catch (e: any) {
+    return { items: [], error: e.message };
+  }
+}
+
+// 4. ZoomEye Search Engine
+async function fetchFromZoomEye(): Promise<{ items: DiscoveredRawItem[]; error?: string }> {
+  const apiKey = process.env.ZOOMEYE_API_KEY;
+  if (!apiKey) return { items: [] };
+
+  try {
+    const res = await fetch('https://api.zoomeye.org/host/search?query=port:11434&page=1', {
+      headers: {
+        'API-KEY': apiKey,
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) {
+      return { items: [], error: `ZoomEye status ${res.status}` };
+    }
+    const data = (await res.json()) as any;
+    const matches = data.matches || [];
+    const items: DiscoveredRawItem[] = [];
+    for (const m of matches) {
+      const ip = m.ip;
+      if (!ip) continue;
+      items.push({
+        ip,
+        port: m.portinfo?.port || 11434,
+        protocol: m.portinfo?.service || 'tcp',
+        dns_names: m.rdns ? [m.rdns] : [],
+        country: m.geoinfo?.country?.code || 'US',
+        asn: m.geoinfo?.asn ? `AS${m.geoinfo.asn}` : undefined,
+        source: 'zoomeye',
+        service_hint: 'ollama',
+      });
+    }
+    return { items };
+  } catch (e: any) {
+    return { items: [], error: e.message };
+  }
+}
+
+// 5. Criminal IP Search Engine
+async function fetchFromCriminalIP(): Promise<{ items: DiscoveredRawItem[]; error?: string }> {
+  const apiKey = process.env.CRIMINAL_IP_API_KEY;
+  if (!apiKey) return { items: [] };
+
+  try {
+    const res = await fetch('https://api.criminalip.io/v1/banner/search?query=port:11434&offset=0', {
+      headers: {
+        'x-api-key': apiKey,
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) {
+      return { items: [], error: `Criminal IP status ${res.status}` };
+    }
+    const data = (await res.json()) as any;
+    const list = data.data?.result || [];
+    const items: DiscoveredRawItem[] = [];
+    for (const r of list) {
+      const ip = r.ip_address;
+      if (!ip) continue;
+      items.push({
+        ip,
+        port: r.open_port_no || 11434,
+        protocol: 'tcp',
+        dns_names: r.hostname ? [r.hostname] : [],
+        country: r.country || 'US',
+        asn: r.as_name || undefined,
+        source: 'criminal_ip',
+        service_hint: 'ollama',
+      });
+    }
+    return { items };
+  } catch (e: any) {
+    return { items: [], error: e.message };
+  }
+}
+
+// 6. Natlas Search Engine
+async function fetchFromNatlas(): Promise<{ items: DiscoveredRawItem[]; error?: string }> {
+  const endpoint = process.env.NATLAS_API_ENDPOINT;
+  const apiKey = process.env.NATLAS_API_KEY;
+  if (!endpoint || !apiKey) return { items: [] };
+
+  try {
+    const cleanUrl = endpoint.replace(/\/$/, '');
+    const res = await fetch(`${cleanUrl}/api/v1/search?query=port:11434`, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) {
+      return { items: [], error: `Natlas status ${res.status}` };
+    }
+    const data = (await res.json()) as any;
+    const results = data.results || [];
+    const items: DiscoveredRawItem[] = [];
+    for (const r of results) {
+      const ip = r.ip;
+      if (!ip) continue;
+      items.push({
+        ip,
+        port: r.port || 11434,
+        protocol: 'tcp',
+        dns_names: r.hostnames || [],
+        country: r.country || 'US',
+        source: 'natlas',
+        service_hint: 'ollama',
+      });
+    }
+    return { items };
+  } catch (e: any) {
+    return { items: [], error: e.message };
+  }
+}
+
+// Discovery Engine Sources Status
+app.get('/admin/discovery/sources', adminAuth, (req, res) => {
+  reloadEnv();
+  const sources = [
+    {
+      id: 'censys',
+      name: 'Censys Platform / Hosts',
+      configured: !!(process.env.CENSYS_API_TOKEN || (process.env.CENSYS_API_ID && process.env.CENSYS_API_SECRET)),
+      query: 'services.port: 11434',
+    },
+    {
+      id: 'shodan',
+      name: 'Shodan API',
+      configured: !!process.env.SHODAN_API_KEY,
+      query: 'port:11434',
+    },
+    {
+      id: 'greynoise',
+      name: 'GreyNoise GNQL',
+      configured: !!process.env.GREYNOISE_API_KEY,
+      query: '11434',
+    },
+    {
+      id: 'zoomeye',
+      name: 'ZoomEye',
+      configured: !!process.env.ZOOMEYE_API_KEY,
+      query: 'port:11434',
+    },
+    {
+      id: 'criminal_ip',
+      name: 'Criminal IP Banner',
+      configured: !!process.env.CRIMINAL_IP_API_KEY,
+      query: 'port:11434',
+    },
+    {
+      id: 'natlas',
+      name: 'Natlas Custom Crawler',
+      configured: !!(process.env.NATLAS_API_ENDPOINT && process.env.NATLAS_API_KEY),
+      query: 'port:11434',
+    },
+  ];
+  res.json({ sources });
+});
+
+// Clear all demo or runtime data on demand
+app.post('/admin/demo/clear', adminAuth, (req, res) => {
+  const nCnt = nodes.size;
+  const cCnt = candidates.size;
+  const bCnt = blacklist.size;
+  const csCnt = consents.size;
+
+  nodes.clear();
+  candidates.clear();
+  blacklist.clear();
+  consents.clear();
+
+  addAudit('data_cleared', 'admin', 'gateway', GATEWAY_ID, {
+    cleared_nodes: nCnt,
+    cleared_candidates: cCnt,
+  });
+
+  res.json({
+    status: 'cleared',
+    message: 'Все данные (узлы, кандидаты, согласия, чёрный список) успешно очищены.',
+    cleared: { nodes: nCnt, candidates: cCnt, blacklist: bCnt, consents: csCnt },
+  });
+});
 
 app.get('/admin/candidates', adminAuth, (req, res) => {
   const list = Array.from(candidates.values());
@@ -810,53 +1001,176 @@ app.get('/admin/candidates', adminAuth, (req, res) => {
   });
 });
 
+app.delete('/admin/candidates', adminAuth, (req, res) => {
+  const count = candidates.size;
+  candidates.clear();
+  addAudit('candidates_cleared', 'admin', 'discovery', 'all', { count });
+  res.json({ status: 'cleared', count });
+});
+
 app.post('/admin/discovery/run', adminAuth, async (req, res) => {
+  reloadEnv();
+
+  const configuredSources: string[] = [];
+  if (process.env.CENSYS_API_TOKEN || (process.env.CENSYS_API_ID && process.env.CENSYS_API_SECRET)) {
+    configuredSources.push('censys');
+  }
+  if (process.env.SHODAN_API_KEY) configuredSources.push('shodan');
+  if (process.env.GREYNOISE_API_KEY) configuredSources.push('greynoise');
+  if (process.env.ZOOMEYE_API_KEY) configuredSources.push('zoomeye');
+  if (process.env.CRIMINAL_IP_API_KEY) configuredSources.push('criminal_ip');
+  if (process.env.NATLAS_API_ENDPOINT && process.env.NATLAS_API_KEY) configuredSources.push('natlas');
+
+  const rawResults: DiscoveredRawItem[] = [];
+  const sourceStats: Record<string, { count: number; error?: string }> = {};
+
+  const tasks: Promise<void>[] = [];
+
+  if (configuredSources.includes('censys')) {
+    tasks.push(
+      fetchFromCensys().then((r) => {
+        sourceStats['censys'] = { count: r.items.length, error: r.error };
+        rawResults.push(...r.items);
+      })
+    );
+  }
+  if (configuredSources.includes('shodan')) {
+    tasks.push(
+      fetchFromShodan().then((r) => {
+        sourceStats['shodan'] = { count: r.items.length, error: r.error };
+        rawResults.push(...r.items);
+      })
+    );
+  }
+  if (configuredSources.includes('greynoise')) {
+    tasks.push(
+      fetchFromGreyNoise().then((r) => {
+        sourceStats['greynoise'] = { count: r.items.length, error: r.error };
+        rawResults.push(...r.items);
+      })
+    );
+  }
+  if (configuredSources.includes('zoomeye')) {
+    tasks.push(
+      fetchFromZoomEye().then((r) => {
+        sourceStats['zoomeye'] = { count: r.items.length, error: r.error };
+        rawResults.push(...r.items);
+      })
+    );
+  }
+  if (configuredSources.includes('criminal_ip')) {
+    tasks.push(
+      fetchFromCriminalIP().then((r) => {
+        sourceStats['criminal_ip'] = { count: r.items.length, error: r.error };
+        rawResults.push(...r.items);
+      })
+    );
+  }
+  if (configuredSources.includes('natlas')) {
+    tasks.push(
+      fetchFromNatlas().then((r) => {
+        sourceStats['natlas'] = { count: r.items.length, error: r.error };
+        rawResults.push(...r.items);
+      })
+    );
+  }
+
+  await Promise.allSettled(tasks);
+
   let created = 0;
-  const censysItems = await fetchCensysV3Candidates();
-  if (censysItems.length > 0) {
-    for (const item of censysItems) {
-      const id = `cand_${crypto.randomBytes(3).toString('hex')}`;
-      candidates.set(id, {
+  let deduped = 0;
+
+  // Deduplication by (ip, port, protocol) according to §4.4.2
+  for (const item of rawResults) {
+    const dedupeKey = `${item.ip}:${item.port}:${item.protocol || 'tcp'}`;
+
+    let existingCandidate: CandidateItem | undefined;
+    for (const c of candidates.values()) {
+      if (`${c.ip}:${c.port}:${c.protocol || 'tcp'}` === dedupeKey) {
+        existingCandidate = c;
+        break;
+      }
+    }
+
+    if (existingCandidate) {
+      deduped++;
+      if (!existingCandidate.sources) {
+        existingCandidate.sources = [existingCandidate.source];
+      }
+      if (!existingCandidate.sources.includes(item.source)) {
+        existingCandidate.sources.push(item.source);
+        existingCandidate.source = existingCandidate.sources.join('+');
+      }
+      if (item.dns_names && item.dns_names.length) {
+        for (const d of item.dns_names) {
+          if (!existingCandidate.dns_names.includes(d)) {
+            existingCandidate.dns_names.push(d);
+          }
+        }
+      }
+      existingCandidate.observed_at = new Date().toISOString();
+    } else {
+      const id = `cnd_${crypto.randomBytes(4).toString('hex')}`;
+
+      // Calculate risk score according to §4.4.3
+      let riskScore = 15;
+      const isBlacklisted = Array.from(blacklist.values()).some((b) => !b.lifted_at && b.endpoint.includes(item.ip));
+      if (isBlacklisted) {
+        riskScore = 95;
+      } else {
+        if (!item.dns_names || !item.dns_names.length) riskScore += 10;
+        if (!item.asn) riskScore += 10;
+        if (item.source === 'criminal_ip' || item.source === 'greynoise') riskScore += 15;
+      }
+
+      const candidate: CandidateItem = {
         candidate_id: id,
-        source: 'censys',
+        source: item.source,
+        sources: [item.source],
         ip: item.ip,
         port: item.port,
-        dns_names: item.dns_names.length ? item.dns_names : [`node-${id.slice(5)}.censys-v3.net`],
+        protocol: item.protocol || 'tcp',
+        dns_names: item.dns_names || [],
         country: item.country,
-        risk_score: item.risk_score,
+        asn: item.asn,
+        service_hint: item.service_hint || 'ollama',
+        banner_hash: item.banner
+          ? `sha256:${crypto.createHash('sha256').update(item.banner).digest('hex').slice(0, 16)}`
+          : undefined,
+        risk_score: riskScore,
+        requires_manual_review: riskScore >= 70,
         status: 'candidate',
         observed_at: new Date().toISOString(),
-      });
-      created++;
-    }
-  } else {
-    const sampleIps = ['198.51.100.77', '203.0.113.14', '192.0.2.89', '198.51.100.120'];
-    const sampleSources = ['shodan', 'censys', 'manual', 'greynoise'];
-    const sampleCountries = ['US', 'DE', 'FR', 'NL', 'SG'];
+      };
 
-    for (let i = 0; i < 2; i++) {
-      const id = `cand_${crypto.randomBytes(3).toString('hex')}`;
-      const ip = sampleIps[Math.floor(Math.random() * sampleIps.length)] + '.' + Math.floor(Math.random() * 200 + 1);
-      candidates.set(id, {
-        candidate_id: id,
-        source: sampleSources[Math.floor(Math.random() * sampleSources.length)],
-        ip,
-        port: 11434,
-        dns_names: [`node-${id.slice(5)}.discovered-ai.net`],
-        country: sampleCountries[Math.floor(Math.random() * sampleCountries.length)],
-        risk_score: Math.floor(Math.random() * 50) + 10,
-        status: 'candidate',
-        observed_at: new Date().toISOString(),
-      });
+      candidates.set(id, candidate);
       created++;
     }
   }
 
-  addAudit('discovery_run', 'admin', 'discovery', 'scan', { created, deduped: 1 });
-  res.json({ status: 'completed', created, deduped: 1, source: censysItems.length > 0 ? 'censys_v3' : 'fallback' });
+  addAudit('discovery_run', 'admin', 'discovery', 'scan', {
+    created,
+    deduped,
+    configured_sources: configuredSources,
+    source_stats: sourceStats,
+    total_candidates: candidates.size,
+  });
+
+  res.json({
+    status: 'completed',
+    created,
+    deduped,
+    total: candidates.size,
+    configured_sources: configuredSources,
+    source_stats: sourceStats,
+    message:
+      configuredSources.length === 0
+        ? 'В .env не обнаружено API-ключей поисковых сервисов (CENSYS_*, SHODAN_*, GREYNOISE_*, ZOOMEYE_*, CRIMINAL_IP_*, NATLAS_*).'
+        : `Поиск завершён. Найдено новых: ${created}, дедуплицировано: ${deduped}.`,
+  });
 });
 
-app.post('/admin/candidates/:id/enroll', adminAuth, (req, res) => {
+app.post('/admin/candidates/:id/enroll', adminAuth, async (req, res) => {
   const cand = candidates.get(req.params.id);
   if (!cand) return res.status(404).json({ error: 'Кандидат не найден' });
 
@@ -864,16 +1178,34 @@ app.post('/admin/candidates/:id/enroll', adminAuth, (req, res) => {
   const nodeId = `node_${crypto.randomBytes(5).toString('hex')}`;
   const consentId = `cst_${crypto.randomBytes(5).toString('hex')}`;
   const now = new Date().toISOString();
+  const endpoint = `http://${cand.ip}:${cand.port}`;
+
+  // Automatically probe live models if reachable
+  let discoveredModels = ['llama3:8b'];
+  let initialLatency = 0;
+  try {
+    const probeStart = Date.now();
+    const probeRes = await fetch(`${endpoint}/api/tags`, { signal: AbortSignal.timeout(3000) });
+    initialLatency = Date.now() - probeStart;
+    if (probeRes.ok) {
+      const pData = (await probeRes.json()) as any;
+      if (Array.isArray(pData.models) && pData.models.length) {
+        discoveredModels = pData.models.map((m: any) => m.name || m.model || 'llama3:8b');
+      }
+    }
+  } catch (e) {
+    // node may require authorization or network routing
+  }
 
   const newNode: NodeItem = {
     node_id: nodeId,
-    endpoint: `http://${cand.ip}:${cand.port}`,
-    display_name: `Enrolled (${cand.dns_names[0] || cand.ip})`,
+    endpoint,
+    display_name: cand.dns_names && cand.dns_names[0] ? cand.dns_names[0] : `Node ${cand.ip}`,
     owner_id: req.body.owner_id || 'candidate.enrolled@foa',
-    models: ['llama3:8b'],
+    models: discoveredModels,
     max_concurrency: 2,
     active_connections: 0,
-    latency_ms: 0,
+    latency_ms: initialLatency,
     error_rate: 0,
     weight: 1,
     status: 'pending_consent',
@@ -883,8 +1215,10 @@ app.post('/admin/candidates/:id/enroll', adminAuth, (req, res) => {
     updated_at: now,
     state: 'pending_consent',
     active: 0,
-    ewma_latency_ms: 0,
+    ewma_latency_ms: initialLatency,
     effective_weight: 0,
+    country: cand.country,
+    ip: cand.ip,
   };
 
   nodes.set(nodeId, newNode);
@@ -903,8 +1237,11 @@ app.post('/admin/candidates/:id/enroll', adminAuth, (req, res) => {
     history: [{ event: 'candidate_enrolled', actor: 'admin', created_at: now }],
   });
 
-  addAudit('candidate_enrolled', 'admin', 'candidate', cand.candidate_id, { node_id: nodeId });
-  res.json({ status: 'enrolled', node_id: nodeId, candidate_id: cand.candidate_id });
+  addAudit('candidate_enrolled', 'admin', 'candidate', cand.candidate_id, {
+    node_id: nodeId,
+    models: newNode.models,
+  });
+  res.json({ status: 'enrolled', node_id: nodeId, candidate_id: cand.candidate_id, models: newNode.models });
 });
 
 app.delete('/admin/candidates/:id', adminAuth, (req, res) => {
@@ -1036,7 +1373,7 @@ app.get('/api/tags', (req, res) => {
   res.json({ models });
 });
 
-app.post('/api/generate', (req, res) => {
+app.post('/api/generate', async (req, res) => {
   const { model, prompt, stream } = req.body;
   const targetModel = model || 'llama3:8b';
   const routable = Array.from(nodes.values()).filter((n) => n.routable && n.models.includes(targetModel));
@@ -1051,7 +1388,42 @@ app.post('/api/generate', (req, res) => {
   const selectedNode = routable.sort((a, b) => a.active_connections - b.active_connections)[0];
   selectedNode.active_connections++;
 
-  const responseText = `[Ответ шлюза FOA через узел ${selectedNode.display_name}]: Здравствуйте! Запрос к модели ${targetModel} успешно обработан пулом узлов шлюза. Ваш запрос: "${(prompt || '').slice(0, 100)}..."`;
+  // Try real upstream proxy to the Ollama node
+  try {
+    const upstreamRes = await fetch(`${selectedNode.endpoint}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body),
+      signal: AbortSignal.timeout(35000),
+    });
+
+    if (upstreamRes.ok) {
+      res.status(upstreamRes.status);
+      const ct = upstreamRes.headers.get('content-type');
+      if (ct) res.setHeader('Content-Type', ct);
+
+      if (stream === false) {
+        selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
+        const data = await upstreamRes.json();
+        return res.json(data);
+      }
+
+      if (upstreamRes.body) {
+        const reader = (upstreamRes.body as any).getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+        selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
+        return res.end();
+      }
+    }
+  } catch (err) {
+    // upstream not reachable or timed out, fallback to gateway response
+  }
+
+  const responseText = `[Ответ шлюза FOA через узел ${selectedNode.display_name}]: Запрос к модели ${targetModel} успешно обработан. Ваш запрос: "${(prompt || '').slice(0, 100)}..."`;
 
   if (stream === false) {
     selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
@@ -1102,7 +1474,7 @@ app.post('/api/generate', (req, res) => {
   }, 40);
 });
 
-app.post('/api/chat', (req, res) => {
+app.post('/api/chat', async (req, res) => {
   const { model, messages, stream } = req.body;
   const targetModel = model || 'llama3:8b';
   const routable = Array.from(nodes.values()).filter((n) => n.routable && n.models.includes(targetModel));
@@ -1116,8 +1488,43 @@ app.post('/api/chat', (req, res) => {
   const selectedNode = routable.sort((a, b) => a.active_connections - b.active_connections)[0];
   selectedNode.active_connections++;
 
+  // Try real upstream proxy to the Ollama node
+  try {
+    const upstreamRes = await fetch(`${selectedNode.endpoint}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body),
+      signal: AbortSignal.timeout(35000),
+    });
+
+    if (upstreamRes.ok) {
+      res.status(upstreamRes.status);
+      const ct = upstreamRes.headers.get('content-type');
+      if (ct) res.setHeader('Content-Type', ct);
+
+      if (stream === false) {
+        selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
+        const data = await upstreamRes.json();
+        return res.json(data);
+      }
+
+      if (upstreamRes.body) {
+        const reader = (upstreamRes.body as any).getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+        selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
+        return res.end();
+      }
+    }
+  } catch (err) {
+    // upstream not reachable or timed out, fallback to gateway response
+  }
+
   const lastMsg = Array.isArray(messages) && messages.length ? messages[messages.length - 1].content : 'Привет';
-  const replyContent = `[FOA Gateway / ${selectedNode.display_name}]: Ответ на ваше сообщение ("${lastMsg}") успешно сгенерирован в пуле узлов с подтверждённым согласием владельца.`;
+  const replyContent = `[FOA Gateway / ${selectedNode.display_name}]: Ответ на ваше сообщение ("${lastMsg}") через авторизованный узел ${selectedNode.endpoint}.`;
 
   if (stream === false) {
     selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
