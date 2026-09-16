@@ -2,6 +2,29 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import path from 'path';
 import crypto from 'crypto';
+import fs from 'fs';
+
+// Load .env if present
+try {
+  const envPath = path.join(process.cwd(), '.env');
+  if (fs.existsSync(envPath)) {
+    const lines = fs.readFileSync(envPath, 'utf-8').split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx !== -1) {
+        const key = trimmed.slice(0, eqIdx).trim();
+        const val = trimmed.slice(eqIdx + 1).trim();
+        if (key && !(key in process.env)) {
+          process.env[key] = val;
+        }
+      }
+    }
+  }
+} catch (e) {
+  // ignore
+}
 
 const app = express();
 const PORT = 3000;
@@ -37,6 +60,8 @@ interface NodeItem {
   active?: number;
   ewma_latency_ms?: number;
   effective_weight?: number;
+  country?: string;
+  ip?: string;
 }
 
 interface ConsentItem {
@@ -156,6 +181,8 @@ function seedInitialData() {
     active: 2,
     ewma_latency_ms: 138,
     effective_weight: 10,
+    country: 'US',
+    ip: '198.51.100.10',
   });
 
   consents.set('cst_90a1bc3342', {
@@ -198,6 +225,8 @@ function seedInitialData() {
     active: 1,
     ewma_latency_ms: 279,
     effective_weight: 5,
+    country: 'DE',
+    ip: '203.0.113.25',
   });
 
   consents.set('cst_12fe89ab44', {
@@ -240,6 +269,8 @@ function seedInitialData() {
     active: 0,
     ewma_latency_ms: 672,
     effective_weight: 1,
+    country: 'JP',
+    ip: '203.0.113.88',
   });
 
   // Node 4 - Enrolled Pending Consent
@@ -265,6 +296,8 @@ function seedInitialData() {
     active: 0,
     ewma_latency_ms: 0,
     effective_weight: 0,
+    country: 'SG',
+    ip: '198.51.100.120',
   });
 
   // Blacklist item
@@ -719,6 +752,55 @@ app.get('/admin/blacklist', adminAuth, (req, res) => {
 });
 
 // Discovery / Candidates
+async function fetchCensysV3Candidates() {
+  const token = process.env.CENSYS_API_TOKEN || process.env.CENSYS_API_KEY;
+  if (!token) return [];
+  try {
+    const response = await fetch('https://api.platform.censys.io/v3/global/search/query', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify({
+        query: 'services.port: 11434',
+        per_page: 15
+      }),
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!response.ok) {
+      if (response.status === 403) {
+        console.info('Censys v3 API token unauthorized (403), falling back to built-in discovery pool.');
+      } else {
+        console.warn('Censys v3 API error status:', response.status);
+      }
+      return [];
+    }
+    const data = await response.json() as any;
+    const hits = data.result?.hits || data.hits || data.results || [];
+    const list = [];
+    for (const h of hits) {
+      const ip = h.ip || h.host_id || h.query_target;
+      if (!ip) continue;
+      const country = h.location?.country_code || h.country || 'US';
+      const dnsNames = h.dns?.names || h.names || [];
+      list.push({
+        ip,
+        port: 11434,
+        dns_names: dnsNames,
+        country,
+        risk_score: Math.floor(Math.random() * 25) + 5,
+        source: 'censys'
+      });
+    }
+    return list;
+  } catch (e) {
+    console.warn('Censys v3 request failed:', e);
+    return [];
+  }
+}
+
 app.get('/admin/candidates', adminAuth, (req, res) => {
   const list = Array.from(candidates.values());
   res.json({
@@ -728,31 +810,50 @@ app.get('/admin/candidates', adminAuth, (req, res) => {
   });
 });
 
-app.post('/admin/discovery/run', adminAuth, (req, res) => {
-  const sampleIps = ['198.51.100.77', '203.0.113.14', '192.0.2.89', '198.51.100.120'];
-  const sampleSources = ['shodan', 'censys', 'manual', 'greynoise'];
-  const sampleCountries = ['US', 'DE', 'FR', 'NL', 'SG'];
-
+app.post('/admin/discovery/run', adminAuth, async (req, res) => {
   let created = 0;
-  for (let i = 0; i < 2; i++) {
-    const id = `cand_${crypto.randomBytes(3).toString('hex')}`;
-    const ip = sampleIps[Math.floor(Math.random() * sampleIps.length)] + '.' + Math.floor(Math.random() * 200 + 1);
-    candidates.set(id, {
-      candidate_id: id,
-      source: sampleSources[Math.floor(Math.random() * sampleSources.length)],
-      ip,
-      port: 11434,
-      dns_names: [`node-${id.slice(5)}.discovered-ai.net`],
-      country: sampleCountries[Math.floor(Math.random() * sampleCountries.length)],
-      risk_score: Math.floor(Math.random() * 50) + 10,
-      status: 'candidate',
-      observed_at: new Date().toISOString(),
-    });
-    created++;
+  const censysItems = await fetchCensysV3Candidates();
+  if (censysItems.length > 0) {
+    for (const item of censysItems) {
+      const id = `cand_${crypto.randomBytes(3).toString('hex')}`;
+      candidates.set(id, {
+        candidate_id: id,
+        source: 'censys',
+        ip: item.ip,
+        port: item.port,
+        dns_names: item.dns_names.length ? item.dns_names : [`node-${id.slice(5)}.censys-v3.net`],
+        country: item.country,
+        risk_score: item.risk_score,
+        status: 'candidate',
+        observed_at: new Date().toISOString(),
+      });
+      created++;
+    }
+  } else {
+    const sampleIps = ['198.51.100.77', '203.0.113.14', '192.0.2.89', '198.51.100.120'];
+    const sampleSources = ['shodan', 'censys', 'manual', 'greynoise'];
+    const sampleCountries = ['US', 'DE', 'FR', 'NL', 'SG'];
+
+    for (let i = 0; i < 2; i++) {
+      const id = `cand_${crypto.randomBytes(3).toString('hex')}`;
+      const ip = sampleIps[Math.floor(Math.random() * sampleIps.length)] + '.' + Math.floor(Math.random() * 200 + 1);
+      candidates.set(id, {
+        candidate_id: id,
+        source: sampleSources[Math.floor(Math.random() * sampleSources.length)],
+        ip,
+        port: 11434,
+        dns_names: [`node-${id.slice(5)}.discovered-ai.net`],
+        country: sampleCountries[Math.floor(Math.random() * sampleCountries.length)],
+        risk_score: Math.floor(Math.random() * 50) + 10,
+        status: 'candidate',
+        observed_at: new Date().toISOString(),
+      });
+      created++;
+    }
   }
 
   addAudit('discovery_run', 'admin', 'discovery', 'scan', { created, deduped: 1 });
-  res.json({ status: 'completed', created, deduped: 1 });
+  res.json({ status: 'completed', created, deduped: 1, source: censysItems.length > 0 ? 'censys_v3' : 'fallback' });
 });
 
 app.post('/admin/candidates/:id/enroll', adminAuth, (req, res) => {

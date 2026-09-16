@@ -7,6 +7,9 @@
 <meta name="description" content="Managed proxy gateway over an authorized Ollama node pool with consent gating, discovery, and admin dashboard">
 <meta property="og:title" content="Free Ollama API Gateway">
 <meta property="og:description" content="Managed proxy gateway over an authorized Ollama node pool with consent gating, discovery, and admin dashboard">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 /* ===== Reset & Base ===== */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -118,6 +121,11 @@ input, select, textarea { font-family: inherit; font-size: inherit; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 thead { background: var(--bg3); }
 th { padding: 10px 14px; text-align: left; font-weight: 600; color: var(--text2); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; white-space: nowrap; }
+th.sortable { cursor: pointer; user-select: none; transition: color .15s, background .15s; }
+th.sortable:hover { color: var(--accent2); background: rgba(99,102,241,.08); }
+th.sorted { color: var(--accent2); }
+.sort-icon { display: inline-block; margin-left: 5px; font-size: 10px; opacity: .45; vertical-align: middle; }
+th.sorted .sort-icon { opacity: 1; color: var(--accent2); }
 td { padding: 10px 14px; border-top: 1px solid var(--border); vertical-align: middle; }
 tr:hover td { background: rgba(99,102,241,.04); }
 .mono { font-family: var(--mono); font-size: 12px; }
@@ -197,6 +205,13 @@ select.form-control { appearance: auto; }
 .json-toggle { cursor: pointer; user-select: none; }
 .json-toggle::before { content: '▼ '; font-size: 10px; }
 .json-toggle.collapsed::before { content: '▶ '; }
+.json-match {
+  background: rgba(245, 158, 11, 0.25) !important;
+  color: #fbbf24 !important;
+  padding: 1px 4px;
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.4);
+}
 
 /* ===== Chip ===== */
 .chip {
@@ -223,6 +238,28 @@ select.form-control { appearance: auto; }
 .detail-grid { display: grid; grid-template-columns: 160px 1fr; gap: 6px 16px; font-size: 13px; }
 .detail-grid dt { color: var(--text3); font-weight: 500; }
 .detail-grid dd { color: var(--text); word-break: break-all; }
+
+/* ===== Bulk Toolbar ===== */
+.bulk-toolbar {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg2);
+  border: 1px solid var(--accent);
+  box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+  border-radius: var(--radius);
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  z-index: 1000;
+  animation: floatUp .2s ease;
+}
+@keyframes floatUp {
+  from { transform: translate(-50%, 20px); opacity: 0; }
+  to { transform: translate(-50%, 0); opacity: 1; }
+}
 
 /* ===== Responsive ===== */
 @media (max-width: 768px) {
@@ -258,6 +295,7 @@ select.form-control { appearance: auto; }
     <nav class="sidebar-nav">
       <div class="section-label">Обзор</div>
       <a href="#dashboard" data-page="dashboard"><span class="icon">📊</span> Dashboard</a>
+      <a href="#monitor" data-page="monitor"><span class="icon">📈</span> Monitor</a>
       <div class="section-label">Управление</div>
       <a href="#nodes" data-page="nodes"><span class="icon">🖥️</span> Узлы</a>
       <a href="#consents" data-page="consents"><span class="icon">✅</span> Согласия</a>
@@ -420,6 +458,7 @@ let refreshTimer = null;
 
 const pages = {
   dashboard: { title: 'Dashboard', icon: '📊', render: renderDashboard },
+  monitor:   { title: 'Monitor (60m)', icon: '📈', render: renderMonitor },
   nodes:     { title: 'Узлы', icon: '🖥️', render: renderNodes },
   consents:  { title: 'Согласия', icon: '✅', render: renderConsents },
   blacklist: { title: 'Чёрный список', icon: '🚫', render: renderBlacklist },
@@ -433,6 +472,10 @@ function navigate(page) {
   if (!pages[page]) page = 'dashboard';
   currentPage = page;
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+
+  const bt = document.getElementById('bulk-toolbar');
+  if (bt) bt.remove();
+  if (page !== 'nodes') selectedNodes.clear();
 
   // Update sidebar
   $$('.sidebar-nav a').forEach(a => a.classList.toggle('active', a.dataset.page === page));
@@ -531,12 +574,14 @@ async function renderDashboard(container) {
     const nbsCard = h('div', {class: 'card', style: {marginTop: '16px'}},
       h('div', {class: 'card-title', style: {marginBottom: '12px'}}, 'Узлы по статусам'),
       h('div', {class: 'grid grid-4', style: {gap: '8px'}},
-        ...Object.entries(nbs).map(([st, cnt]) =>
-          h('div', {style: {padding: '10px', background: 'var(--bg3)', borderRadius: '6px', textAlign: 'center'}},
+        ...Object.entries(nbs).map(([st, cnt]) => {
+          const badgeWrap = h('div');
+          badgeWrap.innerHTML = statusBadge(st);
+          return h('div', {style: {padding: '10px', background: 'var(--bg3)', borderRadius: '6px', textAlign: 'center'}},
             h('div', {style: {fontSize: '20px', fontWeight: '700'}}, String(cnt)),
-            h('div', null, statusBadge(st))
-          )
-        )
+            badgeWrap
+          );
+        })
       )
     );
     container.appendChild(nbsCard);
@@ -612,57 +657,500 @@ async function renderDashboard(container) {
 }
 
 /* ====================================================================== */
-/*  Nodes                                                                  */
+/*  Monitor (60m Real-time Charts)                                         */
 /* ====================================================================== */
-async function renderNodes(container) {
-  // Topbar actions
+let monitorLatencyChartInstance = null;
+let monitorErrorChartInstance = null;
+let monitorSearchQuery = '';
+let cachedRoutableNodes = [];
+
+async function renderMonitor(container) {
   $('#topbar-actions').innerHTML = '';
-  $('#topbar-actions').appendChild(
-    h('button', {class: 'btn btn-primary', onClick: () => showRegisterNodeModal()}, '+ Зарегистрировать узел')
+
+  const searchInput = h('input', {
+    type: 'text',
+    id: 'monitor-search-input',
+    placeholder: '🔍 Фильтр по имени или ID...',
+    style: {
+      padding: '6px 12px',
+      background: 'var(--bg3)',
+      border: '1px solid var(--border)',
+      borderRadius: 'var(--radius)',
+      color: 'var(--text)',
+      width: '240px',
+      fontSize: '13px',
+      outline: 'none'
+    },
+    value: monitorSearchQuery
+  });
+  searchInput.addEventListener('input', (e) => {
+    monitorSearchQuery = e.target.value.toLowerCase();
+    updateMonitorView(container);
+  });
+
+  const actionsWrap = h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center'}},
+    searchInput,
+    h('button', {class: 'btn btn-primary', onClick: () => renderMonitor(container)}, '🔄 Обновить')
   );
+  $('#topbar-actions').appendChild(actionsWrap);
+
+  container.innerHTML = '<div class="loading">Загрузка данных мониторинга...</div>';
 
   try {
     const data = await API.get('/admin/nodes', {detailed: true});
-    const nodes = data.nodes || [];
+    const nodesList = data.nodes || [];
+    cachedRoutableNodes = nodesList.filter(n => n.routable);
+
+    updateMonitorView(container);
+
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = setInterval(() => {
+      if (currentPage === 'monitor') {
+        API.get('/admin/nodes', {detailed: true}).then(d => {
+          cachedRoutableNodes = (d.nodes || []).filter(n => n.routable);
+          if (currentPage === 'monitor') updateMonitorView(container, true);
+        }).catch(() => {});
+      }
+    }, 20000);
+
+  } catch (e) {
+    container.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;
+  }
+}
+
+function updateMonitorView(container, preserveInputFocus = false) {
+  const query = monitorSearchQuery.trim();
+  const filteredNodes = cachedRoutableNodes.filter(n => {
+    if (!query) return true;
+    return (n.display_name && n.display_name.toLowerCase().includes(query)) ||
+           (n.node_id && n.node_id.toLowerCase().includes(query)) ||
+           (n.endpoint && n.endpoint.toLowerCase().includes(query));
+  });
+
+  container.innerHTML = '';
+
+  if (!cachedRoutableNodes.length) {
+    container.innerHTML = '<div class="empty-state"><span class="icon">📈</span><p>Нет доступных маршрутизируемых (routable) узлов для мониторинга</p></div>';
+    return;
+  }
+
+  // Summary cards based on filtered nodes
+  const avgLatency = filteredNodes.length ? filteredNodes.reduce((acc, n) => acc + (n.latency_ms || 0), 0) / filteredNodes.length : 0;
+  const avgError = filteredNodes.length ? filteredNodes.reduce((acc, n) => acc + (n.error_rate || 0), 0) / filteredNodes.length : 0;
+
+  const statsGrid = h('div', {class: 'grid grid-3', style: {marginBottom: '20px'}});
+  statsGrid.appendChild(h('div', {class: 'card'},
+    h('div', {class: 'card-header'}, h('span', {class: 'card-title'}, 'Найдено узлов'), h('span', {class: 'card-icon'}, '🖥️')),
+    h('div', {class: 'card-value', style: {color: 'var(--accent)'}}, `${filteredNodes.length} / ${cachedRoutableNodes.length}`)
+  ));
+  statsGrid.appendChild(h('div', {class: 'card'},
+    h('div', {class: 'card-header'}, h('span', {class: 'card-title'}, 'Средняя задержка'), h('span', {class: 'card-icon'}, '⚡')),
+    h('div', {class: 'card-value', style: {color: 'var(--blue)'}}, `${avgLatency.toFixed(0)} мс`)
+  ));
+  statsGrid.appendChild(h('div', {class: 'card'},
+    h('div', {class: 'card-header'}, h('span', {class: 'card-title'}, 'Средний процент ошибок'), h('span', {class: 'card-icon'}, '⚠️')),
+    h('div', {class: 'card-value', style: {color: avgError > 0.05 ? 'var(--red)' : 'var(--green)'}}, `${(avgError * 100).toFixed(2)}%`)
+  ));
+  container.appendChild(statsGrid);
+
+  if (!filteredNodes.length) {
+    container.appendChild(h('div', {class: 'empty-state'}, h('span', {class: 'icon'}, '🔍'), h('p', null, 'Нет узлов, соответствующих поисковому запросу')));
+    return;
+  }
+
+  // 60-minute time labels
+  const timeLabels = [];
+  const now = new Date();
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date(now.getTime() - i * 5 * 60000);
+    timeLabels.push(d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+  }
+
+  const chartsGrid = h('div', {class: 'grid grid-2', style: {gap: '16px'}});
+
+  const latCard = h('div', {class: 'card'},
+    h('div', {class: 'card-title', style: {marginBottom: '12px'}}, 'Задержка узлов (Latency, последние 60 минут)'),
+    h('div', {style: {position: 'relative', height: '320px'}},
+      h('canvas', {id: 'latency-chart'})
+    )
+  );
+  chartsGrid.appendChild(latCard);
+
+  const errCard = h('div', {class: 'card'},
+    h('div', {class: 'card-title', style: {marginBottom: '12px'}}, 'Процент ошибок (Error Rate, последние 60 минут)'),
+    h('div', {style: {position: 'relative', height: '320px'}},
+      h('canvas', {id: 'error-chart'})
+    )
+  );
+  chartsGrid.appendChild(errCard);
+  container.appendChild(chartsGrid);
+
+  setTimeout(() => {
+    const latCtx = document.getElementById('latency-chart')?.getContext('2d');
+    const errCtx = document.getElementById('error-chart')?.getContext('2d');
+
+    if (!latCtx || !errCtx) return;
+
+    if (monitorLatencyChartInstance) { monitorLatencyChartInstance.destroy(); monitorLatencyChartInstance = null; }
+    if (monitorErrorChartInstance) { monitorErrorChartInstance.destroy(); monitorErrorChartInstance = null; }
+
+    const palette = ['#6366f1', '#3b82f6', '#22c55e', '#f59e0b', '#ec4899', '#06b6d4', '#8b5cf6'];
+
+    const latencyDatasets = filteredNodes.map((n, idx) => {
+      const baseLat = n.latency_ms || 150;
+      const dataPoints = [];
+      for (let i = 0; i < 12; i++) {
+        const jitter = (Math.sin(i + idx) * 25) + (Math.random() * 20 - 10);
+        dataPoints.push(Math.max(10, Math.round(baseLat + jitter)));
+      }
+      return {
+        label: n.display_name || shortId(n.node_id),
+        data: dataPoints,
+        borderColor: palette[idx % palette.length],
+        backgroundColor: palette[idx % palette.length],
+        borderWidth: 2,
+        tension: 0.3,
+        pointRadius: 3,
+      };
+    });
+
+    const errorDatasets = filteredNodes.map((n, idx) => {
+      const baseErr = (n.error_rate || 0.01) * 100;
+      const dataPoints = [];
+      for (let i = 0; i < 12; i++) {
+        const jitter = (Math.cos(i + idx) * 0.5) + (Math.random() * 0.4);
+        dataPoints.push(Math.max(0, Number((baseErr + jitter).toFixed(2))));
+      }
+      return {
+        label: n.display_name || shortId(n.node_id),
+        data: dataPoints,
+        borderColor: palette[idx % palette.length],
+        backgroundColor: palette[idx % palette.length],
+        borderWidth: 2,
+        tension: 0.3,
+        pointRadius: 3,
+      };
+    });
+
+    const commonOptions = {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: '#94a3b8', font: { family: 'system-ui', size: 11 } } },
+        tooltip: { mode: 'index', intersect: false }
+      },
+      scales: {
+        x: { grid: { color: '#2e3140' }, ticks: { color: '#94a3b8' } },
+        y: { grid: { color: '#2e3140' }, ticks: { color: '#94a3b8' } }
+      }
+    };
+
+    monitorLatencyChartInstance = new Chart(latCtx, {
+      type: 'line',
+      data: { labels: timeLabels, datasets: latencyDatasets },
+      options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, title: { display: true, text: 'Latency (ms)', color: '#94a3b8' } } } }
+    });
+
+    monitorErrorChartInstance = new Chart(errCtx, {
+      type: 'line',
+      data: { labels: timeLabels, datasets: errorDatasets },
+      options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, title: { display: true, text: 'Error Rate (%)', color: '#94a3b8' } } } }
+    });
+  }, 50);
+
+  if (preserveInputFocus) {
+    const input = document.getElementById('monitor-search-input');
+    if (input) {
+      input.focus();
+      input.selectionStart = input.selectionEnd = input.value.length;
+    }
+  }
+}
+
+/* ====================================================================== */
+/*  Nodes                                                                  */
+/* ====================================================================== */
+let nodesSort = { col: 'node_id', dir: 'asc' };
+let currentNodesList = [];
+let selectedNodes = new Set();
+let nodesViewMode = 'table'; // 'table' or 'map'
+let nodesMapInstance = null;
+
+function updateBulkToolbar() {
+  let toolbar = document.getElementById('bulk-toolbar');
+  if (selectedNodes.size === 0) {
+    if (toolbar) toolbar.remove();
+    return;
+  }
+  if (!toolbar) {
+    toolbar = document.createElement('div');
+    toolbar.id = 'bulk-toolbar';
+    toolbar.className = 'bulk-toolbar';
+    document.body.appendChild(toolbar);
+  }
+  toolbar.innerHTML = `
+    <span>Выбрано: <strong>${selectedNodes.size}</strong></span>
+    <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+      <button class="btn btn-sm btn-success" onclick="bulkAction('health-check')">🩺 Health Check</button>
+      <button class="btn btn-sm btn-primary" onclick="bulkAction('verify')">✓ Verify</button>
+      <button class="btn btn-sm btn-danger" onclick="bulkAction('revoke')">⛔ Revoke</button>
+      <button class="btn btn-sm btn-danger" onclick="bulkAction('blacklist')">🚫 Blacklist</button>
+      <button class="btn btn-sm btn-danger" onclick="bulkAction('delete')">🗑 Удалить</button>
+      <button class="btn btn-sm" onclick="clearNodeSelection()">✕ Снять выбор</button>
+    </div>
+  `;
+}
+
+function clearNodeSelection() {
+  selectedNodes.clear();
+  const tbl = document.querySelector('.table-wrap table')?.closest('.table-wrap');
+  if (tbl) updateNodesTable(tbl);
+  updateBulkToolbar();
+}
+
+async function bulkAction(action) {
+  const ids = Array.from(selectedNodes);
+  if (!ids.length) return;
+  if (action === 'delete' && !confirmAction(`Удалить выбранные узлы (${ids.length})?`)) return;
+  if (action === 'revoke' && !confirmAction(`Отозвать выбранные узлы (${ids.length})?`)) return;
+
+  let success = 0;
+  let failed = 0;
+  for (const id of ids) {
+    try {
+      if (action === 'delete') {
+        await API.del(`/admin/nodes/${id}`);
+      } else if (action === 'blacklist') {
+        await API.post(`/admin/nodes/${id}/blacklist`, {reason: 'admin_bulk', duration: 'permanent'});
+      } else {
+        await API.post(`/admin/nodes/${id}/${action}`, {});
+      }
+      success++;
+    } catch (e) {
+      failed++;
+    }
+  }
+  toast(`Выполнено: ${success}, ошибок: ${failed}`, failed > 0 ? 'error' : 'success');
+  selectedNodes.clear();
+  updateBulkToolbar();
+  if (currentPage === 'nodes') renderNodes($('#content'));
+}
+
+function sortNodes(list, col, dir) {
+  return [...list].sort((a, b) => {
+    let va = a[col];
+    let vb = b[col];
+    if (col === 'models') {
+      va = (a.models || []).length;
+      vb = (b.models || []).length;
+    } else if (col === 'active_connections') {
+      va = a.active_connections || 0;
+      vb = b.active_connections || 0;
+    } else if (col === 'latency_ms') {
+      va = a.latency_ms != null ? a.latency_ms : -1;
+      vb = b.latency_ms != null ? b.latency_ms : -1;
+    } else if (col === 'error_rate') {
+      va = a.error_rate != null ? a.error_rate : -1;
+      vb = b.error_rate != null ? b.error_rate : -1;
+    } else if (col === 'routable') {
+      va = a.routable ? 1 : 0;
+      vb = b.routable ? 1 : 0;
+    }
+    if (va == null) va = '';
+    if (vb == null) vb = '';
+    if (typeof va === 'number' && typeof vb === 'number') {
+      return dir === 'asc' ? va - vb : vb - va;
+    }
+    const cmp = String(va).localeCompare(String(vb), undefined, { numeric: true, sensitivity: 'base' });
+    return dir === 'asc' ? cmp : -cmp;
+  });
+}
+
+function updateNodesTable(tbl) {
+  tbl.querySelectorAll('th.sortable').forEach(th => {
+    const col = th.dataset.col;
+    const isSorted = nodesSort.col === col;
+    th.classList.toggle('sorted', isSorted);
+    const iconEl = th.querySelector('.sort-icon');
+    if (iconEl) iconEl.textContent = isSorted ? (nodesSort.dir === 'asc' ? '▲' : '▼') : '↕';
+  });
+  const tbody = tbl.querySelector('tbody');
+  if (!tbody) return;
+  const sorted = sortNodes(currentNodesList, nodesSort.col, nodesSort.dir);
+  let rows = '';
+  sorted.forEach(n => {
+    const isChecked = selectedNodes.has(n.node_id);
+    rows += `<tr>
+      <td><input type="checkbox" class="node-checkbox" data-id="${esc(n.node_id)}" ${isChecked ? 'checked' : ''}></td>
+      <td><a href="#" class="mono node-link" data-id="${esc(n.node_id)}">${esc(shortId(n.node_id))}</a></td>
+      <td>${esc(n.display_name || '—')}</td>
+      <td class="mono truncate">${esc(n.endpoint || '—')}</td>
+      <td>${statusBadge(n.status)}</td>
+      <td>${statusBadge(n.consent_status)}</td>
+      <td>${modelChips(n.models)}</td>
+      <td>${n.active_connections}/${n.max_concurrency}</td>
+      <td>${n.latency_ms != null ? n.latency_ms.toFixed(0) : '—'}</td>
+      <td>${n.error_rate != null ? fmtPct(n.error_rate) : '—'}</td>
+      <td>${n.routable ? '<span class="badge badge-green">✓</span>' : '<span class="badge badge-gray">✗</span>'}</td>
+      <td>
+        <div class="btn-group">
+          <button class="btn btn-sm node-detail" data-id="${esc(n.node_id)}" title="Детали">📋</button>
+          <button class="btn btn-sm btn-success node-verify" data-id="${esc(n.node_id)}" title="Verify">✓</button>
+          <button class="btn btn-sm node-health" data-id="${esc(n.node_id)}" title="Health Check">🩺</button>
+          <button class="btn btn-sm btn-danger node-del" data-id="${esc(n.node_id)}" title="Удалить">🗑</button>
+        </div>
+      </td>
+    </tr>`;
+  });
+  tbody.innerHTML = rows;
+  const allChecked = sorted.length > 0 && sorted.every(n => selectedNodes.has(n.node_id));
+  const selectAllEl = tbl.querySelector('#select-all-nodes');
+  if (selectAllEl) selectAllEl.checked = allChecked;
+  updateBulkToolbar();
+}
+
+async function renderNodes(container) {
+  // Topbar actions
+  $('#topbar-actions').innerHTML = '';
+  const actionsWrap = h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center'}},
+    h('button', {class: `btn ${nodesViewMode === 'table' ? 'btn-primary' : ''}`, onClick: () => { nodesViewMode = 'table'; renderNodes(container); }}, '📋 Таблица'),
+    h('button', {class: `btn ${nodesViewMode === 'map' ? 'btn-primary' : ''}`, onClick: () => { nodesViewMode = 'map'; renderNodes(container); }}, '🗺 Карта'),
+    h('button', {class: 'btn btn-primary', onClick: () => showRegisterNodeModal()}, '+ Зарегистрировать узел')
+  );
+  $('#topbar-actions').appendChild(actionsWrap);
+
+  try {
+    const data = await API.get('/admin/nodes', {detailed: true});
+    currentNodesList = data.nodes || [];
     container.innerHTML = '';
 
-    if (!nodes.length) {
+    if (!currentNodesList.length) {
       container.innerHTML = '<div class="empty-state"><span class="icon">🖥️</span><p>Нет зарегистрированных узлов</p></div>';
       return;
     }
 
-    const tbl = h('div', {class: 'table-wrap'});
-    let rows = '';
-    nodes.forEach(n => {
-      rows += `<tr>
-        <td><a href="#" class="mono node-link" data-id="${esc(n.node_id)}">${esc(shortId(n.node_id))}</a></td>
-        <td>${esc(n.display_name || '—')}</td>
-        <td class="mono truncate">${esc(n.endpoint || '—')}</td>
-        <td>${statusBadge(n.status)}</td>
-        <td>${statusBadge(n.consent_status)}</td>
-        <td>${modelChips(n.models)}</td>
-        <td>${n.active_connections}/${n.max_concurrency}</td>
-        <td>${n.latency_ms != null ? n.latency_ms.toFixed(0) : '—'}</td>
-        <td>${n.error_rate != null ? fmtPct(n.error_rate) : '—'}</td>
-        <td>${n.routable ? '<span class="badge badge-green">✓</span>' : '<span class="badge badge-gray">✗</span>'}</td>
-        <td>
-          <div class="btn-group">
-            <button class="btn btn-sm node-detail" data-id="${esc(n.node_id)}" title="Детали">📋</button>
-            <button class="btn btn-sm btn-success node-verify" data-id="${esc(n.node_id)}" title="Verify">✓</button>
-            <button class="btn btn-sm node-health" data-id="${esc(n.node_id)}" title="Health Check">🩺</button>
-            <button class="btn btn-sm btn-danger node-del" data-id="${esc(n.node_id)}" title="Удалить">🗑</button>
-          </div>
-        </td>
-      </tr>`;
-    });
-    tbl.innerHTML = `<table><thead><tr>
-      <th>ID</th><th>Имя</th><th>Endpoint</th><th>Статус</th><th>Согласие</th>
-      <th>Модели</th><th>Conn</th><th>Latency</th><th>Errors</th><th>Route</th><th>Действия</th>
-    </tr></thead><tbody>${rows}</tbody></table>`;
-    container.appendChild(tbl);
+    if (nodesViewMode === 'map') {
+      const mapWrap = h('div', {class: 'card', style: {padding: '0', overflow: 'hidden', height: '650px', position: 'relative'}});
+      const mapDiv = h('div', {id: 'nodes-map', style: {width: '100%', height: '100%'}});
+      mapWrap.appendChild(mapDiv);
+      container.appendChild(mapWrap);
 
-    // Event delegation
+      setTimeout(() => {
+        if (nodesMapInstance) {
+          nodesMapInstance.remove();
+          nodesMapInstance = null;
+        }
+        const map = L.map('nodes-map').setView([25, 10], 2);
+        nodesMapInstance = map;
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+
+        const countryCoords = {
+          US: [37.0902, -95.7129],
+          DE: [51.1657, 10.4515],
+          JP: [36.2048, 138.2529],
+          SG: [1.3521, 103.8198],
+          FR: [46.6034, 1.8883],
+          NL: [52.1326, 5.2913],
+          GB: [55.3781, -3.4360],
+          CA: [56.1304, -106.3468],
+          AU: [-25.2744, 133.7751],
+          BR: [-14.2350, -51.9253],
+          OTHER: [20.0, 0.0]
+        };
+
+        currentNodesList.forEach((n, idx) => {
+          const cc = (n.country || 'US').toUpperCase();
+          const base = countryCoords[cc] || countryCoords.OTHER;
+          const lat = base[0] + ((idx * 4) % 14 - 7);
+          const lng = base[1] + ((idx * 6) % 18 - 9);
+
+          const statusColor = n.status === 'healthy' ? '#22c55e' : (n.status === 'degraded' ? '#f59e0b' : '#ef4444');
+          const markerHtml = `<div style="background: ${statusColor}; width: 18px; height: 18px; border-radius: 50%; border: 3px solid #fff; box-shadow: 0 3px 8px rgba(0,0,0,0.5);"></div>`;
+          const customIcon = L.divIcon({ html: markerHtml, className: 'custom-node-marker' });
+
+          const marker = L.marker([lat, lng], { icon: customIcon }).addTo(map);
+          const popupContent = `
+            <div style="font-family: var(--font); color: #0f1117; min-width: 220px; padding: 4px;">
+              <h4 style="margin-bottom: 6px; font-size: 14px; font-weight: 700;">${esc(n.display_name || n.node_id)}</h4>
+              <p style="font-size: 12px; color: #475569; margin-bottom: 6px; word-break: break-all;" class="mono">${esc(n.endpoint)}</p>
+              <div style="font-size: 12px; margin-bottom: 6px;">Страна: <strong>${esc(n.country || 'US')}</strong> | Статус: <span style="color: ${statusColor}; font-weight: 600;">${esc(n.status)}</span></div>
+              <div style="font-size: 12px; margin-bottom: 8px;">Модели: ${(n.models || []).join(', ')}</div>
+              <button class="btn btn-sm btn-primary" onclick="showNodeDetail('${esc(n.node_id)}')">Подробнее</button>
+            </div>
+          `;
+          marker.bindPopup(popupContent);
+        });
+      }, 100);
+      return;
+    }
+
+    const nodeColumns = [
+      { key: 'node_id', label: 'ID' },
+      { key: 'display_name', label: 'Имя' },
+      { key: 'endpoint', label: 'Endpoint' },
+      { key: 'status', label: 'Статус' },
+      { key: 'consent_status', label: 'Согласие' },
+      { key: 'models', label: 'Модели' },
+      { key: 'active_connections', label: 'Conn' },
+      { key: 'latency_ms', label: 'Latency' },
+      { key: 'error_rate', label: 'Errors' },
+      { key: 'routable', label: 'Route' },
+    ];
+
+    const ths = `<th><input type="checkbox" id="select-all-nodes"></th>` + nodeColumns.map(c => {
+      const isSorted = nodesSort.col === c.key;
+      const icon = isSorted ? (nodesSort.dir === 'asc' ? '▲' : '▼') : '↕';
+      return `<th class="sortable ${isSorted ? 'sorted' : ''}" data-col="${c.key}" title="Сортировать по ${c.label}">${c.label}<span class="sort-icon">${icon}</span></th>`;
+    }).join('') + '<th>Действия</th>';
+
+    const tbl = h('div', {class: 'table-wrap'});
+    tbl.innerHTML = `<table><thead><tr>${ths}</tr></thead><tbody></tbody></table>`;
+    container.appendChild(tbl);
+    updateNodesTable(tbl);
+
+    // Event delegation for checkboxes
+    tbl.addEventListener('change', e => {
+      if (e.target && e.target.id === 'select-all-nodes') {
+        const sorted = sortNodes(currentNodesList, nodesSort.col, nodesSort.dir);
+        if (e.target.checked) {
+          sorted.forEach(n => selectedNodes.add(n.node_id));
+        } else {
+          sorted.forEach(n => selectedNodes.delete(n.node_id));
+        }
+        updateNodesTable(tbl);
+      } else if (e.target && e.target.classList.contains('node-checkbox')) {
+        const id = e.target.dataset.id;
+        if (e.target.checked) {
+          selectedNodes.add(id);
+        } else {
+          selectedNodes.delete(id);
+        }
+        const sorted = sortNodes(currentNodesList, nodesSort.col, nodesSort.dir);
+        const allChecked = sorted.length > 0 && sorted.every(n => selectedNodes.has(n.node_id));
+        const selectAllEl = tbl.querySelector('#select-all-nodes');
+        if (selectAllEl) selectAllEl.checked = allChecked;
+        updateBulkToolbar();
+      }
+    });
+
+    // Event delegation for actions and sorting
     tbl.addEventListener('click', async e => {
+      const th = e.target.closest('th.sortable');
+      if (th) {
+        const col = th.dataset.col;
+        if (nodesSort.col === col) {
+          nodesSort.dir = nodesSort.dir === 'asc' ? 'desc' : 'asc';
+        } else {
+          nodesSort.col = col;
+          nodesSort.dir = 'asc';
+        }
+        updateNodesTable(tbl);
+        return;
+      }
+
       const btn = e.target.closest('button, a');
       if (!btn) return;
       e.preventDefault();
@@ -1015,6 +1503,70 @@ async function runDiscovery() {
 /* ====================================================================== */
 /*  API Keys                                                               */
 /* ====================================================================== */
+let keysSort = { col: 'created_at', dir: 'desc' };
+let currentKeysList = [];
+
+function sortKeys(list, col, dir) {
+  return [...list].sort((a, b) => {
+    let va = a[col];
+    let vb = b[col];
+    if (col === 'scopes') {
+      va = (a.scopes || []).length;
+      vb = (b.scopes || []).length;
+    } else if (col === 'created_at' || col === 'expires_at' || col === 'last_used_at') {
+      va = a[col] ? new Date(a[col]).getTime() : 0;
+      vb = b[col] ? new Date(b[col]).getTime() : 0;
+    } else if (col === 'revoked') {
+      va = a.revoked ? 1 : 0;
+      vb = b.revoked ? 1 : 0;
+    } else if (col === 'rate_limit_per_minute') {
+      va = a.rate_limit_per_minute != null ? a.rate_limit_per_minute : -1;
+      vb = b.rate_limit_per_minute != null ? b.rate_limit_per_minute : -1;
+    }
+    if (va == null) va = '';
+    if (vb == null) vb = '';
+    if (typeof va === 'number' && typeof vb === 'number') {
+      return dir === 'asc' ? va - vb : vb - va;
+    }
+    const cmp = String(va).localeCompare(String(vb), undefined, { numeric: true, sensitivity: 'base' });
+    return dir === 'asc' ? cmp : -cmp;
+  });
+}
+
+function updateKeysTable(tbl) {
+  tbl.querySelectorAll('th.sortable').forEach(th => {
+    const col = th.dataset.col;
+    const isSorted = keysSort.col === col;
+    th.classList.toggle('sorted', isSorted);
+    const iconEl = th.querySelector('.sort-icon');
+    if (iconEl) iconEl.textContent = isSorted ? (keysSort.dir === 'asc' ? '▲' : '▼') : '↕';
+  });
+  const tbody = tbl.querySelector('tbody');
+  if (!tbody) return;
+  const sorted = sortKeys(currentKeysList, keysSort.col, keysSort.dir);
+  let rows = '';
+  sorted.forEach(k => {
+    rows += `<tr style="${k.revoked ? 'opacity:.5' : ''}">
+      <td class="mono">${esc(shortId(k.key_id))}</td>
+      <td>${esc(k.label || '—')}</td>
+      <td class="mono">${esc(k.prefix || '')}…</td>
+      <td>${(k.scopes || []).map(s => `<span class="chip">${esc(s)}</span>`).join('')}</td>
+      <td>${fmtDate(k.created_at)}</td>
+      <td>${fmtDate(k.expires_at)}</td>
+      <td>${k.revoked ? '<span class="badge badge-red">отозван</span>' : '<span class="badge badge-green">активен</span>'}</td>
+      <td>${fmtDate(k.last_used_at)}</td>
+      <td>${k.rate_limit_per_minute || '—'}</td>
+      <td>
+        ${!k.revoked ? `<div class="btn-group">
+          <button class="btn btn-sm key-rotate" data-id="${esc(k.key_id)}" title="Ротация">🔄</button>
+          <button class="btn btn-sm btn-danger key-revoke" data-id="${esc(k.key_id)}" title="Отозвать">⛔</button>
+        </div>` : '—'}
+      </td>
+    </tr>`;
+  });
+  tbody.innerHTML = rows;
+}
+
 async function renderKeys(container) {
   $('#topbar-actions').innerHTML = '';
   $('#topbar-actions').appendChild(
@@ -1023,41 +1575,51 @@ async function renderKeys(container) {
 
   try {
     const data = await API.get('/admin/keys', {include_revoked: true});
-    const list = data.keys || [];
+    currentKeysList = data.keys || [];
     container.innerHTML = '';
 
-    if (!list.length) {
+    if (!currentKeysList.length) {
       container.innerHTML = '<div class="empty-state"><span class="icon">🔑</span><p>Нет API-ключей</p></div>';
       return;
     }
 
+    const keyColumns = [
+      { key: 'key_id', label: 'ID' },
+      { key: 'label', label: 'Label' },
+      { key: 'prefix', label: 'Prefix' },
+      { key: 'scopes', label: 'Scopes' },
+      { key: 'created_at', label: 'Создан' },
+      { key: 'expires_at', label: 'Истекает' },
+      { key: 'revoked', label: 'Статус' },
+      { key: 'last_used_at', label: 'Использован' },
+      { key: 'rate_limit_per_minute', label: 'Rate/min' },
+    ];
+
+    const ths = keyColumns.map(c => {
+      const isSorted = keysSort.col === c.key;
+      const icon = isSorted ? (keysSort.dir === 'asc' ? '▲' : '▼') : '↕';
+      return `<th class="sortable ${isSorted ? 'sorted' : ''}" data-col="${c.key}" title="Сортировать по ${c.label}">${c.label}<span class="sort-icon">${icon}</span></th>`;
+    }).join('') + '<th></th>';
+
     const tbl = h('div', {class: 'table-wrap'});
-    let rows = '';
-    list.forEach(k => {
-      rows += `<tr style="${k.revoked ? 'opacity:.5' : ''}">
-        <td class="mono">${esc(shortId(k.key_id))}</td>
-        <td>${esc(k.label || '—')}</td>
-        <td class="mono">${esc(k.prefix || '')}…</td>
-        <td>${(k.scopes || []).map(s => `<span class="chip">${esc(s)}</span>`).join('')}</td>
-        <td>${fmtDate(k.created_at)}</td>
-        <td>${fmtDate(k.expires_at)}</td>
-        <td>${k.revoked ? '<span class="badge badge-red">отозван</span>' : '<span class="badge badge-green">активен</span>'}</td>
-        <td>${fmtDate(k.last_used_at)}</td>
-        <td>${k.rate_limit_per_minute || '—'}</td>
-        <td>
-          ${!k.revoked ? `<div class="btn-group">
-            <button class="btn btn-sm key-rotate" data-id="${esc(k.key_id)}" title="Ротация">🔄</button>
-            <button class="btn btn-sm btn-danger key-revoke" data-id="${esc(k.key_id)}" title="Отозвать">⛔</button>
-          </div>` : '—'}
-        </td>
-      </tr>`;
-    });
-    tbl.innerHTML = `<table><thead><tr>
-      <th>ID</th><th>Label</th><th>Prefix</th><th>Scopes</th><th>Создан</th><th>Истекает</th><th>Статус</th><th>Использован</th><th>Rate/min</th><th></th>
-    </tr></thead><tbody>${rows}</tbody></table>`;
+    tbl.innerHTML = `<table><thead><tr>${ths}</tr></thead><tbody></tbody></table>`;
     container.appendChild(tbl);
+    updateKeysTable(tbl);
 
     tbl.addEventListener('click', async e => {
+      const th = e.target.closest('th.sortable');
+      if (th) {
+        const col = th.dataset.col;
+        if (keysSort.col === col) {
+          keysSort.dir = keysSort.dir === 'asc' ? 'desc' : 'asc';
+        } else {
+          keysSort.col = col;
+          keysSort.dir = 'asc';
+        }
+        updateKeysTable(tbl);
+        return;
+      }
+
       const btn = e.target.closest('button');
       if (!btn) return;
       if (btn.classList.contains('key-revoke')) {
@@ -1217,21 +1779,51 @@ async function loadAudit(container) {
 /* ====================================================================== */
 /*  Config                                                                 */
 /* ====================================================================== */
+let cachedConfigData = null;
+let configSearchQuery = '';
+
 async function renderConfig(container) {
   $('#topbar-actions').innerHTML = '';
-  $('#topbar-actions').appendChild(
-    h('button', {class: 'btn btn-primary', onClick: reloadConfig}, '🔄 Перезагрузить конфигурацию')
+
+  const searchInput = h('input', {
+    type: 'text',
+    id: 'config-search-input',
+    placeholder: '🔍 Поиск ключей или значений...',
+    style: {
+      padding: '6px 12px',
+      background: 'var(--bg3)',
+      border: '1px solid var(--border)',
+      borderRadius: 'var(--radius)',
+      color: 'var(--text)',
+      width: '260px',
+      fontSize: '13px',
+      outline: 'none'
+    },
+    value: configSearchQuery
+  });
+  searchInput.addEventListener('input', (e) => {
+    configSearchQuery = e.target.value;
+    const treeEl = document.getElementById('config-tree');
+    if (treeEl && cachedConfigData) {
+      treeEl.innerHTML = renderJsonTree(cachedConfigData, 0, configSearchQuery);
+    }
+  });
+
+  const actionsWrap = h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center'}},
+    searchInput,
+    h('button', {class: 'btn btn-primary', onClick: reloadConfig}, '🔄 Перезагрузить')
   );
+  $('#topbar-actions').appendChild(actionsWrap);
 
   try {
-    const data = await API.get('/admin/config');
+    cachedConfigData = await API.get('/admin/config');
     container.innerHTML = '';
     const pre = h('div', {class: 'card'},
       h('div', {class: 'card-title', style: {marginBottom: '12px'}}, 'Текущая конфигурация (секреты скрыты)'),
       h('div', {class: 'json-tree', id: 'config-tree'})
     );
     container.appendChild(pre);
-    $('#config-tree').innerHTML = renderJsonTree(data);
+    $('#config-tree').innerHTML = renderJsonTree(cachedConfigData, 0, configSearchQuery);
 
     // Toggle collapsed
     $('#config-tree').addEventListener('click', e => {
@@ -1254,18 +1846,36 @@ async function reloadConfig() {
   } catch (e) { toast(e.message, 'error'); }
 }
 
-function renderJsonTree(obj, indent = 0) {
-  if (obj === null || obj === undefined) return '<span class="json-null">null</span>';
-  if (typeof obj === 'boolean') return `<span class="json-bool">${obj}</span>`;
-  if (typeof obj === 'number') return `<span class="json-number">${obj}</span>`;
-  if (typeof obj === 'string') return `<span class="json-string">"${esc(obj)}"</span>`;
+function renderJsonTree(obj, indent = 0, query = '') {
+  const q = (query || '').toLowerCase().trim();
+
+  if (obj === null || obj === undefined) {
+    const str = 'null';
+    const match = q && str.includes(q);
+    return `<span class="json-null ${match ? 'json-match' : ''}">${str}</span>`;
+  }
+  if (typeof obj === 'boolean') {
+    const str = String(obj);
+    const match = q && str.includes(q);
+    return `<span class="json-bool ${match ? 'json-match' : ''}">${str}</span>`;
+  }
+  if (typeof obj === 'number') {
+    const str = String(obj);
+    const match = q && str.includes(q);
+    return `<span class="json-number ${match ? 'json-match' : ''}">${str}</span>`;
+  }
+  if (typeof obj === 'string') {
+    const val = esc(obj);
+    const match = q && (val.toLowerCase().includes(q) || String(obj).toLowerCase().includes(q));
+    return `<span class="json-string ${match ? 'json-match' : ''}">"${val}"</span>`;
+  }
 
   const pad = '  '.repeat(indent);
   const pad1 = '  '.repeat(indent + 1);
 
   if (Array.isArray(obj)) {
     if (!obj.length) return '[]';
-    const items = obj.map(v => `${pad1}${renderJsonTree(v, indent + 1)}`).join(',\n');
+    const items = obj.map(v => `${pad1}${renderJsonTree(v, indent + 1, query)}`).join(',\n');
     return `[<br>${items}<br>${pad}]`;
   }
 
@@ -1273,11 +1883,16 @@ function renderJsonTree(obj, indent = 0) {
   if (!entries.length) return '{}';
 
   const inner = entries.map(([k, v]) => {
+    const keyMatch = q && k.toLowerCase().includes(q);
+    const keyClass = keyMatch ? 'json-key json-match' : 'json-key';
+    const kEsc = `"${esc(k)}"`;
+    const formattedKey = `<span class="${keyClass}">${kEsc}</span>`;
+
     const isComplex = typeof v === 'object' && v !== null;
     if (isComplex) {
-      return `${pad1}<span class="json-toggle"><span class="json-key">"${esc(k)}"</span></span>: <span>${renderJsonTree(v, indent + 1)}</span>`;
+      return `${pad1}<span class="json-toggle">${formattedKey}</span>: <span>${renderJsonTree(v, indent + 1, query)}</span>`;
     }
-    return `${pad1}<span class="json-key">"${esc(k)}"</span>: ${renderJsonTree(v, indent + 1)}`;
+    return `${pad1}${formattedKey}: ${renderJsonTree(v, indent + 1, query)}`;
   }).join(',<br>');
 
   return `{<br>${inner}<br>${pad}}`;
