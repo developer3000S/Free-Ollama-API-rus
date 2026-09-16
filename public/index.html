@@ -1,0 +1,1288 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Free Ollama API Gateway</title>
+<meta name="description" content="Managed proxy gateway over an authorized Ollama node pool with consent gating, discovery, and admin dashboard">
+<meta property="og:title" content="Free Ollama API Gateway">
+<meta property="og:description" content="Managed proxy gateway over an authorized Ollama node pool with consent gating, discovery, and admin dashboard">
+<style>
+/* ===== Reset & Base ===== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0f1117; --bg2: #1a1d27; --bg3: #242734; --bg4: #2e3140;
+  --text: #e2e8f0; --text2: #94a3b8; --text3: #64748b;
+  --accent: #6366f1; --accent2: #818cf8;
+  --green: #22c55e; --yellow: #f59e0b; --red: #ef4444; --blue: #3b82f6; --cyan: #06b6d4;
+  --border: #2e3140; --radius: 8px; --radius-sm: 4px;
+  --sidebar-w: 240px;
+  --font: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --mono: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+}
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; line-height: 1.5; }
+a { color: var(--accent2); text-decoration: none; }
+a:hover { text-decoration: underline; }
+button { cursor: pointer; font-family: inherit; font-size: inherit; }
+input, select, textarea { font-family: inherit; font-size: inherit; }
+
+/* ===== Login Screen ===== */
+#login-screen {
+  display: flex; align-items: center; justify-content: center;
+  height: 100vh; background: var(--bg);
+}
+.login-box {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+  padding: 40px; width: 400px; max-width: 90vw; text-align: center;
+}
+.login-box h1 { font-size: 24px; margin-bottom: 4px; }
+.login-box .subtitle { color: var(--text2); margin-bottom: 28px; font-size: 13px; }
+.login-box .logo { font-size: 40px; margin-bottom: 16px; display: block; }
+.login-box input {
+  width: 100%; padding: 10px 14px; background: var(--bg3); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); margin-bottom: 12px; outline: none;
+}
+.login-box input:focus { border-color: var(--accent); }
+.login-box .btn-login {
+  width: 100%; padding: 10px; background: var(--accent); color: #fff; border: none;
+  border-radius: var(--radius); font-weight: 600; font-size: 14px; margin-top: 4px;
+}
+.login-box .btn-login:hover { background: var(--accent2); }
+.login-error { color: var(--red); font-size: 13px; margin-top: 8px; min-height: 20px; }
+
+/* ===== App Layout ===== */
+#app { display: none; height: 100vh; }
+#app.active { display: flex; }
+
+/* ===== Sidebar ===== */
+.sidebar {
+  width: var(--sidebar-w); background: var(--bg2); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; flex-shrink: 0; overflow-y: auto;
+}
+.sidebar-brand {
+  padding: 20px 16px; border-bottom: 1px solid var(--border);
+  font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 10px;
+}
+.sidebar-brand .icon { font-size: 22px; }
+.sidebar-nav { padding: 8px; flex: 1; }
+.sidebar-nav a {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; border-radius: var(--radius); color: var(--text2);
+  font-size: 13px; font-weight: 500; margin-bottom: 2px; transition: all .15s;
+}
+.sidebar-nav a:hover { background: var(--bg3); color: var(--text); text-decoration: none; }
+.sidebar-nav a.active { background: var(--accent); color: #fff; }
+.sidebar-nav a .icon { width: 20px; text-align: center; font-size: 16px; }
+.sidebar-nav .section-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--text3); padding: 16px 12px 6px; font-weight: 600;
+}
+.sidebar-footer {
+  padding: 12px 16px; border-top: 1px solid var(--border);
+  font-size: 12px; color: var(--text3); display: flex; align-items: center; justify-content: space-between;
+}
+.sidebar-footer button {
+  background: none; border: none; color: var(--text3); font-size: 12px; padding: 4px 8px;
+  border-radius: var(--radius-sm);
+}
+.sidebar-footer button:hover { color: var(--red); background: rgba(239,68,68,.1); }
+
+/* ===== Main Content ===== */
+.main { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
+.topbar {
+  padding: 16px 24px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg); position: sticky; top: 0; z-index: 10;
+}
+.topbar h2 { font-size: 18px; font-weight: 600; }
+.topbar-actions { display: flex; gap: 8px; align-items: center; }
+.content { padding: 24px; flex: 1; }
+
+/* ===== Cards & Widgets ===== */
+.grid { display: grid; gap: 16px; }
+.grid-2 { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+.grid-3 { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.grid-4 { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+.card {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 20px;
+}
+.card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.card-title { font-size: 13px; font-weight: 600; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; }
+.card-value { font-size: 28px; font-weight: 700; }
+.card-sub { font-size: 12px; color: var(--text3); margin-top: 4px; }
+.card-icon { font-size: 24px; }
+
+/* ===== Tables ===== */
+.table-wrap { overflow-x: auto; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+thead { background: var(--bg3); }
+th { padding: 10px 14px; text-align: left; font-weight: 600; color: var(--text2); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; white-space: nowrap; }
+td { padding: 10px 14px; border-top: 1px solid var(--border); vertical-align: middle; }
+tr:hover td { background: rgba(99,102,241,.04); }
+.mono { font-family: var(--mono); font-size: 12px; }
+.truncate { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ===== Badges ===== */
+.badge {
+  display: inline-block; padding: 2px 8px; border-radius: 10px;
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .3px;
+}
+.badge-green { background: rgba(34,197,94,.15); color: var(--green); }
+.badge-yellow { background: rgba(245,158,11,.15); color: var(--yellow); }
+.badge-red { background: rgba(239,68,68,.15); color: var(--red); }
+.badge-blue { background: rgba(59,130,246,.15); color: var(--blue); }
+.badge-gray { background: rgba(100,116,139,.15); color: var(--text3); }
+.badge-cyan { background: rgba(6,182,212,.15); color: var(--cyan); }
+
+/* ===== Buttons ===== */
+.btn {
+  padding: 7px 14px; border-radius: var(--radius); border: 1px solid var(--border);
+  background: var(--bg3); color: var(--text); font-size: 13px; font-weight: 500;
+  display: inline-flex; align-items: center; gap: 6px; transition: all .15s;
+}
+.btn:hover { background: var(--bg4); border-color: var(--text3); }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary:hover { background: var(--accent2); border-color: var(--accent2); }
+.btn-danger { background: rgba(239,68,68,.15); border-color: var(--red); color: var(--red); }
+.btn-danger:hover { background: var(--red); color: #fff; }
+.btn-success { background: rgba(34,197,94,.15); border-color: var(--green); color: var(--green); }
+.btn-success:hover { background: var(--green); color: #fff; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+.btn-icon { padding: 6px; width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center; }
+.btn-group { display: flex; gap: 4px; }
+
+/* ===== Forms & Modals ===== */
+.form-group { margin-bottom: 14px; }
+.form-group label { display: block; font-size: 12px; font-weight: 600; color: var(--text2); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .3px; }
+.form-control {
+  width: 100%; padding: 8px 12px; background: var(--bg3); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); outline: none;
+}
+.form-control:focus { border-color: var(--accent); }
+select.form-control { appearance: auto; }
+.checkbox-group { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.checkbox-group label { display: flex; align-items: center; gap: 4px; font-size: 13px; color: var(--text); text-transform: none; letter-spacing: 0; font-weight: 400; cursor: pointer; }
+.checkbox-group input[type="checkbox"] { accent-color: var(--accent); }
+
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex;
+  align-items: center; justify-content: center; z-index: 1000;
+}
+.modal {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+  padding: 24px; width: 520px; max-width: 90vw; max-height: 85vh; overflow-y: auto;
+}
+.modal h3 { font-size: 17px; margin-bottom: 16px; }
+.modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+
+/* ===== Toast ===== */
+.toast-container { position: fixed; top: 16px; right: 16px; z-index: 2000; display: flex; flex-direction: column; gap: 8px; }
+.toast {
+  padding: 12px 20px; border-radius: var(--radius); font-size: 13px; font-weight: 500;
+  min-width: 260px; animation: slideIn .3s ease; box-shadow: 0 4px 16px rgba(0,0,0,.4);
+}
+.toast-success { background: #166534; color: #bbf7d0; border: 1px solid var(--green); }
+.toast-error { background: #7f1d1d; color: #fecaca; border: 1px solid var(--red); }
+.toast-info { background: #1e3a5f; color: #bfdbfe; border: 1px solid var(--blue); }
+@keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+/* ===== JSON Tree ===== */
+.json-tree { font-family: var(--mono); font-size: 12px; line-height: 1.7; }
+.json-key { color: var(--accent2); }
+.json-string { color: var(--green); }
+.json-number { color: var(--yellow); }
+.json-bool { color: var(--cyan); }
+.json-null { color: var(--text3); }
+.json-toggle { cursor: pointer; user-select: none; }
+.json-toggle::before { content: '▼ '; font-size: 10px; }
+.json-toggle.collapsed::before { content: '▶ '; }
+
+/* ===== Chip ===== */
+.chip {
+  display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 11px;
+  background: var(--bg4); color: var(--text2); margin: 1px 2px; font-family: var(--mono);
+}
+
+/* ===== Security flags ===== */
+.flag-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.flag {
+  display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px;
+  border-radius: 6px; font-size: 12px; font-weight: 500;
+}
+.flag-on { background: rgba(34,197,94,.12); color: var(--green); }
+.flag-off { background: rgba(239,68,68,.1); color: var(--red); }
+
+/* ===== Misc ===== */
+.empty-state { text-align: center; padding: 48px 24px; color: var(--text3); }
+.empty-state .icon { font-size: 48px; margin-bottom: 12px; display: block; }
+.loading { text-align: center; padding: 32px; color: var(--text3); }
+.toolbar { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+.toolbar .spacer { flex: 1; }
+.tag-input { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+.detail-grid { display: grid; grid-template-columns: 160px 1fr; gap: 6px 16px; font-size: 13px; }
+.detail-grid dt { color: var(--text3); font-weight: 500; }
+.detail-grid dd { color: var(--text); word-break: break-all; }
+
+/* ===== Responsive ===== */
+@media (max-width: 768px) {
+  .sidebar { display: none; }
+  .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+  .content { padding: 16px; }
+}
+</style>
+</head>
+<body>
+
+<!-- ===== Toast Container ===== -->
+<div class="toast-container" id="toasts"></div>
+
+<!-- ===== Login Screen ===== -->
+<div id="login-screen">
+  <div class="login-box">
+    <span class="logo">🦙</span>
+    <h1>FOA Gateway</h1>
+    <p class="subtitle">Панель администрирования</p>
+    <input type="password" id="login-token" placeholder="Admin / Auditor Token (например: foa-admin-secret)" value="foa-admin-secret" autocomplete="off">
+    <button class="btn-login" onclick="doLogin()">Войти в панель</button>
+    <div style="margin-top: 10px; font-size: 12px; color: var(--text3);">Демо-токен: <span style="color:var(--accent2); font-family:var(--mono);">foa-admin-secret</span></div>
+    <div class="login-error" id="login-error"></div>
+  </div>
+</div>
+
+<!-- ===== App Layout ===== -->
+<div id="app">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-brand"><span class="icon">🦙</span> FOA Gateway</div>
+    <nav class="sidebar-nav">
+      <div class="section-label">Обзор</div>
+      <a href="#dashboard" data-page="dashboard"><span class="icon">📊</span> Dashboard</a>
+      <div class="section-label">Управление</div>
+      <a href="#nodes" data-page="nodes"><span class="icon">🖥️</span> Узлы</a>
+      <a href="#consents" data-page="consents"><span class="icon">✅</span> Согласия</a>
+      <a href="#blacklist" data-page="blacklist"><span class="icon">🚫</span> Чёрный список</a>
+      <a href="#discovery" data-page="discovery"><span class="icon">🔍</span> Discovery</a>
+      <a href="#keys" data-page="keys"><span class="icon">🔑</span> API-ключи</a>
+      <div class="section-label">Система</div>
+      <a href="#audit" data-page="audit"><span class="icon">📋</span> Аудит</a>
+      <a href="#config" data-page="config"><span class="icon">⚙️</span> Конфигурация</a>
+    </nav>
+    <div class="sidebar-footer">
+      <span id="sidebar-version"></span>
+      <button onclick="doLogout()">Выйти</button>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <div class="main">
+    <div class="topbar">
+      <h2 id="page-title">Dashboard</h2>
+      <div class="topbar-actions" id="topbar-actions"></div>
+    </div>
+    <div class="content" id="content"></div>
+  </div>
+</div>
+
+<!-- ===== Modals Container ===== -->
+<div id="modals"></div>
+
+<script>
+/* ====================================================================== */
+/*  API Client                                                             */
+/* ====================================================================== */
+const API = {
+  token: '',
+  base: '',
+
+  headers() {
+    return { 'Authorization': `Bearer ${this.token}`, 'Content-Type': 'application/json' };
+  },
+
+  async get(path, params) {
+    const url = new URL(this.base + path, location.origin);
+    if (params) Object.entries(params).forEach(([k,v]) => { if (v != null) url.searchParams.set(k, v); });
+    const res = await fetch(url, { headers: this.headers() });
+    if (!res.ok) throw await this._err(res);
+    return res.json();
+  },
+
+  async post(path, body) {
+    const res = await fetch(this.base + path, { method: 'POST', headers: this.headers(), body: JSON.stringify(body || {}) });
+    if (!res.ok) throw await this._err(res);
+    return res.json();
+  },
+
+  async patch(path, body) {
+    const res = await fetch(this.base + path, { method: 'PATCH', headers: this.headers(), body: JSON.stringify(body || {}) });
+    if (!res.ok) throw await this._err(res);
+    return res.json();
+  },
+
+  async del(path) {
+    const res = await fetch(this.base + path, { method: 'DELETE', headers: this.headers() });
+    if (!res.ok) throw await this._err(res);
+    return res.json();
+  },
+
+  async put(path, body) {
+    const res = await fetch(this.base + path, { method: 'PUT', headers: this.headers(), body: JSON.stringify(body || {}) });
+    if (!res.ok) throw await this._err(res);
+    return res.json();
+  },
+
+  async _err(res) {
+    try { const j = await res.json(); return new Error(j.error || j.detail || JSON.stringify(j)); }
+    catch { return new Error(`HTTP ${res.status}`); }
+  }
+};
+
+/* ====================================================================== */
+/*  Utils                                                                  */
+/* ====================================================================== */
+function $(sel, ctx) { return (ctx || document).querySelector(sel); }
+function $$(sel, ctx) { return [...(ctx || document).querySelectorAll(sel)]; }
+function h(tag, attrs, ...children) {
+  const el = document.createElement(tag);
+  if (attrs) Object.entries(attrs).forEach(([k,v]) => {
+    if (k === 'class') el.className = v;
+    else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2).toLowerCase(), v);
+    else el.setAttribute(k, v);
+  });
+  children.flat(9).forEach(c => {
+    if (c == null) return;
+    el.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  });
+  return el;
+}
+
+function shortId(id) { return id ? (id.length > 12 ? id.slice(0, 10) + '…' : id) : '—'; }
+function fmtDate(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleDateString('ru-RU') + ' ' + d.toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit'});
+}
+function fmtPct(v) { return (v * 100).toFixed(1) + '%'; }
+
+function statusBadge(status) {
+  const map = {
+    healthy: 'green', verified: 'green', active: 'green',
+    degraded: 'yellow', pending: 'yellow', pending_consent: 'yellow',
+    consent_challenge_sent: 'yellow', challenge_sent: 'yellow',
+    unhealthy: 'red', blacklisted: 'red', revoked: 'red', quarantined: 'red',
+    failed: 'red', expired: 'red',
+    draining: 'blue', candidate: 'cyan', none: 'gray',
+    enrolled: 'blue', rejected: 'red', out_of_scope: 'gray', requires_manual_review: 'yellow',
+  };
+  const color = map[status] || 'gray';
+  return `<span class="badge badge-${color}">${status || 'unknown'}</span>`;
+}
+
+function modelChips(models) {
+  if (!models || !models.length) return '<span class="chip">—</span>';
+  return models.slice(0, 5).map(m => `<span class="chip">${esc(m)}</span>`).join('') +
+    (models.length > 5 ? `<span class="chip">+${models.length - 5}</span>` : '');
+}
+
+function esc(s) {
+  const el = document.createElement('span');
+  el.textContent = s;
+  return el.innerHTML;
+}
+
+function toast(msg, type = 'info') {
+  const el = h('div', {class: `toast toast-${type}`}, msg);
+  $('#toasts').appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+function showModal(title, contentEl, opts = {}) {
+  const overlay = h('div', {class: 'modal-overlay', onClick: e => { if (e.target === overlay) overlay.remove(); }},
+    h('div', {class: 'modal'},
+      h('h3', null, title),
+      contentEl
+    )
+  );
+  $('#modals').appendChild(overlay);
+  return overlay;
+}
+
+function closeModal() { const m = $('.modal-overlay'); if (m) m.remove(); }
+
+function confirmAction(msg) { return window.confirm(msg); }
+
+/* ====================================================================== */
+/*  Router                                                                 */
+/* ====================================================================== */
+let currentPage = '';
+let refreshTimer = null;
+
+const pages = {
+  dashboard: { title: 'Dashboard', icon: '📊', render: renderDashboard },
+  nodes:     { title: 'Узлы', icon: '🖥️', render: renderNodes },
+  consents:  { title: 'Согласия', icon: '✅', render: renderConsents },
+  blacklist: { title: 'Чёрный список', icon: '🚫', render: renderBlacklist },
+  discovery: { title: 'Discovery', icon: '🔍', render: renderDiscovery },
+  keys:      { title: 'API-ключи', icon: '🔑', render: renderKeys },
+  audit:     { title: 'Журнал аудита', icon: '📋', render: renderAudit },
+  config:    { title: 'Конфигурация', icon: '⚙️', render: renderConfig },
+};
+
+function navigate(page) {
+  if (!pages[page]) page = 'dashboard';
+  currentPage = page;
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+
+  // Update sidebar
+  $$('.sidebar-nav a').forEach(a => a.classList.toggle('active', a.dataset.page === page));
+  // Update title
+  $('#page-title').textContent = pages[page].title;
+  // Clear actions
+  $('#topbar-actions').innerHTML = '';
+  // Render
+  const content = $('#content');
+  content.innerHTML = '<div class="loading">Загрузка…</div>';
+  pages[page].render(content);
+}
+
+function initRouter() {
+  window.addEventListener('hashchange', () => navigate(location.hash.slice(1).split('/')[0]));
+  navigate(location.hash.slice(1).split('/')[0] || 'dashboard');
+}
+
+/* ====================================================================== */
+/*  Auth                                                                   */
+/* ====================================================================== */
+async function doLogin() {
+  const token = $('#login-token').value.trim();
+  if (!token) { $('#login-error').textContent = 'Введите токен'; return; }
+  API.token = token;
+  try {
+    const data = await API.get('/admin/status');
+    sessionStorage.setItem('foa_token', token);
+    $('#login-screen').style.display = 'none';
+    $('#app').classList.add('active');
+    $('#sidebar-version').textContent = `v${data.version || '?'}`;
+    initRouter();
+  } catch (e) {
+    $('#login-error').textContent = 'Неверный токен или сервер недоступен';
+    API.token = '';
+  }
+}
+
+function doLogout() {
+  sessionStorage.removeItem('foa_token');
+  API.token = '';
+  if (refreshTimer) clearInterval(refreshTimer);
+  $('#app').classList.remove('active');
+  $('#login-screen').style.display = 'flex';
+  $('#login-token').value = '';
+  $('#login-error').textContent = '';
+}
+
+// Auto-login
+(function() {
+  const saved = sessionStorage.getItem('foa_token');
+  if (saved) {
+    API.token = saved;
+    API.get('/admin/status').then(data => {
+      $('#login-screen').style.display = 'none';
+      $('#app').classList.add('active');
+      $('#sidebar-version').textContent = `v${data.version || '?'}`;
+      initRouter();
+    }).catch(() => { sessionStorage.removeItem('foa_token'); API.token = ''; });
+  }
+  // Enter key on login
+  $('#login-token').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+})();
+
+/* ====================================================================== */
+/*  Dashboard                                                              */
+/* ====================================================================== */
+async function renderDashboard(container) {
+  try {
+    const data = await API.get('/admin/status');
+    const nbs = data.nodes_by_status || {};
+    const sec = data.security || {};
+
+    container.innerHTML = '';
+
+    // Stats cards
+    const statsGrid = h('div', {class: 'grid grid-4'});
+    const statCards = [
+      { label: 'Маршрутизируемые', value: data.routable_nodes || 0, icon: '✅', color: 'var(--green)' },
+      { label: 'Всего узлов', value: Object.values(nbs).reduce((a,b) => a+b, 0), icon: '🖥️', color: 'var(--accent2)' },
+      { label: 'Заблокированных', value: data.blacklisted || 0, icon: '🚫', color: 'var(--red)' },
+      { label: 'Кандидатов', value: data.discovery?.candidates || 0, icon: '🔍', color: 'var(--cyan)' },
+    ];
+    statCards.forEach(s => {
+      statsGrid.appendChild(h('div', {class: 'card'},
+        h('div', {class: 'card-header'},
+          h('span', {class: 'card-title'}, s.label),
+          h('span', {class: 'card-icon'}, s.icon)
+        ),
+        h('div', {class: 'card-value', style: {color: s.color}}, String(s.value)),
+      ));
+    });
+    container.appendChild(statsGrid);
+
+    // Nodes by status
+    const nbsCard = h('div', {class: 'card', style: {marginTop: '16px'}},
+      h('div', {class: 'card-title', style: {marginBottom: '12px'}}, 'Узлы по статусам'),
+      h('div', {class: 'grid grid-4', style: {gap: '8px'}},
+        ...Object.entries(nbs).map(([st, cnt]) =>
+          h('div', {style: {padding: '10px', background: 'var(--bg3)', borderRadius: '6px', textAlign: 'center'}},
+            h('div', {style: {fontSize: '20px', fontWeight: '700'}}, String(cnt)),
+            h('div', null, statusBadge(st))
+          )
+        )
+      )
+    );
+    container.appendChild(nbsCard);
+
+    // Runtime pool info
+    if (data.nodes && Object.keys(data.nodes).length) {
+      const poolCard = h('div', {class: 'card', style: {marginTop: '16px'}},
+        h('div', {class: 'card-title', style: {marginBottom: '12px'}}, 'Пул узлов (runtime)')
+      );
+      const tbl = h('div', {class: 'table-wrap'});
+      let rows = '';
+      Object.entries(data.nodes).forEach(([nid, n]) => {
+        rows += `<tr>
+          <td class="mono">${esc(shortId(nid))}</td>
+          <td>${statusBadge(n.state || '—')}</td>
+          <td>${n.active || 0} / ${n.max_concurrency || '?'}</td>
+          <td>${n.ewma_latency_ms != null ? n.ewma_latency_ms.toFixed(0) + ' мс' : '—'}</td>
+          <td>${n.error_rate != null ? fmtPct(n.error_rate) : '—'}</td>
+          <td>${n.effective_weight || '—'}</td>
+          <td>${n.routable ? '<span class="badge badge-green">✓</span>' : '<span class="badge badge-gray">✗</span>'}</td>
+        </tr>`;
+      });
+      tbl.innerHTML = `<table><thead><tr><th>Node</th><th>Статус</th><th>Соединения</th><th>Задержка</th><th>Ошибки</th><th>Вес</th><th>Route</th></tr></thead><tbody>${rows}</tbody></table>`;
+      poolCard.appendChild(tbl);
+      container.appendChild(poolCard);
+    }
+
+    // Security + Discovery
+    const row2 = h('div', {class: 'grid grid-2', style: {marginTop: '16px'}});
+
+    // Security flags
+    const secCard = h('div', {class: 'card'},
+      h('div', {class: 'card-title', style: {marginBottom: '12px'}}, 'Безопасность'),
+      h('div', {class: 'flag-list'},
+        ...Object.entries(sec).map(([k, v]) =>
+          h('span', {class: `flag ${v ? 'flag-on' : 'flag-off'}`},
+            (v ? '✓ ' : '✗ ') + k.replace(/_/g, ' ')
+          )
+        )
+      )
+    );
+    row2.appendChild(secCard);
+
+    // Discovery
+    const disc = data.discovery || {};
+    const discCard = h('div', {class: 'card'},
+      h('div', {class: 'card-title', style: {marginBottom: '12px'}}, 'Discovery'),
+      h('div', {class: 'detail-grid'},
+        h('dt', null, 'Режим'), h('dd', null, disc.mode || '—'),
+        h('dt', null, 'Кандидатов'), h('dd', null, String(disc.candidates || 0)),
+        h('dt', null, 'Источники'), h('dd', null, (disc.active_sources || []).join(', ') || 'нет'),
+      )
+    );
+    row2.appendChild(discCard);
+    container.appendChild(row2);
+
+    // Gateway info
+    const infoCard = h('div', {class: 'card', style: {marginTop: '16px'}},
+      h('div', {class: 'card-title', style: {marginBottom: '8px'}}, 'Информация'),
+      h('div', {class: 'detail-grid'},
+        h('dt', null, 'Gateway ID'), h('dd', {class: 'mono'}, data.gateway_id || '—'),
+        h('dt', null, 'Время сервера'), h('dd', null, fmtDate(data.time)),
+      )
+    );
+    container.appendChild(infoCard);
+
+    // Auto-refresh
+    refreshTimer = setInterval(() => { if (currentPage === 'dashboard') renderDashboard(container); }, 15000);
+
+  } catch (e) {
+    container.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;
+  }
+}
+
+/* ====================================================================== */
+/*  Nodes                                                                  */
+/* ====================================================================== */
+async function renderNodes(container) {
+  // Topbar actions
+  $('#topbar-actions').innerHTML = '';
+  $('#topbar-actions').appendChild(
+    h('button', {class: 'btn btn-primary', onClick: () => showRegisterNodeModal()}, '+ Зарегистрировать узел')
+  );
+
+  try {
+    const data = await API.get('/admin/nodes', {detailed: true});
+    const nodes = data.nodes || [];
+    container.innerHTML = '';
+
+    if (!nodes.length) {
+      container.innerHTML = '<div class="empty-state"><span class="icon">🖥️</span><p>Нет зарегистрированных узлов</p></div>';
+      return;
+    }
+
+    const tbl = h('div', {class: 'table-wrap'});
+    let rows = '';
+    nodes.forEach(n => {
+      rows += `<tr>
+        <td><a href="#" class="mono node-link" data-id="${esc(n.node_id)}">${esc(shortId(n.node_id))}</a></td>
+        <td>${esc(n.display_name || '—')}</td>
+        <td class="mono truncate">${esc(n.endpoint || '—')}</td>
+        <td>${statusBadge(n.status)}</td>
+        <td>${statusBadge(n.consent_status)}</td>
+        <td>${modelChips(n.models)}</td>
+        <td>${n.active_connections}/${n.max_concurrency}</td>
+        <td>${n.latency_ms != null ? n.latency_ms.toFixed(0) : '—'}</td>
+        <td>${n.error_rate != null ? fmtPct(n.error_rate) : '—'}</td>
+        <td>${n.routable ? '<span class="badge badge-green">✓</span>' : '<span class="badge badge-gray">✗</span>'}</td>
+        <td>
+          <div class="btn-group">
+            <button class="btn btn-sm node-detail" data-id="${esc(n.node_id)}" title="Детали">📋</button>
+            <button class="btn btn-sm btn-success node-verify" data-id="${esc(n.node_id)}" title="Verify">✓</button>
+            <button class="btn btn-sm node-health" data-id="${esc(n.node_id)}" title="Health Check">🩺</button>
+            <button class="btn btn-sm btn-danger node-del" data-id="${esc(n.node_id)}" title="Удалить">🗑</button>
+          </div>
+        </td>
+      </tr>`;
+    });
+    tbl.innerHTML = `<table><thead><tr>
+      <th>ID</th><th>Имя</th><th>Endpoint</th><th>Статус</th><th>Согласие</th>
+      <th>Модели</th><th>Conn</th><th>Latency</th><th>Errors</th><th>Route</th><th>Действия</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+    container.appendChild(tbl);
+
+    // Event delegation
+    tbl.addEventListener('click', async e => {
+      const btn = e.target.closest('button, a');
+      if (!btn) return;
+      e.preventDefault();
+      const id = btn.dataset.id;
+      if (btn.classList.contains('node-detail') || btn.classList.contains('node-link')) await showNodeDetail(id);
+      else if (btn.classList.contains('node-verify')) await nodeAction('verify', id);
+      else if (btn.classList.contains('node-health')) await nodeAction('health-check', id);
+      else if (btn.classList.contains('node-del')) await nodeDelete(id);
+    });
+
+    // Auto-refresh
+    refreshTimer = setInterval(() => { if (currentPage === 'nodes') renderNodes(container); }, 20000);
+
+  } catch (e) {
+    container.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;
+  }
+}
+
+async function showNodeDetail(nodeId) {
+  try {
+    const data = await API.get(`/admin/nodes/${nodeId}`);
+    const el = h('div', null,
+      h('div', {class: 'detail-grid'},
+        ...Object.entries(data).flatMap(([k, v]) => [
+          h('dt', null, k),
+          h('dd', {class: typeof v === 'string' ? 'mono' : ''}, typeof v === 'object' ? JSON.stringify(v) : String(v ?? '—'))
+        ])
+      ),
+      h('div', {class: 'modal-footer'},
+        h('button', {class: 'btn btn-success', onClick: () => { closeModal(); nodeAction('verify', nodeId); }}, '✓ Verify'),
+        h('button', {class: 'btn', onClick: () => { closeModal(); nodeAction('health-check', nodeId); }}, '🩺 Health Check'),
+        h('button', {class: 'btn btn-danger', onClick: () => { closeModal(); nodeAction('revoke', nodeId); }}, '⛔ Revoke'),
+        h('button', {class: 'btn btn-danger', onClick: () => { closeModal(); nodeBlacklist(nodeId); }}, '🚫 Blacklist'),
+        h('button', {class: 'btn', onClick: closeModal}, 'Закрыть'),
+      )
+    );
+    showModal(`Узел ${shortId(nodeId)}`, el);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function nodeAction(action, nodeId) {
+  try {
+    const data = await API.post(`/admin/nodes/${nodeId}/${action}`, {});
+    toast(`${action}: ${data.status || 'ok'}`, 'success');
+    if (currentPage === 'nodes') renderNodes($('#content'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function nodeDelete(nodeId) {
+  if (!confirmAction(`Удалить узел ${shortId(nodeId)}?`)) return;
+  try {
+    await API.del(`/admin/nodes/${nodeId}`);
+    toast('Узел удалён', 'success');
+    renderNodes($('#content'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function nodeBlacklist(nodeId) {
+  try {
+    await API.post(`/admin/nodes/${nodeId}/blacklist`, {reason: 'admin_manual', duration: 'permanent'});
+    toast('Узел заблокирован', 'success');
+    if (currentPage === 'nodes') renderNodes($('#content'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function showRegisterNodeModal() {
+  const form = h('div', null,
+    h('div', {class: 'form-group'},
+      h('label', null, 'Endpoint *'),
+      h('input', {class: 'form-control', id: 'reg-endpoint', placeholder: 'http://192.168.1.100:11434'})
+    ),
+    h('div', {class: 'form-group'},
+      h('label', null, 'Display Name'),
+      h('input', {class: 'form-control', id: 'reg-name', placeholder: 'My Ollama Node'})
+    ),
+    h('div', {class: 'form-group'},
+      h('label', null, 'Owner ID'),
+      h('input', {class: 'form-control', id: 'reg-owner', placeholder: 'owner@example.com'})
+    ),
+    h('div', {class: 'form-group'},
+      h('label', null, 'Модели (через запятую)'),
+      h('input', {class: 'form-control', id: 'reg-models', placeholder: 'llama3:8b, codellama:13b'})
+    ),
+    h('div', {class: 'form-group'},
+      h('label', null, 'Max Concurrency'),
+      h('input', {class: 'form-control', id: 'reg-concurrency', type: 'number', value: '2', min: '1'})
+    ),
+    h('div', {class: 'form-group'},
+      h('label', null, 'Consent Method'),
+      h('select', {class: 'form-control', id: 'reg-consent'},
+        h('option', {value: 'http_well_known'}, 'HTTP Well-Known'),
+        h('option', {value: 'dns_txt'}, 'DNS TXT'),
+        h('option', {value: 'signed_token'}, 'Signed Token')
+      )
+    ),
+    h('div', {class: 'form-group'},
+      h('label', null, 'Weight'),
+      h('input', {class: 'form-control', id: 'reg-weight', type: 'number', value: '1', min: '1', max: '100'})
+    ),
+    h('div', {class: 'modal-footer'},
+      h('button', {class: 'btn', onClick: closeModal}, 'Отмена'),
+      h('button', {class: 'btn btn-primary', onClick: submitRegisterNode}, 'Зарегистрировать')
+    )
+  );
+  showModal('Регистрация узла', form);
+}
+
+async function submitRegisterNode() {
+  const body = {
+    endpoint: $('#reg-endpoint').value.trim(),
+    display_name: $('#reg-name').value.trim(),
+    owner_id: $('#reg-owner').value.trim(),
+    models: $('#reg-models').value.split(',').map(s => s.trim()).filter(Boolean),
+    max_concurrency: parseInt($('#reg-concurrency').value) || 2,
+    consent_method: $('#reg-consent').value,
+    weight: parseInt($('#reg-weight').value) || 1,
+  };
+  if (!body.endpoint) { toast('Endpoint обязателен', 'error'); return; }
+  try {
+    const data = await API.post('/admin/nodes', body);
+    closeModal();
+    toast(`Узел ${shortId(data.node_id)} зарегистрирован. ${data.next_step || ''}`, 'success');
+    // Show challenge info
+    if (data.challenge || data.consent_url) {
+      showModal('Следующий шаг', h('div', null,
+        h('p', null, data.next_step || ''),
+        data.challenge ? h('pre', {style: {background: 'var(--bg3)', padding: '12px', borderRadius: '6px', fontSize: '12px', overflowX: 'auto', marginTop: '8px'}}, JSON.stringify(data.challenge, null, 2)) : null,
+        h('div', {class: 'modal-footer'}, h('button', {class: 'btn btn-primary', onClick: closeModal}, 'Понятно'))
+      ));
+    }
+    renderNodes($('#content'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+/* ====================================================================== */
+/*  Consents                                                               */
+/* ====================================================================== */
+async function renderConsents(container) {
+  try {
+    const data = await API.get('/admin/consents');
+    const list = data.consents || [];
+    container.innerHTML = '';
+
+    if (!list.length) {
+      container.innerHTML = '<div class="empty-state"><span class="icon">✅</span><p>Нет записей согласий</p></div>';
+      return;
+    }
+
+    const tbl = h('div', {class: 'table-wrap'});
+    let rows = '';
+    list.forEach(c => {
+      rows += `<tr>
+        <td><a href="#" class="mono consent-link" data-id="${esc(c.consent_id)}">${esc(shortId(c.consent_id))}</a></td>
+        <td class="mono">${esc(shortId(c.node_id))}</td>
+        <td class="mono">${esc(c.owner_id || '—')}</td>
+        <td>${statusBadge(c.status)}</td>
+        <td>${esc(c.method || '—')}</td>
+        <td>${modelChips(c.allowed_models)}</td>
+        <td>${fmtDate(c.issued_at)}</td>
+        <td>${fmtDate(c.expires_at)}</td>
+      </tr>`;
+    });
+    tbl.innerHTML = `<table><thead><tr>
+      <th>ID</th><th>Node</th><th>Owner</th><th>Статус</th><th>Метод</th><th>Модели</th><th>Выдано</th><th>Истекает</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+    container.appendChild(tbl);
+
+    tbl.addEventListener('click', async e => {
+      const link = e.target.closest('.consent-link');
+      if (!link) return;
+      e.preventDefault();
+      await showConsentDetail(link.dataset.id);
+    });
+  } catch (e) {
+    container.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;
+  }
+}
+
+async function showConsentDetail(consentId) {
+  try {
+    const data = await API.get(`/admin/consents/${consentId}`);
+    const el = h('div', null,
+      h('div', {class: 'detail-grid'},
+        h('dt', null, 'Consent ID'), h('dd', {class: 'mono'}, data.consent_id),
+        h('dt', null, 'Node ID'), h('dd', {class: 'mono'}, data.node_id),
+        h('dt', null, 'Owner'), h('dd', null, data.owner_id || '—'),
+        h('dt', null, 'Статус'), h('dd', null, data.status),
+        h('dt', null, 'Метод'), h('dd', null, data.method || '—'),
+        h('dt', null, 'Выдано'), h('dd', null, fmtDate(data.issued_at)),
+        h('dt', null, 'Истекает'), h('dd', null, fmtDate(data.expires_at)),
+        h('dt', null, 'Отозвано'), h('dd', null, fmtDate(data.revoked_at)),
+        h('dt', null, 'Причина отзыва'), h('dd', null, data.revoke_reason || '—'),
+        h('dt', null, 'Модели'), h('dd', null, (data.allowed_models || []).join(', ') || '—'),
+        h('dt', null, 'Max Concurrency'), h('dd', null, String(data.max_concurrency || '—')),
+        h('dt', null, 'Версия'), h('dd', null, String(data.version || '—')),
+      ),
+      data.history && data.history.length ? h('div', {style: {marginTop: '16px'}},
+        h('div', {class: 'card-title', style: {marginBottom: '8px'}}, 'История'),
+        ...data.history.map(hi => h('div', {style: {padding: '8px', background: 'var(--bg3)', borderRadius: '4px', marginBottom: '4px', fontSize: '12px'}},
+          h('strong', null, hi.event), ' — ', hi.actor || '?', ' (', fmtDate(hi.created_at), ')',
+          hi.detail ? h('pre', {style: {fontSize: '11px', marginTop: '4px', color: 'var(--text3)'}}, JSON.stringify(hi.detail)) : null
+        ))
+      ) : null,
+      h('div', {class: 'modal-footer'}, h('button', {class: 'btn', onClick: closeModal}, 'Закрыть'))
+    );
+    showModal(`Согласие ${shortId(consentId)}`, el);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+/* ====================================================================== */
+/*  Blacklist                                                              */
+/* ====================================================================== */
+async function renderBlacklist(container) {
+  $('#topbar-actions').innerHTML = '';
+  try {
+    const data = await API.get('/admin/blacklist', {include_expired: true});
+    const list = data.blacklist || [];
+    container.innerHTML = '';
+
+    const info = h('div', {class: 'card', style: {marginBottom: '16px', padding: '12px 16px'}},
+      h('span', null, `Активных блокировок: `),
+      h('strong', {style: {color: 'var(--red)'}}, String(data.active_total || 0))
+    );
+    container.appendChild(info);
+
+    if (!list.length) {
+      container.appendChild(h('div', {class: 'empty-state'}, h('span', {class: 'icon'}, '🚫'), h('p', null, 'Чёрный список пуст')));
+      return;
+    }
+
+    const tbl = h('div', {class: 'table-wrap'});
+    let rows = '';
+    list.forEach(b => {
+      const active = !b.lifted_at && (!b.expires_at || new Date(b.expires_at) > new Date());
+      rows += `<tr>
+        <td class="mono">${esc(shortId(b.node_id))}</td>
+        <td class="mono truncate">${esc(b.endpoint || '—')}</td>
+        <td>${esc(b.reason || '—')}</td>
+        <td>${b.permanent ? '<span class="badge badge-red">permanent</span>' : '<span class="badge badge-yellow">temporary</span>'}</td>
+        <td>${esc(b.actor || '—')}</td>
+        <td>${fmtDate(b.created_at)}</td>
+        <td>${fmtDate(b.expires_at)}</td>
+        <td>${b.lifted_at ? '<span class="badge badge-green">снята</span>' : (active ? '<span class="badge badge-red">активна</span>' : '<span class="badge badge-gray">истекла</span>')}</td>
+        <td>${active ? `<button class="btn btn-sm btn-success unbl-btn" data-id="${esc(b.node_id)}">Снять</button>` : '—'}</td>
+      </tr>`;
+    });
+    tbl.innerHTML = `<table><thead><tr>
+      <th>Node</th><th>Endpoint</th><th>Причина</th><th>Тип</th><th>Actor</th><th>Создана</th><th>Истекает</th><th>Статус</th><th></th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+    container.appendChild(tbl);
+
+    tbl.addEventListener('click', async e => {
+      const btn = e.target.closest('.unbl-btn');
+      if (!btn) return;
+      try {
+        await API.post(`/admin/nodes/${btn.dataset.id}/unblacklist`);
+        toast('Блокировка снята', 'success');
+        renderBlacklist(container);
+      } catch (err) { toast(err.message, 'error'); }
+    });
+  } catch (e) {
+    container.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;
+  }
+}
+
+/* ====================================================================== */
+/*  Discovery / Candidates                                                 */
+/* ====================================================================== */
+async function renderDiscovery(container) {
+  $('#topbar-actions').innerHTML = '';
+  $('#topbar-actions').appendChild(
+    h('button', {class: 'btn btn-primary', onClick: runDiscovery}, '▶ Запустить Discovery')
+  );
+
+  try {
+    const data = await API.get('/admin/candidates', {limit: 200});
+    const list = data.candidates || [];
+    container.innerHTML = '';
+
+    const info = h('div', {class: 'card', style: {marginBottom: '16px', padding: '12px 16px'}},
+      h('span', null, `Всего кандидатов: `), h('strong', null, String(data.total || 0)),
+      data.note ? h('span', {style: {color: 'var(--text3)', marginLeft: '12px', fontSize: '12px'}}, data.note) : null
+    );
+    container.appendChild(info);
+
+    if (!list.length) {
+      container.appendChild(h('div', {class: 'empty-state'}, h('span', {class: 'icon'}, '🔍'), h('p', null, 'Кандидатов нет')));
+      return;
+    }
+
+    const tbl = h('div', {class: 'table-wrap'});
+    let rows = '';
+    list.forEach(c => {
+      const riskColor = c.risk_score >= 70 ? 'red' : c.risk_score >= 40 ? 'yellow' : 'green';
+      rows += `<tr>
+        <td class="mono">${esc(shortId(c.candidate_id))}</td>
+        <td>${esc(c.source)}</td>
+        <td class="mono">${esc(c.ip)}:${c.port}</td>
+        <td>${(c.dns_names || []).map(d => esc(d)).join(', ') || '—'}</td>
+        <td>${esc(c.country || '—')}</td>
+        <td><span class="badge badge-${riskColor}">${c.risk_score}</span></td>
+        <td>${statusBadge(c.status)}</td>
+        <td>${fmtDate(c.observed_at)}</td>
+        <td>
+          <div class="btn-group">
+            <button class="btn btn-sm btn-success cand-enroll" data-id="${esc(c.candidate_id)}" data-ip="${esc(c.ip)}" data-port="${c.port}" title="Enroll">📥</button>
+            <button class="btn btn-sm btn-danger cand-del" data-id="${esc(c.candidate_id)}" title="Удалить">🗑</button>
+          </div>
+        </td>
+      </tr>`;
+    });
+    tbl.innerHTML = `<table><thead><tr>
+      <th>ID</th><th>Source</th><th>IP:Port</th><th>DNS</th><th>Country</th><th>Risk</th><th>Статус</th><th>Обнаружен</th><th></th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+    container.appendChild(tbl);
+
+    tbl.addEventListener('click', async e => {
+      const btn = e.target.closest('button');
+      if (!btn) return;
+      if (btn.classList.contains('cand-enroll')) {
+        const ownerId = prompt('Owner ID для конвертации в узел:');
+        if (!ownerId) return;
+        try {
+          const res = await API.post(`/admin/candidates/${btn.dataset.id}/enroll`, {owner_id: ownerId});
+          toast(`Кандидат конвертирован → узел ${shortId(res.node_id)}`, 'success');
+          renderDiscovery(container);
+        } catch (err) { toast(err.message, 'error'); }
+      } else if (btn.classList.contains('cand-del')) {
+        if (!confirmAction('Удалить кандидата?')) return;
+        try {
+          await API.del(`/admin/candidates/${btn.dataset.id}`);
+          toast('Кандидат удалён', 'success');
+          renderDiscovery(container);
+        } catch (err) { toast(err.message, 'error'); }
+      }
+    });
+  } catch (e) {
+    container.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;
+  }
+}
+
+async function runDiscovery() {
+  try {
+    const data = await API.post('/admin/discovery/run');
+    toast(`Discovery: создано ${data.created || 0}, дедуплицировано ${data.deduped || 0}`, 'success');
+    if (currentPage === 'discovery') renderDiscovery($('#content'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+/* ====================================================================== */
+/*  API Keys                                                               */
+/* ====================================================================== */
+async function renderKeys(container) {
+  $('#topbar-actions').innerHTML = '';
+  $('#topbar-actions').appendChild(
+    h('button', {class: 'btn btn-primary', onClick: showCreateKeyModal}, '+ Создать ключ')
+  );
+
+  try {
+    const data = await API.get('/admin/keys', {include_revoked: true});
+    const list = data.keys || [];
+    container.innerHTML = '';
+
+    if (!list.length) {
+      container.innerHTML = '<div class="empty-state"><span class="icon">🔑</span><p>Нет API-ключей</p></div>';
+      return;
+    }
+
+    const tbl = h('div', {class: 'table-wrap'});
+    let rows = '';
+    list.forEach(k => {
+      rows += `<tr style="${k.revoked ? 'opacity:.5' : ''}">
+        <td class="mono">${esc(shortId(k.key_id))}</td>
+        <td>${esc(k.label || '—')}</td>
+        <td class="mono">${esc(k.prefix || '')}…</td>
+        <td>${(k.scopes || []).map(s => `<span class="chip">${esc(s)}</span>`).join('')}</td>
+        <td>${fmtDate(k.created_at)}</td>
+        <td>${fmtDate(k.expires_at)}</td>
+        <td>${k.revoked ? '<span class="badge badge-red">отозван</span>' : '<span class="badge badge-green">активен</span>'}</td>
+        <td>${fmtDate(k.last_used_at)}</td>
+        <td>${k.rate_limit_per_minute || '—'}</td>
+        <td>
+          ${!k.revoked ? `<div class="btn-group">
+            <button class="btn btn-sm key-rotate" data-id="${esc(k.key_id)}" title="Ротация">🔄</button>
+            <button class="btn btn-sm btn-danger key-revoke" data-id="${esc(k.key_id)}" title="Отозвать">⛔</button>
+          </div>` : '—'}
+        </td>
+      </tr>`;
+    });
+    tbl.innerHTML = `<table><thead><tr>
+      <th>ID</th><th>Label</th><th>Prefix</th><th>Scopes</th><th>Создан</th><th>Истекает</th><th>Статус</th><th>Использован</th><th>Rate/min</th><th></th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+    container.appendChild(tbl);
+
+    tbl.addEventListener('click', async e => {
+      const btn = e.target.closest('button');
+      if (!btn) return;
+      if (btn.classList.contains('key-revoke')) {
+        if (!confirmAction('Отозвать ключ?')) return;
+        try {
+          await API.post(`/admin/keys/${btn.dataset.id}/revoke`);
+          toast('Ключ отозван', 'success');
+          renderKeys(container);
+        } catch (err) { toast(err.message, 'error'); }
+      } else if (btn.classList.contains('key-rotate')) {
+        try {
+          const res = await API.post(`/admin/keys/${btn.dataset.id}/rotate`);
+          showKeyResult(res);
+          renderKeys(container);
+        } catch (err) { toast(err.message, 'error'); }
+      }
+    });
+  } catch (e) {
+    container.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;
+  }
+}
+
+function showCreateKeyModal() {
+  const form = h('div', null,
+    h('div', {class: 'form-group'},
+      h('label', null, 'Label'),
+      h('input', {class: 'form-control', id: 'key-label', placeholder: 'My API Key'})
+    ),
+    h('div', {class: 'form-group'},
+      h('label', null, 'Scopes'),
+      h('div', {class: 'checkbox-group'},
+        ...['ollama:read', 'ollama:generate', 'ollama:embed'].map(s =>
+          h('label', null,
+            h('input', {type: 'checkbox', class: 'key-scope', value: s, ...(s !== 'ollama:embed' ? {checked: ''} : {})}),
+            s
+          )
+        )
+      )
+    ),
+    h('div', {class: 'form-group'},
+      h('label', null, 'Rate Limit (req/min)'),
+      h('input', {class: 'form-control', id: 'key-rate', type: 'number', placeholder: 'по умолчанию'})
+    ),
+    h('div', {class: 'form-group'},
+      h('label', null, 'TTL (секунды, пусто = бессрочно)'),
+      h('input', {class: 'form-control', id: 'key-ttl', type: 'number', placeholder: '86400'})
+    ),
+    h('div', {class: 'modal-footer'},
+      h('button', {class: 'btn', onClick: closeModal}, 'Отмена'),
+      h('button', {class: 'btn btn-primary', onClick: submitCreateKey}, 'Создать')
+    )
+  );
+  showModal('Создание API-ключа', form);
+}
+
+async function submitCreateKey() {
+  const scopes = $$('.key-scope:checked').map(cb => cb.value);
+  const body = {
+    label: $('#key-label').value.trim(),
+    scopes: scopes,
+  };
+  const rate = parseInt($('#key-rate')?.value);
+  if (rate) body.rate_limit_per_minute = rate;
+  const ttl = parseInt($('#key-ttl')?.value);
+  if (ttl) body.ttl_seconds = ttl;
+
+  try {
+    const res = await API.post('/admin/keys', body);
+    closeModal();
+    showKeyResult(res);
+    renderKeys($('#content'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function showKeyResult(data) {
+  const el = h('div', null,
+    h('div', {style: {background: 'rgba(239,68,68,.1)', border: '1px solid var(--red)', borderRadius: '8px', padding: '12px', marginBottom: '16px'}},
+      h('strong', {style: {color: 'var(--red)'}}, '⚠️ Сохраните ключ сейчас! Повторно он не выдаётся.')
+    ),
+    h('div', {class: 'form-group'},
+      h('label', null, 'API Key'),
+      h('input', {class: 'form-control mono', value: data.api_key, readonly: '', id: 'new-key-value',
+        style: {fontSize: '13px', background: 'var(--bg)', letterSpacing: '.5px'}})
+    ),
+    h('div', {class: 'modal-footer'},
+      h('button', {class: 'btn', onClick: () => { navigator.clipboard.writeText(data.api_key); toast('Скопировано', 'success'); }}, '📋 Копировать'),
+      h('button', {class: 'btn btn-primary', onClick: closeModal}, 'Готово')
+    )
+  );
+  showModal('Новый API-ключ', el);
+}
+
+/* ====================================================================== */
+/*  Audit Log                                                              */
+/* ====================================================================== */
+async function renderAudit(container) {
+  container.innerHTML = '';
+
+  // Filters
+  const toolbar = h('div', {class: 'toolbar'},
+    h('input', {class: 'form-control', id: 'audit-event', placeholder: 'Фильтр по event…', style: {width: '200px'}}),
+    h('input', {class: 'form-control', id: 'audit-subject', placeholder: 'subject_id…', style: {width: '200px'}}),
+    h('select', {class: 'form-control', id: 'audit-limit', style: {width: '100px'}},
+      h('option', {value: '50'}, '50'),
+      h('option', {value: '100', selected: ''}, '100'),
+      h('option', {value: '500'}, '500'),
+    ),
+    h('button', {class: 'btn btn-primary', onClick: () => loadAudit(container)}, '🔍 Найти')
+  );
+  container.appendChild(toolbar);
+
+  const wrap = h('div', {id: 'audit-table-wrap'});
+  container.appendChild(wrap);
+  await loadAudit(container);
+}
+
+async function loadAudit(container) {
+  const wrap = $('#audit-table-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = '<div class="loading">Загрузка…</div>';
+  try {
+    const params = {
+      limit: $('#audit-limit')?.value || 100,
+    };
+    const ev = $('#audit-event')?.value?.trim();
+    if (ev) params.event = ev;
+    const sub = $('#audit-subject')?.value?.trim();
+    if (sub) params.subject_id = sub;
+
+    const data = await API.get('/admin/audit', params);
+    const entries = data.entries || [];
+
+    if (!entries.length) {
+      wrap.innerHTML = '<div class="empty-state"><span class="icon">📋</span><p>Нет записей</p></div>';
+      return;
+    }
+
+    let rows = '';
+    entries.forEach(e => {
+      rows += `<tr>
+        <td style="white-space:nowrap">${fmtDate(e.created_at)}</td>
+        <td><span class="chip">${esc(e.event)}</span></td>
+        <td>${esc(e.actor || '—')}</td>
+        <td>${esc(e.subject_type || '—')}</td>
+        <td class="mono">${esc(shortId(e.subject_id || ''))}</td>
+        <td class="mono" style="font-size:11px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(typeof e.detail === 'object' ? JSON.stringify(e.detail) : String(e.detail || '—'))}</td>
+      </tr>`;
+    });
+    wrap.innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Время</th><th>Событие</th><th>Actor</th><th>Тип</th><th>Subject</th><th>Детали</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;
+  }
+}
+
+/* ====================================================================== */
+/*  Config                                                                 */
+/* ====================================================================== */
+async function renderConfig(container) {
+  $('#topbar-actions').innerHTML = '';
+  $('#topbar-actions').appendChild(
+    h('button', {class: 'btn btn-primary', onClick: reloadConfig}, '🔄 Перезагрузить конфигурацию')
+  );
+
+  try {
+    const data = await API.get('/admin/config');
+    container.innerHTML = '';
+    const pre = h('div', {class: 'card'},
+      h('div', {class: 'card-title', style: {marginBottom: '12px'}}, 'Текущая конфигурация (секреты скрыты)'),
+      h('div', {class: 'json-tree', id: 'config-tree'})
+    );
+    container.appendChild(pre);
+    $('#config-tree').innerHTML = renderJsonTree(data);
+
+    // Toggle collapsed
+    $('#config-tree').addEventListener('click', e => {
+      const toggle = e.target.closest('.json-toggle');
+      if (!toggle) return;
+      toggle.classList.toggle('collapsed');
+      const content = toggle.nextElementSibling;
+      if (content) content.style.display = content.style.display === 'none' ? '' : 'none';
+    });
+  } catch (e) {
+    container.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;
+  }
+}
+
+async function reloadConfig() {
+  try {
+    const data = await API.post('/admin/config/reload');
+    toast(`Конфигурация перезагружена: ${(data.reloaded || []).join(', ')}`, 'success');
+    renderConfig($('#content'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function renderJsonTree(obj, indent = 0) {
+  if (obj === null || obj === undefined) return '<span class="json-null">null</span>';
+  if (typeof obj === 'boolean') return `<span class="json-bool">${obj}</span>`;
+  if (typeof obj === 'number') return `<span class="json-number">${obj}</span>`;
+  if (typeof obj === 'string') return `<span class="json-string">"${esc(obj)}"</span>`;
+
+  const pad = '  '.repeat(indent);
+  const pad1 = '  '.repeat(indent + 1);
+
+  if (Array.isArray(obj)) {
+    if (!obj.length) return '[]';
+    const items = obj.map(v => `${pad1}${renderJsonTree(v, indent + 1)}`).join(',\n');
+    return `[<br>${items}<br>${pad}]`;
+  }
+
+  const entries = Object.entries(obj);
+  if (!entries.length) return '{}';
+
+  const inner = entries.map(([k, v]) => {
+    const isComplex = typeof v === 'object' && v !== null;
+    if (isComplex) {
+      return `${pad1}<span class="json-toggle"><span class="json-key">"${esc(k)}"</span></span>: <span>${renderJsonTree(v, indent + 1)}</span>`;
+    }
+    return `${pad1}<span class="json-key">"${esc(k)}"</span>: ${renderJsonTree(v, indent + 1)}`;
+  }).join(',<br>');
+
+  return `{<br>${inner}<br>${pad}}`;
+}
+
+</script>
+</body>
+</html>
