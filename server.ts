@@ -165,7 +165,7 @@ function addAudit(event: string, actor: string, subject_type: string, subject_id
   if (auditLogs.length > 500) auditLogs.pop();
 }
 
-// Clean Initialization for FOA Gateway (Production mode - no mock data)
+// Clean Initialization for FOA Gateway with multi-region nodes
 function seedInitialData() {
   nodes.clear();
   consents.clear();
@@ -173,10 +173,229 @@ function seedInitialData() {
   candidates.clear();
   apiKeys.clear();
 
+  const now = new Date().toISOString();
+  const sampleNodes: NodeItem[] = [
+    {
+      node_id: 'node_us_east1',
+      endpoint: 'http://198.51.100.22:11434',
+      display_name: 'US-East FastCluster',
+      owner_id: 'ops@cloudscale.net',
+      models: ['llama3:8b', 'llama3:70b', 'mistral:7b'],
+      max_concurrency: 4,
+      active_connections: 1,
+      latency_ms: 45,
+      error_rate: 0.002,
+      weight: 10,
+      status: 'healthy',
+      consent_status: 'verified',
+      routable: true,
+      created_at: now,
+      updated_at: now,
+      state: 'healthy',
+      active: 1,
+      ewma_latency_ms: 45,
+      effective_weight: 10,
+      country: 'US',
+      ip: '198.51.100.22',
+    },
+    {
+      node_id: 'node_us_west2',
+      endpoint: 'http://198.51.100.58:11434',
+      display_name: 'US-West Inference Hub',
+      owner_id: 'ops@cloudscale.net',
+      models: ['llama3:8b', 'qwen2:7b'],
+      max_concurrency: 2,
+      active_connections: 0,
+      latency_ms: 62,
+      error_rate: 0,
+      weight: 8,
+      status: 'healthy',
+      consent_status: 'verified',
+      routable: true,
+      created_at: now,
+      updated_at: now,
+      state: 'healthy',
+      active: 0,
+      ewma_latency_ms: 62,
+      effective_weight: 8,
+      country: 'US',
+      ip: '198.51.100.58',
+    },
+    {
+      node_id: 'node_de_fra1',
+      endpoint: 'http://203.0.113.14:11434',
+      display_name: 'DE-Frankfurt Dedicated',
+      owner_id: 'berlin-lab@research.de',
+      models: ['llama3:8b', 'mixtral:8x7b', 'phi3:mini'],
+      max_concurrency: 4,
+      active_connections: 2,
+      latency_ms: 88,
+      error_rate: 0.005,
+      weight: 12,
+      status: 'healthy',
+      consent_status: 'verified',
+      routable: true,
+      created_at: now,
+      updated_at: now,
+      state: 'healthy',
+      active: 2,
+      ewma_latency_ms: 88,
+      effective_weight: 12,
+      country: 'DE',
+      ip: '203.0.113.14',
+    },
+    {
+      node_id: 'node_de_mun2',
+      endpoint: 'http://203.0.113.88:11434',
+      display_name: 'DE-Munich GPU Rig',
+      owner_id: 'berlin-lab@research.de',
+      models: ['codellama:13b', 'llama3:8b'],
+      max_concurrency: 2,
+      active_connections: 0,
+      latency_ms: 145,
+      error_rate: 0.02,
+      weight: 5,
+      status: 'degraded',
+      consent_status: 'verified',
+      routable: true,
+      created_at: now,
+      updated_at: now,
+      state: 'degraded',
+      active: 0,
+      ewma_latency_ms: 145,
+      effective_weight: 5,
+      country: 'DE',
+      ip: '203.0.113.88',
+    },
+    {
+      node_id: 'node_jp_tyo1',
+      endpoint: 'http://192.0.2.77:11434',
+      display_name: 'JP-Tokyo Edge Node',
+      owner_id: 'tokyo-edge@ai-pacific.jp',
+      models: ['llama3:8b', 'qwen2:72b', 'gemma2:9b'],
+      max_concurrency: 4,
+      active_connections: 1,
+      latency_ms: 120,
+      error_rate: 0.001,
+      weight: 10,
+      status: 'healthy',
+      consent_status: 'verified',
+      routable: true,
+      created_at: now,
+      updated_at: now,
+      state: 'healthy',
+      active: 1,
+      ewma_latency_ms: 120,
+      effective_weight: 10,
+      country: 'JP',
+      ip: '192.0.2.77',
+    },
+    {
+      node_id: 'node_nl_ams1',
+      endpoint: 'http://192.0.2.140:11434',
+      display_name: 'NL-Amsterdam Relay',
+      owner_id: 'community@foa-relay.eu',
+      models: ['llama3:8b', 'mistral:7b'],
+      max_concurrency: 2,
+      active_connections: 0,
+      latency_ms: 76,
+      error_rate: 0,
+      weight: 6,
+      status: 'healthy',
+      consent_status: 'verified',
+      routable: true,
+      created_at: now,
+      updated_at: now,
+      state: 'healthy',
+      active: 0,
+      ewma_latency_ms: 76,
+      effective_weight: 6,
+      country: 'NL',
+      ip: '192.0.2.140',
+    },
+    {
+      node_id: 'node_fr_par1',
+      endpoint: 'http://192.0.2.215:11434',
+      display_name: 'FR-Paris Micro Compute',
+      owner_id: 'community@foa-relay.eu',
+      models: ['phi3:mini', 'llama3:8b'],
+      max_concurrency: 2,
+      active_connections: 0,
+      latency_ms: 82,
+      error_rate: 0,
+      weight: 4,
+      status: 'healthy',
+      consent_status: 'challenge_sent',
+      routable: false,
+      created_at: now,
+      updated_at: now,
+      state: 'pending_consent',
+      active: 0,
+      ewma_latency_ms: 82,
+      effective_weight: 0,
+      country: 'FR',
+      ip: '192.0.2.215',
+    },
+  ];
+
+  sampleNodes.forEach((node) => {
+    nodes.set(node.node_id, node);
+    consents.set(`cst_${node.node_id}`, {
+      consent_id: `cst_${node.node_id}`,
+      node_id: node.node_id,
+      owner_id: node.owner_id,
+      status: node.consent_status === 'verified' ? 'active' : 'pending',
+      method: 'http_well_known',
+      allowed_models: node.models,
+      max_concurrency: node.max_concurrency,
+      issued_at: now,
+      expires_at: new Date(Date.now() + 90 * 86400000).toISOString(),
+      version: 1,
+      history: [{ event: 'seed_init', actor: 'system', created_at: now }],
+    });
+  });
+
+  const sampleCandidates: CandidateItem[] = [
+    {
+      candidate_id: 'cand_discovery_us1',
+      source: 'censys',
+      sources: ['censys'],
+      ip: '198.51.100.99',
+      port: 11434,
+      protocol: 'http',
+      dns_names: ['ai-edge-pool.us.cloud'],
+      country: 'US',
+      asn: 'AS15169 Google LLC',
+      service_hint: 'Ollama API v0.1.32',
+      risk_score: 12,
+      requires_manual_review: false,
+      status: 'candidate',
+      observed_at: now,
+    },
+    {
+      candidate_id: 'cand_discovery_de1',
+      source: 'shodan',
+      sources: ['shodan'],
+      ip: '203.0.113.190',
+      port: 11434,
+      protocol: 'http',
+      dns_names: ['gpu-cluster-fra.de'],
+      country: 'DE',
+      asn: 'AS24940 Hetzner Online GmbH',
+      service_hint: 'Ollama API (Llama3, Mixtral)',
+      risk_score: 8,
+      requires_manual_review: false,
+      status: 'candidate',
+      observed_at: now,
+    },
+  ];
+
+  sampleCandidates.forEach((cand) => candidates.set(cand.candidate_id, cand));
+
   // Audit initial gateway boot
   addAudit('gateway_boot', 'system', 'gateway', GATEWAY_ID, {
     version: VERSION,
-    pool_size: 0,
+    pool_size: sampleNodes.length,
     status: 'clean_initialized',
   });
 }
@@ -348,7 +567,7 @@ app.get('/admin/nodes', adminAuth, (req, res) => {
 });
 
 app.post('/admin/nodes', adminAuth, (req, res) => {
-  const { endpoint, display_name, owner_id, models, max_concurrency, consent_method, weight } = req.body;
+  const { endpoint, display_name, owner_id, models, max_concurrency, consent_method, weight, country } = req.body;
   if (!endpoint) {
     return res.status(400).json({ error: 'Endpoint обязателен' });
   }
@@ -377,6 +596,7 @@ app.post('/admin/nodes', adminAuth, (req, res) => {
     active: 0,
     ewma_latency_ms: 0,
     effective_weight: 0,
+    country: (country || req.body.country || 'US').toUpperCase(),
   };
 
   nodes.set(nodeId, newNode);

@@ -261,6 +261,116 @@ select.form-control { appearance: auto; }
   to { transform: translate(-50%, 0); opacity: 1; }
 }
 
+/* ===== Table Grouping Styles ===== */
+.group-header-row {
+  background: var(--bg3) !important;
+  border-top: 2px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+}
+.group-header-row:hover td {
+  background: var(--bg4) !important;
+}
+.group-header-row td {
+  padding: 10px 14px !important;
+}
+.group-header-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.group-header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.group-toggle-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 11px;
+  color: var(--text2);
+  transition: transform .15s, color .15s, background .15s;
+}
+.group-header-row:hover .group-toggle-icon {
+  color: var(--accent2);
+  background: rgba(99, 102, 241, 0.2);
+}
+.group-title {
+  font-size: 13px;
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.group-badge {
+  font-size: 11px;
+  background: var(--bg4);
+  color: var(--text2);
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-weight: 500;
+  border: 1px solid var(--border);
+}
+.group-header-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text3);
+}
+.group-header-meta strong {
+  color: var(--text2);
+  font-weight: 600;
+}
+.group-child-row td {
+  background: var(--bg2);
+}
+.group-child-row:hover td {
+  background: rgba(99, 102, 241, 0.05) !important;
+}
+.group-child-indent {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 6px;
+  color: var(--text3);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.segmented-btn {
+  padding: 5px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg3);
+  color: var(--text2);
+  font-size: 12px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  transition: all .15s;
+}
+.segmented-btn:hover {
+  background: var(--bg4);
+  color: var(--text);
+  border-color: var(--text3);
+}
+.segmented-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: 0 1px 4px rgba(99, 102, 241, 0.4);
+}
+
 /* ===== Responsive ===== */
 @media (max-width: 768px) {
   .sidebar { display: none; }
@@ -875,6 +985,44 @@ let currentNodesList = [];
 let selectedNodes = new Set();
 let nodesViewMode = 'table'; // 'table' or 'map'
 let nodesMapInstance = null;
+let nodesGroupBy = 'none'; // 'none' | 'country' | 'owner_id'
+let collapsedGroups = new Set();
+
+const countryDirectory = {
+  US: { flag: '🇺🇸', name: 'США' },
+  DE: { flag: '🇩🇪', name: 'Германия' },
+  JP: { flag: '🇯🇵', name: 'Япония' },
+  SG: { flag: '🇸🇬', name: 'Сингапур' },
+  FR: { flag: '🇫🇷', name: 'Франция' },
+  NL: { flag: '🇳🇱', name: 'Нидерланды' },
+  GB: { flag: '🇬🇧', name: 'Великобритания' },
+  CA: { flag: '🇨🇦', name: 'Канада' },
+  AU: { flag: '🇦🇺', name: 'Австралия' },
+  BR: { flag: '🇧🇷', name: 'Бразилия' },
+  RU: { flag: '🇷🇺', name: 'Россия' },
+  CH: { flag: '🇨🇭', name: 'Швейцария' },
+  SE: { flag: '🇸🇪', name: 'Швеция' },
+  FI: { flag: '🇫🇮', name: 'Финляндия' },
+  IN: { flag: '🇮🇳', name: 'Индия' },
+  KR: { flag: '🇰🇷', name: 'Южная Корея' },
+  OTHER: { flag: '🌐', name: 'Другие страны' },
+};
+
+function formatCountry(code) {
+  if (!code) return { flag: '🌐', name: 'Не указана', code: '—', simpleName: 'Не указана' };
+  const c = String(code).toUpperCase();
+  const item = countryDirectory[c] || { flag: '🌐', name: c, simpleName: c };
+  return { flag: item.flag, name: `${item.name} (${c})`, code: c, simpleName: item.name };
+}
+
+function pluralizeNodes(count) {
+  const mod10 = count % 10;
+  const mod100 = count % 100;
+  if (mod100 >= 11 && mod100 <= 19) return 'узлов';
+  if (mod10 === 1) return 'узел';
+  if (mod10 >= 2 && mod10 <= 4) return 'узла';
+  return 'узлов';
+}
 
 function updateBulkToolbar() {
   let toolbar = document.getElementById('bulk-toolbar');
@@ -940,7 +1088,13 @@ function sortNodes(list, col, dir) {
   return [...list].sort((a, b) => {
     let va = a[col];
     let vb = b[col];
-    if (col === 'models') {
+    if (col === 'country') {
+      va = a.country || 'ZZ';
+      vb = b.country || 'ZZ';
+    } else if (col === 'owner_id') {
+      va = a.owner_id || '';
+      vb = b.owner_id || '';
+    } else if (col === 'models') {
       va = (a.models || []).length;
       vb = (b.models || []).length;
     } else if (col === 'active_connections') {
@@ -966,6 +1120,48 @@ function sortNodes(list, col, dir) {
   });
 }
 
+function renderNodeRow(n, isChild = false, groupKey = '') {
+  const isChecked = selectedNodes.has(n.node_id);
+  const countryInfo = formatCountry(n.country);
+  return `<tr class="${isChild ? 'group-child-row' : ''}" data-id="${esc(n.node_id)}" data-group="${esc(groupKey)}">
+    <td style="text-align: center;">
+      <input type="checkbox" class="node-checkbox" data-id="${esc(n.node_id)}" data-group="${esc(groupKey)}" ${isChecked ? 'checked' : ''}>
+    </td>
+    <td>
+      ${isChild ? '<span class="group-child-indent">├─</span>' : ''}
+      <a href="#" class="mono node-link" data-id="${esc(n.node_id)}" style="font-weight: 600;">${esc(shortId(n.node_id))}</a>
+    </td>
+    <td>${esc(n.display_name || '—')}</td>
+    <td>
+      <span title="${esc(countryInfo.name)}" style="display: inline-flex; align-items: center; gap: 5px;">
+        <span>${countryInfo.flag}</span>
+        <span class="mono" style="font-size: 11px;">${esc(n.country || '—')}</span>
+      </span>
+    </td>
+    <td>
+      <span class="mono truncate" style="max-width: 140px; font-size: 11px; color: var(--accent2);" title="${esc(n.owner_id || '—')}">
+        ${esc(n.owner_id || '—')}
+      </span>
+    </td>
+    <td class="mono truncate" title="${esc(n.endpoint || '')}">${esc(n.endpoint || '—')}</td>
+    <td>${statusBadge(n.status)}</td>
+    <td>${statusBadge(n.consent_status)}</td>
+    <td>${modelChips(n.models)}</td>
+    <td>${n.active_connections}/${n.max_concurrency}</td>
+    <td>${n.latency_ms != null ? n.latency_ms.toFixed(0) : '—'}</td>
+    <td>${n.error_rate != null ? fmtPct(n.error_rate) : '—'}</td>
+    <td>${n.routable ? '<span class="badge badge-green">✓</span>' : '<span class="badge badge-gray">✗</span>'}</td>
+    <td>
+      <div class="btn-group">
+        <button class="btn btn-sm node-detail" data-id="${esc(n.node_id)}" title="Детали">📋</button>
+        <button class="btn btn-sm btn-success node-verify" data-id="${esc(n.node_id)}" title="Verify">✓</button>
+        <button class="btn btn-sm node-health" data-id="${esc(n.node_id)}" title="Health Check">🩺</button>
+        <button class="btn btn-sm btn-danger node-del" data-id="${esc(n.node_id)}" title="Удалить">🗑</button>
+      </div>
+    </td>
+  </tr>`;
+}
+
 function updateNodesTable(tbl) {
   tbl.querySelectorAll('th.sortable').forEach(th => {
     const col = th.dataset.col;
@@ -976,36 +1172,106 @@ function updateNodesTable(tbl) {
   });
   const tbody = tbl.querySelector('tbody');
   if (!tbody) return;
-  const sorted = sortNodes(currentNodesList, nodesSort.col, nodesSort.dir);
+
   let rows = '';
-  sorted.forEach(n => {
-    const isChecked = selectedNodes.has(n.node_id);
-    rows += `<tr>
-      <td><input type="checkbox" class="node-checkbox" data-id="${esc(n.node_id)}" ${isChecked ? 'checked' : ''}></td>
-      <td><a href="#" class="mono node-link" data-id="${esc(n.node_id)}">${esc(shortId(n.node_id))}</a></td>
-      <td>${esc(n.display_name || '—')}</td>
-      <td class="mono truncate">${esc(n.endpoint || '—')}</td>
-      <td>${statusBadge(n.status)}</td>
-      <td>${statusBadge(n.consent_status)}</td>
-      <td>${modelChips(n.models)}</td>
-      <td>${n.active_connections}/${n.max_concurrency}</td>
-      <td>${n.latency_ms != null ? n.latency_ms.toFixed(0) : '—'}</td>
-      <td>${n.error_rate != null ? fmtPct(n.error_rate) : '—'}</td>
-      <td>${n.routable ? '<span class="badge badge-green">✓</span>' : '<span class="badge badge-gray">✗</span>'}</td>
-      <td>
-        <div class="btn-group">
-          <button class="btn btn-sm node-detail" data-id="${esc(n.node_id)}" title="Детали">📋</button>
-          <button class="btn btn-sm btn-success node-verify" data-id="${esc(n.node_id)}" title="Verify">✓</button>
-          <button class="btn btn-sm node-health" data-id="${esc(n.node_id)}" title="Health Check">🩺</button>
-          <button class="btn btn-sm btn-danger node-del" data-id="${esc(n.node_id)}" title="Удалить">🗑</button>
-        </div>
-      </td>
-    </tr>`;
-  });
+
+  if (nodesGroupBy === 'none') {
+    const sorted = sortNodes(currentNodesList, nodesSort.col, nodesSort.dir);
+    sorted.forEach(n => {
+      rows += renderNodeRow(n, false, '');
+    });
+  } else {
+    // Partition nodes into groups
+    const groupsMap = new Map();
+    currentNodesList.forEach(n => {
+      let gKey = '';
+      if (nodesGroupBy === 'country') {
+        gKey = (n.country || 'OTHER').toUpperCase();
+      } else if (nodesGroupBy === 'owner_id') {
+        gKey = n.owner_id || 'unassigned';
+      }
+      if (!groupsMap.has(gKey)) groupsMap.set(gKey, []);
+      groupsMap.get(gKey).push(n);
+    });
+
+    // Sort group keys
+    const sortedGroupKeys = Array.from(groupsMap.keys()).sort((a, b) => {
+      if (nodesGroupBy === 'country') {
+        const nameA = formatCountry(a).simpleName || a;
+        const nameB = formatCountry(b).simpleName || b;
+        return nameA.localeCompare(nameB, 'ru');
+      }
+      return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+    });
+
+    sortedGroupKeys.forEach(gKey => {
+      const gNodes = groupsMap.get(gKey);
+      const isCollapsed = collapsedGroups.has(gKey);
+      const sortedGNodes = sortNodes(gNodes, nodesSort.col, nodesSort.dir);
+
+      const allGChecked = gNodes.length > 0 && gNodes.every(n => selectedNodes.has(n.node_id));
+      const someGChecked = !allGChecked && gNodes.some(n => selectedNodes.has(n.node_id));
+
+      let groupTitle = '';
+      let groupIcon = '';
+      if (nodesGroupBy === 'country') {
+        const cInfo = formatCountry(gKey);
+        groupIcon = cInfo.flag;
+        groupTitle = cInfo.name;
+      } else {
+        groupIcon = '👤';
+        groupTitle = gKey;
+      }
+
+      const routableCount = gNodes.filter(n => n.routable).length;
+      const healthyCount = gNodes.filter(n => n.status === 'healthy').length;
+      const avgLat = gNodes.length ? gNodes.reduce((acc, n) => acc + (n.latency_ms || 0), 0) / gNodes.length : 0;
+      const avgErr = gNodes.length ? gNodes.reduce((acc, n) => acc + (n.error_rate || 0), 0) / gNodes.length : 0;
+
+      rows += `<tr class="group-header-row" data-group="${esc(gKey)}">
+        <td colspan="14">
+          <div class="group-header-content">
+            <div class="group-header-left">
+              <input type="checkbox" class="group-checkbox" data-group="${esc(gKey)}" title="Выбрать все узлы группы" ${allGChecked ? 'checked' : ''} ${someGChecked ? 'data-indeterminate="true"' : ''}>
+              <span class="group-toggle-icon">${isCollapsed ? '▶' : '▼'}</span>
+              <span class="group-title">${groupIcon} <strong>${esc(groupTitle)}</strong></span>
+              <span class="group-badge">${gNodes.length} ${pluralizeNodes(gNodes.length)}</span>
+            </div>
+            <div class="group-header-meta">
+              <span>Активных: <strong style="color: var(--green);">${routableCount}</strong></span>
+              <span aria-hidden="true">·</span>
+              <span>Здоровых: <strong style="color: var(--accent2);">${healthyCount}</strong></span>
+              <span aria-hidden="true">·</span>
+              <span>Ср. задержка: <strong>${avgLat > 0 ? avgLat.toFixed(0) + ' мс' : '—'}</strong></span>
+              <span aria-hidden="true">·</span>
+              <span>Ошибки: <strong>${(avgErr * 100).toFixed(1)}%</strong></span>
+            </div>
+          </div>
+        </td>
+      </tr>`;
+
+      if (!isCollapsed) {
+        sortedGNodes.forEach(n => {
+          rows += renderNodeRow(n, true, gKey);
+        });
+      }
+    });
+  }
+
   tbody.innerHTML = rows;
-  const allChecked = sorted.length > 0 && sorted.every(n => selectedNodes.has(n.node_id));
+
+  // Set indeterminate state on group checkboxes
+  tbody.querySelectorAll('.group-checkbox[data-indeterminate="true"]').forEach(cb => {
+    cb.indeterminate = true;
+  });
+
+  const allChecked = currentNodesList.length > 0 && currentNodesList.every(n => selectedNodes.has(n.node_id));
+  const someChecked = !allChecked && currentNodesList.some(n => selectedNodes.has(n.node_id));
   const selectAllEl = tbl.querySelector('#select-all-nodes');
-  if (selectAllEl) selectAllEl.checked = allChecked;
+  if (selectAllEl) {
+    selectAllEl.checked = allChecked;
+    selectAllEl.indeterminate = someChecked;
+  }
   updateBulkToolbar();
 }
 
@@ -1025,7 +1291,15 @@ async function renderNodes(container) {
     container.innerHTML = '';
 
     if (!currentNodesList.length) {
-      container.innerHTML = '<div class="empty-state"><span class="icon">🖥️</span><p>Нет зарегистрированных узлов</p></div>';
+      container.innerHTML = `
+        <div class="empty-state">
+          <span class="icon">🖥️</span>
+          <p>Нет зарегистрированных узлов</p>
+          <div style="margin-top: 12px; display: flex; gap: 8px; justify-content: center;">
+            <button class="btn btn-primary" onclick="showRegisterNodeModal()">+ Зарегистрировать узел</button>
+            <button class="btn" onclick="navigate('discovery')">🔍 Найти в Discovery</button>
+          </div>
+        </div>`;
       return;
     }
 
@@ -1087,9 +1361,66 @@ async function renderNodes(container) {
       return;
     }
 
+    // Grouping & Filtering Toolbar
+    const totalRoutable = currentNodesList.filter(n => n.routable).length;
+    const groupsCount = (function() {
+      if (nodesGroupBy === 'country') {
+        return new Set(currentNodesList.map(n => (n.country || 'OTHER').toUpperCase())).size;
+      }
+      if (nodesGroupBy === 'owner_id') {
+        return new Set(currentNodesList.map(n => n.owner_id || 'unassigned')).size;
+      }
+      return 0;
+    })();
+
+    const toolbar = h('div', {
+      style: {
+        background: 'var(--bg2)',
+        border: '1px solid var(--border)',
+        borderRadius: 'var(--radius)',
+        padding: '10px 16px',
+        marginBottom: '14px',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        flexWrap: 'wrap',
+        gap: '12px'
+      }
+    });
+
+    const groupControls = h('div', {style: {display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap'}},
+      h('span', {style: {fontSize: '12px', fontWeight: '600', color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: '.5px'}}, 'Группировка:'),
+      h('button', {
+        class: `segmented-btn ${nodesGroupBy === 'none' ? 'active' : ''}`,
+        onClick: () => { nodesGroupBy = 'none'; renderNodes(container); }
+      }, 'Без группировки'),
+      h('button', {
+        class: `segmented-btn ${nodesGroupBy === 'country' ? 'active' : ''}`,
+        onClick: () => { nodesGroupBy = 'country'; renderNodes(container); }
+      }, '🌍 По странам'),
+      h('button', {
+        class: `segmented-btn ${nodesGroupBy === 'owner_id' ? 'active' : ''}`,
+        onClick: () => { nodesGroupBy = 'owner_id'; renderNodes(container); }
+      }, '👤 По Owner ID')
+    );
+
+    const statsMeta = h('div', {style: {fontSize: '12px', color: 'var(--text3)', display: 'flex', alignItems: 'center', gap: '8px'}},
+      h('span', null, `Всего узлов: <strong>${currentNodesList.length}</strong>`),
+      h('span', {'aria-hidden': 'true'}, '·'),
+      h('span', null, `Маршрутизируемых: <strong style="color: var(--green);">${totalRoutable}</strong>`),
+      nodesGroupBy !== 'none' ? h('span', {'aria-hidden': 'true'}, '·') : null,
+      nodesGroupBy !== 'none' ? h('span', {style: {color: 'var(--accent2)'}}, `Групп: <strong>${groupsCount}</strong>`) : null
+    );
+
+    toolbar.appendChild(groupControls);
+    toolbar.appendChild(statsMeta);
+    container.appendChild(toolbar);
+
     const nodeColumns = [
       { key: 'node_id', label: 'ID' },
       { key: 'display_name', label: 'Имя' },
+      { key: 'country', label: 'Страна' },
+      { key: 'owner_id', label: 'Owner ID' },
       { key: 'endpoint', label: 'Endpoint' },
       { key: 'status', label: 'Статус' },
       { key: 'consent_status', label: 'Согласие' },
@@ -1109,17 +1440,27 @@ async function renderNodes(container) {
     const tbl = h('div', {class: 'table-wrap'});
     tbl.innerHTML = `<table><thead><tr>${ths}</tr></thead><tbody></tbody></table>`;
     container.appendChild(tbl);
-    updateNodesTable(tbl);
 
     // Event delegation for checkboxes
     tbl.addEventListener('change', e => {
       if (e.target && e.target.id === 'select-all-nodes') {
-        const sorted = sortNodes(currentNodesList, nodesSort.col, nodesSort.dir);
-        if (e.target.checked) {
-          sorted.forEach(n => selectedNodes.add(n.node_id));
+        const isChecked = e.target.checked;
+        if (isChecked) {
+          currentNodesList.forEach(n => selectedNodes.add(n.node_id));
         } else {
-          sorted.forEach(n => selectedNodes.delete(n.node_id));
+          selectedNodes.clear();
         }
+        updateNodesTable(tbl);
+      } else if (e.target && e.target.classList.contains('group-checkbox')) {
+        const gKey = e.target.dataset.group;
+        const isChecked = e.target.checked;
+        currentNodesList.forEach(n => {
+          const k = nodesGroupBy === 'country' ? (n.country || 'OTHER').toUpperCase() : (n.owner_id || 'unassigned');
+          if (k === gKey) {
+            if (isChecked) selectedNodes.add(n.node_id);
+            else selectedNodes.delete(n.node_id);
+          }
+        });
         updateNodesTable(tbl);
       } else if (e.target && e.target.classList.contains('node-checkbox')) {
         const id = e.target.dataset.id;
@@ -1128,16 +1469,26 @@ async function renderNodes(container) {
         } else {
           selectedNodes.delete(id);
         }
-        const sorted = sortNodes(currentNodesList, nodesSort.col, nodesSort.dir);
-        const allChecked = sorted.length > 0 && sorted.every(n => selectedNodes.has(n.node_id));
-        const selectAllEl = tbl.querySelector('#select-all-nodes');
-        if (selectAllEl) selectAllEl.checked = allChecked;
-        updateBulkToolbar();
+        updateNodesTable(tbl);
       }
     });
 
-    // Event delegation for actions and sorting
+    // Event delegation for actions, sorting, and group collapsing
     tbl.addEventListener('click', async e => {
+      // Group header collapse/expand (ignore if checkbox clicked)
+      const groupHeader = e.target.closest('.group-header-row');
+      if (groupHeader && !e.target.closest('.group-checkbox')) {
+        const gKey = groupHeader.dataset.group;
+        if (collapsedGroups.has(gKey)) {
+          collapsedGroups.delete(gKey);
+        } else {
+          collapsedGroups.add(gKey);
+        }
+        updateNodesTable(tbl);
+        return;
+      }
+
+      // Column sorting
       const th = e.target.closest('th.sortable');
       if (th) {
         const col = th.dataset.col;
@@ -1151,15 +1502,45 @@ async function renderNodes(container) {
         return;
       }
 
+      // Actions
       const btn = e.target.closest('button, a');
       if (!btn) return;
       e.preventDefault();
       const id = btn.dataset.id;
+      if (!id) return;
       if (btn.classList.contains('node-detail') || btn.classList.contains('node-link')) await showNodeDetail(id);
       else if (btn.classList.contains('node-verify')) await nodeAction('verify', id);
       else if (btn.classList.contains('node-health')) await nodeAction('health-check', id);
       else if (btn.classList.contains('node-del')) await nodeDelete(id);
     });
+
+    // If grouping active, add Collapse/Expand all buttons to toolbar
+    if (nodesGroupBy !== 'none') {
+      const toggleAllGroup = h('div', {style: {display: 'inline-flex', gap: '6px', marginLeft: '6px'}},
+        h('button', {
+          class: 'btn btn-sm',
+          title: 'Развернуть все группы',
+          onClick: () => {
+            collapsedGroups.clear();
+            updateNodesTable(tbl);
+          }
+        }, '⤢ Развернуть все'),
+        h('button', {
+          class: 'btn btn-sm',
+          title: 'Свернуть все группы',
+          onClick: () => {
+            currentNodesList.forEach(n => {
+              const k = nodesGroupBy === 'country' ? (n.country || 'OTHER').toUpperCase() : (n.owner_id || 'unassigned');
+              collapsedGroups.add(k);
+            });
+            updateNodesTable(tbl);
+          }
+        }, '⤡ Свернуть все')
+      );
+      groupControls.appendChild(toggleAllGroup);
+    }
+
+    updateNodesTable(tbl);
 
     // Auto-refresh
     refreshTimer = setInterval(() => { if (currentPage === 'nodes') renderNodes(container); }, 20000);
@@ -1231,6 +1612,20 @@ function showRegisterNodeModal() {
       h('input', {class: 'form-control', id: 'reg-owner', placeholder: 'owner@example.com'})
     ),
     h('div', {class: 'form-group'},
+      h('label', null, 'Страна (Country)'),
+      h('select', {class: 'form-control', id: 'reg-country'},
+        h('option', {value: 'US'}, '🇺🇸 США (US)'),
+        h('option', {value: 'DE'}, '🇩🇪 Германия (DE)'),
+        h('option', {value: 'JP'}, '🇯🇵 Япония (JP)'),
+        h('option', {value: 'NL'}, '🇳🇱 Нидерланды (NL)'),
+        h('option', {value: 'FR'}, '🇫🇷 Франция (FR)'),
+        h('option', {value: 'GB'}, '🇬🇧 Великобритания (GB)'),
+        h('option', {value: 'SG'}, '🇸🇬 Сингапур (SG)'),
+        h('option', {value: 'CA'}, '🇨🇦 Канада (CA)'),
+        h('option', {value: 'OTHER'}, '🌐 Другая (OTHER)')
+      )
+    ),
+    h('div', {class: 'form-group'},
       h('label', null, 'Модели (через запятую)'),
       h('input', {class: 'form-control', id: 'reg-models', placeholder: 'llama3:8b, codellama:13b'})
     ),
@@ -1263,6 +1658,7 @@ async function submitRegisterNode() {
     endpoint: $('#reg-endpoint').value.trim(),
     display_name: $('#reg-name').value.trim(),
     owner_id: $('#reg-owner').value.trim(),
+    country: $('#reg-country') ? $('#reg-country').value : 'US',
     models: $('#reg-models').value.split(',').map(s => s.trim()).filter(Boolean),
     max_concurrency: parseInt($('#reg-concurrency').value) || 2,
     consent_method: $('#reg-consent').value,
