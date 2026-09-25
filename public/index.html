@@ -612,6 +612,15 @@ function esc(s) {
   return el.innerHTML;
 }
 
+function escAttr(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 function toast(msg, type = 'info') {
   const el = h('div', {class: `toast toast-${type}`}, msg);
   $('#toasts').appendChild(el);
@@ -649,6 +658,7 @@ const pages = {
   keys:      { title: 'API-ключи', icon: '🔑', render: renderKeys },
   audit:     { title: 'Журнал аудита', icon: '📋', render: renderAudit },
   config:    { title: 'Конфигурация', icon: '⚙️', render: renderConfig },
+  help:      { title: 'Помощь', icon: '❓', render: renderHelp },
 };
 
 function navigate(page) {
@@ -851,6 +861,50 @@ let monitorHistogramSelectedNode = 'all'; // 'all' or nodeId
 let monitorHistogramMode = 'count'; // 'count' | 'percentage'
 let cachedLatencyDistribution = null;
 
+function refreshLatencyLegendOverlay() {
+  const legendContainer = document.getElementById('latency-legend-overlay');
+  const avgBadge = document.getElementById('latency-avg-badge');
+  if (!legendContainer || !monitorLatencyChartInstance) return;
+
+  legendContainer.innerHTML = '';
+  let sum = 0;
+  let count = 0;
+
+  monitorLatencyChartInstance.data.datasets.forEach((ds, idx) => {
+    const isHidden = monitorLatencyChartInstance.getDatasetMeta(idx).hidden;
+    if (!isHidden) {
+      ds.data.forEach(val => {
+        sum += val;
+        count++;
+      });
+    }
+
+    const pill = document.createElement('button');
+    pill.className = `btn btn-xs ${isHidden ? 'btn-outline' : ''}`;
+    pill.style.cssText = `font-size: 11px; padding: 2px 8px; border-radius: 12px; border: 1px solid ${ds.borderColor}; background: ${isHidden ? 'transparent' : ds.borderColor}; color: ${isHidden ? ds.borderColor : '#fff'}; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; gap: 4px;`;
+    pill.innerHTML = `<span style="width: 6px; height: 6px; border-radius: 50%; background: ${isHidden ? ds.borderColor : '#fff'}"></span> ${ds.label}`;
+    pill.title = 'Нажмите, чтобы включить/выключить узел в графике';
+    pill.onclick = () => {
+      const meta = monitorLatencyChartInstance.getDatasetMeta(idx);
+      meta.hidden = !meta.hidden;
+      monitorLatencyChartInstance.update();
+      refreshLatencyLegendOverlay();
+    };
+    legendContainer.appendChild(pill);
+  });
+
+  if (avgBadge) {
+    if (count > 0) {
+      const avg = Math.round(sum / count);
+      avgBadge.textContent = `⚡ Средняя: ${avg} мс`;
+      avgBadge.style.display = 'inline-block';
+    } else {
+      avgBadge.textContent = '⚡ Средняя: 0 мс (нет активных)';
+      avgBadge.style.display = 'inline-block';
+    }
+  }
+}
+
 const HISTOGRAM_BINS = [
   { id: 'b_0_50', label: '< 50ms', color: '#10b981', quality: 'Отлично', min: 0, max: 50 },
   { id: 'b_50_100', label: '50–100ms', color: '#06b6d4', quality: 'Быстро', min: 50, max: 100 },
@@ -974,8 +1028,30 @@ function updateMonitorView(container, preserveInputFocus = false) {
   const chartsGrid = h('div', {class: 'grid grid-2', style: {gap: '16px'}});
 
   const latCard = h('div', {class: 'card'},
-    h('div', {class: 'card-title', style: {marginBottom: '12px'}}, 'Задержка узлов (Latency, последние 60 минут)'),
-    h('div', {style: {position: 'relative', height: '320px'}},
+    h('div', {style: {display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '8px'}},
+      h('div', {style: {display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap'}},
+        h('div', {class: 'card-title', style: {marginBottom: '0'}}, 'Задержка узлов (Latency, последние 60 минут)'),
+        h('span', {id: 'latency-avg-badge', class: 'badge badge-blue', style: {fontSize: '11px', display: 'none'}}, '')
+      ),
+      h('div', {style: {display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap'}},
+        h('button', {
+          class: 'btn btn-xs',
+          style: {fontSize: '11px', padding: '2px 8px'},
+          onclick: () => {
+            if (!monitorLatencyChartInstance) return;
+            const allHidden = monitorLatencyChartInstance.data.datasets.every((_, idx) => monitorLatencyChartInstance.getDatasetMeta(idx).hidden);
+            const targetHidden = !allHidden;
+            monitorLatencyChartInstance.data.datasets.forEach((_, idx) => {
+              monitorLatencyChartInstance.getDatasetMeta(idx).hidden = targetHidden;
+            });
+            monitorLatencyChartInstance.update();
+            refreshLatencyLegendOverlay();
+          }
+        }, 'Все / Ничего'),
+        h('div', {id: 'latency-legend-overlay', style: {display: 'flex', flexWrap: 'wrap', gap: '6px', maxHeight: '50px', overflowY: 'auto'}})
+      )
+    ),
+    h('div', {style: {position: 'relative', height: '300px'}},
       h('canvas', {id: 'latency-chart'})
     )
   );
@@ -1329,6 +1405,8 @@ function updateMonitorView(container, preserveInputFocus = false) {
       options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, title: { display: true, text: 'Latency (ms)', color: '#94a3b8' } } } }
     });
 
+    refreshLatencyLegendOverlay();
+
     monitorErrorChartInstance = new Chart(errCtx, {
       type: 'line',
       data: { labels: timeLabels, datasets: errorDatasets },
@@ -1435,6 +1513,7 @@ async function bulkAction(action) {
   if (action === 'revoke' && !confirmAction(`Отозвать выбранные узлы (${ids.length})?`)) return;
 
   if (action === 'auto-verify') {
+    if (!confirmAction(`Выполнить авто-верификацию и включить в маршрутизацию выбранные узлы (${ids.length})?`)) return;
     try {
       const res = await API.post('/admin/nodes/bulk-verify', { node_ids: ids, mode: 'auto', method: 'auto_domain_agreement' });
       toast(`⚡ Авто-верифицировано и включено в маршрутизацию: ${res.count || ids.length}`, 'success');
@@ -1446,6 +1525,7 @@ async function bulkAction(action) {
   }
 
   if (action === 'manual-verify') {
+    if (!confirmAction(`Подтвердить ручную верификацию для выбранных узлов (${ids.length})?`)) return;
     try {
       const res = await API.post('/admin/nodes/bulk-verify', { node_ids: ids, mode: 'manual', method: 'manual_admin' });
       toast(`✓ Ручная верификация подтверждена для: ${res.count || ids.length} узлов`, 'success');
@@ -3120,6 +3200,126 @@ async function loadAudit(container) {
   } catch (e) {
     wrap.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;
   }
+}
+
+/* ====================================================================== */
+/*  Help & Documentation                                                   */
+/* ====================================================================== */
+function copyHelpCode(btn) {
+  const code = btn.getAttribute('data-code') || '';
+  navigator.clipboard.writeText(code);
+  toast('Скопировано в буфер обмена', 'success');
+}
+
+async function renderHelp(container) {
+  $('#topbar-actions').innerHTML = '';
+  const origin = window.location.origin;
+
+  const curlCode = `curl -X POST ${origin}/api/chat \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "llama3",
+    "messages": [{"role": "user", "content": "Привет!"}]
+  }'`;
+
+  const pythonCode = `from openai import OpenAI
+
+client = OpenAI(
+    base_url="${origin}/v1",
+    api_key="YOUR_API_KEY"
+)
+
+response = client.chat.completions.create(
+    model="llama3",
+    messages=[{"role": "user", "content": "Привет!"}]
+)
+print(response.choices[0].message.content)`;
+
+  const headerCode = "Authorization: Bearer <ваш-api-ключ>";
+
+  container.innerHTML = `
+    <div class="help-hero">
+      <h2 style="font-size: 20px; font-weight: 600; margin-bottom: 8px; color: var(--text);">📖 Руководство пользователя и интеграция с API Ollama</h2>
+      <p style="color: var(--text2); font-size: 14px; line-height: 1.5;">
+        Единый шлюз (Unified Gateway) автоматически агрегирует, балансирует и проксирует запросы ко всем найденным, проверенным и разрешенным узлам Ollama через один стандартный эндпоинт. Вам больше не нужно управлять множеством различных адресов — один API-ключ и один базовый URL работают для всех моделей.
+      </p>
+    </div>
+
+    <div class="help-card">
+      <h3 style="font-size: 16px; font-weight: 600; margin-bottom: 12px; color: var(--text);">🌐 1. Единый базовый URL эндпоинта шлюза</h3>
+      <p style="color: var(--text2); font-size: 13px; margin-bottom: 10px;">
+        Все запросы к моделям Ollama (включая совместимые с OpenAI стандарты) направляются на единый эндпоинт шлюза:
+      </p>
+      <div class="code-container">
+        <div class="code-header">
+          <span style="font-family: monospace; font-size: 12px; color: var(--accent);">Базовый URL шлюза</span>
+          <button class="btn" style="padding: 2px 8px; font-size: 11px;" data-code="${origin}" onclick="copyHelpCode(this)">Копировать URL</button>
+        </div>
+        <pre style="padding: 12px; font-family: monospace; font-size: 13px; color: #38bdf8; overflow-x: auto; margin: 0;">${origin}</pre>
+      </div>
+    </div>
+
+    <div class="help-card">
+      <h3 style="font-size: 16px; font-weight: 600; margin-bottom: 12px; color: var(--text);">🔑 2. Формат заголовка аутентификации (Authentication Header)</h3>
+      <p style="color: var(--text2); font-size: 13px; margin-bottom: 10px;">
+        Для доступа к API шлюза требуется передавать ваш API-ключ в заголовок HTTP-запроса. Шлюз поддерживает стандартный Bearer-токен:
+      </p>
+      <div class="code-container">
+        <div class="code-header">
+          <span style="font-family: monospace; font-size: 12px; color: var(--accent);">HTTP Header Format</span>
+          <button class="btn" style="padding: 2px 8px; font-size: 11px;" data-code="${headerCode}" onclick="copyHelpCode(this)">Копировать</button>
+        </div>
+        <pre style="padding: 12px; font-family: monospace; font-size: 13px; color: #38bdf8; overflow-x: auto; margin: 0;">Authorization: Bearer foa_live_xxxxxxxxxxxxxxxxxxxxxxxx</pre>
+      </div>
+      <p style="color: var(--text2); font-size: 12px; margin-top: 8px;">
+        * Вы можете сгенерировать и управлять своими ключами в разделе <a href="#keys" style="color: var(--accent); text-decoration: underline;">«API-ключи»</a> в боковом меню.
+      </p>
+    </div>
+
+    <div class="help-card">
+      <h3 style="font-size: 16px; font-weight: 600; margin-bottom: 12px; color: var(--text);">🚀 3. Поддерживаемые эндпоинты и примеры интеграции</h3>
+      <p style="color: var(--text2); font-size: 13px; margin-bottom: 12px;">
+        Шлюз поддерживает как стандартные Ollama API эндпоинты, так и OpenAI-совместимые чат-комплишены:
+      </p>
+
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-bottom: 16px;">
+        <div style="background: var(--bg); padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
+          <strong style="color: var(--text); font-size: 13px;">Ollama Native API</strong>
+          <ul style="color: var(--text2); font-size: 12px; margin-top: 6px; padding-left: 16px; line-height: 1.6;">
+            <li><code>POST /api/chat</code> — Чат генерация</li>
+            <li><code>POST /api/generate</code> — Текстовая генерация</li>
+            <li><code>GET /api/tags</code> — Список доступных моделей</li>
+          </ul>
+        </div>
+        <div style="background: var(--bg); padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
+          <strong style="color: var(--text); font-size: 13px;">OpenAI Compatible API</strong>
+          <ul style="color: var(--text2); font-size: 12px; margin-top: 6px; padding-left: 16px; line-height: 1.6;">
+            <li><code>POST /v1/chat/completions</code> — Chat Completions</li>
+            <li><code>GET /v1/models</code> — Models list</li>
+          </ul>
+        </div>
+      </div>
+
+      <h4 style="font-size: 14px; font-weight: 600; margin: 16px 0 8px; color: var(--text);">Пример запроса (cURL / Ollama API):</h4>
+      <div class="code-container">
+        <div class="code-header">
+          <span style="font-family: monospace; font-size: 12px; color: var(--accent);">cURL (bash)</span>
+          <button class="btn" style="padding: 2px 8px; font-size: 11px;" data-code="${escAttr(curlCode)}" onclick="copyHelpCode(this)">Копировать cURL</button>
+        </div>
+        <pre style="padding: 12px; font-family: monospace; font-size: 12px; color: #a5f3fc; overflow-x: auto; margin: 0;">${esc(curlCode)}</pre>
+      </div>
+
+      <h4 style="font-size: 14px; font-weight: 600; margin: 16px 0 8px; color: var(--text);">Пример подключения (Python / OpenAI SDK / LangChain):</h4>
+      <div class="code-container">
+        <div class="code-header">
+          <span style="font-family: monospace; font-size: 12px; color: var(--accent);">Python</span>
+          <button class="btn" style="padding: 2px 8px; font-size: 11px;" data-code="${escAttr(pythonCode)}" onclick="copyHelpCode(this)">Копировать Python</button>
+        </div>
+        <pre style="padding: 12px; font-family: monospace; font-size: 12px; color: #a5f3fc; overflow-x: auto; margin: 0;">${esc(pythonCode)}</pre>
+      </div>
+    </div>
+  `;
 }
 
 /* ====================================================================== */
