@@ -392,6 +392,40 @@ function fmtDate(iso) {
 }
 function fmtPct(v) { return (v * 100).toFixed(1) + '%'; }
 
+function exportToCsv(filename, columns, dataRows) {
+  if (!dataRows || !dataRows.length) return false;
+
+  const escapeCell = (val) => {
+    if (val === null || val === undefined) return '""';
+    let str = typeof val === 'object' ? JSON.stringify(val) : String(val);
+    str = str.replace(/"/g, '""');
+    return `"${str}"`;
+  };
+
+  const headerLine = columns.map(c => escapeCell(c.label || c.key)).join(',');
+  const rowLines = dataRows.map(row => {
+    return columns.map(c => {
+      let val = row[c.key];
+      if (typeof c.format === 'function') {
+        val = c.format(val, row);
+      }
+      return escapeCell(val);
+    }).join(',');
+  });
+
+  const csvContent = '\uFEFF' + [headerLine, ...rowLines].join('\r\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.setAttribute('download', filename);
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  return true;
+}
+
 function statusBadge(status) {
   const map = {
     healthy: 'green', verified: 'green', active: 'green',
@@ -741,6 +775,30 @@ function sortNodes(list, col, dir) {
   });
 }
 
+function exportNodesCsv() {
+  if (!currentNodesList.length) {
+    toast('Нет узлов для экспорта', 'error');
+    return;
+  }
+  const sorted = sortNodes(currentNodesList, nodesSort.col, nodesSort.dir);
+  const columns = [
+    { label: 'Node ID', key: 'node_id' },
+    { label: 'Имя', key: 'display_name' },
+    { label: 'Endpoint', key: 'endpoint' },
+    { label: 'Статус', key: 'status' },
+    { label: 'Согласие', key: 'consent_status' },
+    { label: 'Модели', key: 'models', format: v => (Array.isArray(v) ? v.join(', ') : (v || '')) },
+    { label: 'Активные соединения', key: 'active_connections' },
+    { label: 'Max Concurrency', key: 'max_concurrency' },
+    { label: 'Задержка (мс)', key: 'latency_ms', format: v => (v != null ? Number(v).toFixed(0) : '') },
+    { label: 'Ошибки (%)', key: 'error_rate', format: v => (v != null ? (Number(v) * 100).toFixed(1) + '%' : '') },
+    { label: 'Маршрутизация', key: 'routable', format: v => (v ? 'true' : 'false') },
+  ];
+  const dateStr = new Date().toISOString().slice(0, 10);
+  exportToCsv(`nodes_export_${dateStr}.csv`, columns, sorted);
+  toast(`Экспорт CSV завершён (узлов: ${sorted.length})`, 'success');
+}
+
 function updateNodesTable(tbl) {
   tbl.querySelectorAll('th.sortable').forEach(th => {
     const col = th.dataset.col;
@@ -788,7 +846,10 @@ async function renderNodes(container) {
   // Topbar actions
   $('#topbar-actions').innerHTML = '';
   $('#topbar-actions').appendChild(
-    h('button', {class: 'btn btn-primary', onClick: () => showRegisterNodeModal()}, '+ Зарегистрировать узел')
+    h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center'}},
+      h('button', {class: 'btn', id: 'btn-export-nodes', onClick: () => exportNodesCsv(), title: 'Экспорт в CSV'}, '📥 Export CSV'),
+      h('button', {class: 'btn btn-primary', onClick: () => showRegisterNodeModal()}, '+ Зарегистрировать узел')
+    )
   );
 
   try {
@@ -1429,11 +1490,41 @@ function showKeyResult(data) {
 /* ====================================================================== */
 /*  Audit Log                                                              */
 /* ====================================================================== */
+let currentAuditEntries = [];
+
+function exportAuditCsv() {
+  if (!currentAuditEntries || !currentAuditEntries.length) {
+    toast('Нет записей аудита для экспорта', 'error');
+    return;
+  }
+  const columns = [
+    { label: 'Время (UTC)', key: 'created_at' },
+    { label: 'Время (Локальное)', key: 'created_at', format: v => (v ? fmtDate(v) : '') },
+    { label: 'Событие (Event)', key: 'event' },
+    { label: 'Actor', key: 'actor' },
+    { label: 'Тип (Subject Type)', key: 'subject_type' },
+    { label: 'Subject ID', key: 'subject_id' },
+    { label: 'Детали', key: 'detail', format: v => (typeof v === 'object' ? JSON.stringify(v) : String(v != null ? v : '')) }
+  ];
+  const dateStr = new Date().toISOString().slice(0, 10);
+  exportToCsv(`audit_log_export_${dateStr}.csv`, columns, currentAuditEntries);
+  toast(`Экспорт CSV завершён (записей: ${currentAuditEntries.length})`, 'success');
+}
+
 async function renderAudit(container) {
   container.innerHTML = '';
 
+  // Topbar actions
+  $('#topbar-actions').innerHTML = '';
+  $('#topbar-actions').appendChild(
+    h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center'}},
+      h('button', {class: 'btn', onClick: () => loadAudit(container)}, '🔄 Обновить'),
+      h('button', {class: 'btn', id: 'btn-export-audit-top', onClick: () => exportAuditCsv(), title: 'Экспорт журнала аудита в CSV'}, '📥 Export CSV')
+    )
+  );
+
   // Filters
-  const toolbar = h('div', {class: 'toolbar'},
+  const toolbar = h('div', {class: 'toolbar', style: {display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap'}},
     h('input', {class: 'form-control', id: 'audit-event', placeholder: 'Фильтр по event…', style: {width: '200px'}}),
     h('input', {class: 'form-control', id: 'audit-subject', placeholder: 'subject_id…', style: {width: '200px'}}),
     h('select', {class: 'form-control', id: 'audit-limit', style: {width: '100px'}},
@@ -1441,7 +1532,8 @@ async function renderAudit(container) {
       h('option', {value: '100', selected: ''}, '100'),
       h('option', {value: '500'}, '500'),
     ),
-    h('button', {class: 'btn btn-primary', onClick: () => loadAudit(container)}, '🔍 Найти')
+    h('button', {class: 'btn btn-primary', onClick: () => loadAudit(container)}, '🔍 Найти'),
+    h('button', {class: 'btn', id: 'btn-export-audit-toolbar', onClick: () => exportAuditCsv(), title: 'Экспорт в CSV'}, '📥 Export CSV')
   );
   container.appendChild(toolbar);
 
@@ -1464,15 +1556,15 @@ async function loadAudit(container) {
     if (sub) params.subject_id = sub;
 
     const data = await API.get('/admin/audit', params);
-    const entries = data.entries || [];
+    currentAuditEntries = data.entries || [];
 
-    if (!entries.length) {
+    if (!currentAuditEntries.length) {
       wrap.innerHTML = '<div class="empty-state"><span class="icon">📋</span><p>Нет записей</p></div>';
       return;
     }
 
     let rows = '';
-    entries.forEach(e => {
+    currentAuditEntries.forEach(e => {
       rows += `<tr>
         <td style="white-space:nowrap">${fmtDate(e.created_at)}</td>
         <td><span class="chip">${esc(e.event)}</span></td>

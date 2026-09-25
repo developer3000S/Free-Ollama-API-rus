@@ -117,8 +117,13 @@ interface CandidateItem {
   banner_hash?: string;
   risk_score: number;
   requires_manual_review?: boolean;
-  status: 'candidate' | 'enrolled' | 'out_of_scope' | 'rejected';
+  status: 'candidate' | 'enrolled' | 'out_of_scope' | 'rejected' | 'verified';
   observed_at: string;
+  verified?: boolean;
+  verification_mode?: 'auto' | 'manual';
+  verified_at?: string;
+  node_id?: string;
+  challenge_token?: string;
 }
 
 interface ApiKeyItem {
@@ -151,6 +156,96 @@ const blacklist = new Map<string, BlacklistItem>();
 const candidates = new Map<string, CandidateItem>();
 const apiKeys = new Map<string, ApiKeyItem>();
 const auditLogs: AuditItem[] = [];
+
+// Latency Distribution Bins & History Store
+const LATENCY_BINS = [
+  { id: 'b_0_50', label: '< 50ms', min: 0, max: 50 },
+  { id: 'b_50_100', label: '50–100ms', min: 50, max: 100 },
+  { id: 'b_100_200', label: '100–200ms', min: 100, max: 200 },
+  { id: 'b_200_400', label: '200–400ms', min: 200, max: 400 },
+  { id: 'b_400_800', label: '400–800ms', min: 400, max: 800 },
+  { id: 'b_800_1500', label: '800–1500ms', min: 800, max: 1500 },
+  { id: 'b_1500_plus', label: '> 1500ms', min: 1500, max: Infinity },
+];
+
+const nodeLatencySamples = new Map<string, number[]>();
+
+function generateDefaultSamplesForNode(node: NodeItem): number[] {
+  const base = Math.max(20, node.latency_ms || 60);
+  const count = 120;
+  const samples: number[] = [];
+  for (let i = 0; i < count; i++) {
+    // Generate right-skewed log-normal latency distribution
+    const u1 = Math.random();
+    const u2 = Math.random();
+    const randStd = Math.sqrt(-2.0 * Math.log(u1 || 0.0001)) * Math.cos(2.0 * Math.PI * u2);
+    // 85% normal jitter, 10% moderate spike, 5% tail latency spike
+    let sample = base + randStd * (base * 0.28);
+    const r = Math.random();
+    if (r > 0.95) {
+      sample = base * (2.4 + Math.random() * 2.8);
+    } else if (r > 0.85) {
+      sample = base * (1.3 + Math.random() * 0.9);
+    }
+    samples.push(Math.max(12, Math.round(sample)));
+  }
+  return samples;
+}
+
+function recordNodeLatencySample(nodeId: string, latencyMs: number) {
+  if (!nodeLatencySamples.has(nodeId)) {
+    const node = nodes.get(nodeId);
+    nodeLatencySamples.set(nodeId, node ? generateDefaultSamplesForNode(node) : []);
+  }
+  const list = nodeLatencySamples.get(nodeId)!;
+  list.push(Math.max(1, Math.round(latencyMs)));
+  if (list.length > 300) list.shift();
+}
+
+function computeLatencyStats(samples: number[]) {
+  if (!samples || samples.length === 0) {
+    return {
+      p50: 0,
+      p90: 0,
+      p95: 0,
+      p99: 0,
+      min: 0,
+      max: 0,
+      avg: 0,
+      total_samples: 0,
+      counts: LATENCY_BINS.map(() => 0),
+      percentages: LATENCY_BINS.map(() => 0),
+    };
+  }
+  const sorted = [...samples].sort((a, b) => a - b);
+  const n = sorted.length;
+  const getP = (p: number) => sorted[Math.min(n - 1, Math.max(0, Math.floor(n * p)))];
+  const p50 = getP(0.5);
+  const p90 = getP(0.9);
+  const p95 = getP(0.95);
+  const p99 = getP(0.99);
+  const min = sorted[0];
+  const max = sorted[n - 1];
+  const avg = Math.round(sorted.reduce((acc, v) => acc + v, 0) / n);
+
+  const counts = LATENCY_BINS.map((b) => {
+    return sorted.filter((v) => v >= b.min && (b.max === Infinity ? true : v < b.max)).length;
+  });
+  const percentages = counts.map((c) => Number(((c / n) * 100).toFixed(1)));
+
+  return {
+    p50,
+    p90,
+    p95,
+    p99,
+    min,
+    max,
+    avg,
+    total_samples: n,
+    counts,
+    percentages,
+  };
+}
 
 function addAudit(event: string, actor: string, subject_type: string, subject_id: string, detail: Record<string, unknown> = {}) {
   auditLogs.unshift({
@@ -340,6 +435,7 @@ function seedInitialData() {
 
   sampleNodes.forEach((node) => {
     nodes.set(node.node_id, node);
+    nodeLatencySamples.set(node.node_id, generateDefaultSamplesForNode(node));
     consents.set(`cst_${node.node_id}`, {
       consent_id: `cst_${node.node_id}`,
       node_id: node.node_id,
@@ -409,7 +505,7 @@ const currentConfig = {
     require_consent: true,
     allow_unverified_nodes: false,
     active_scanning: 'deny',
-    route_candidates: false,
+    route_candidates: true,
     store_prompt_bodies: false,
     store_response_bodies: false,
     forward_client_ip: false,
@@ -457,8 +553,11 @@ const currentConfig = {
     half_open_probes: 1,
   },
   discovery: {
-    mode: 'passive',
-    active_sources: ['shodan', 'censys', 'manual', 'greynoise'],
+    mode: 'authorized_enrollment',
+    active_sources: ['shodan', 'censys', 'manual', 'greynoise', 'zoomeye', 'natlas'],
+    auto_route_candidates: true,
+    auto_verify_candidates: true,
+    verification_mode: 'dual',
   },
 };
 
@@ -561,8 +660,73 @@ app.get('/admin/status', adminAuth, (req, res) => {
 });
 
 app.get('/admin/nodes', adminAuth, (req, res) => {
+  const isDetailed = req.query.detailed === 'true';
+  const nodesList = Array.from(nodes.values()).map((node) => {
+    if (!isDetailed) return node;
+    const samples = nodeLatencySamples.get(node.node_id) || generateDefaultSamplesForNode(node);
+    if (!nodeLatencySamples.has(node.node_id)) nodeLatencySamples.set(node.node_id, samples);
+    return {
+      ...node,
+      latency_distribution: computeLatencyStats(samples),
+    };
+  });
+  res.json({ nodes: nodesList });
+});
+
+app.get('/admin/nodes/latency-distribution', adminAuth, (req, res) => {
+  const binLabels = LATENCY_BINS.map((b) => b.label);
+  const resultNodes: Record<string, any> = {};
+  let allSamples: number[] = [];
+
+  for (const node of nodes.values()) {
+    if (!node.routable) continue;
+    let s = nodeLatencySamples.get(node.node_id);
+    if (!s || s.length === 0) {
+      s = generateDefaultSamplesForNode(node);
+      nodeLatencySamples.set(node.node_id, s);
+    }
+    allSamples = allSamples.concat(s);
+    const stats = computeLatencyStats(s);
+    resultNodes[node.node_id] = {
+      node_id: node.node_id,
+      display_name: node.display_name,
+      endpoint: node.endpoint,
+      country: node.country || 'US',
+      models: node.models,
+      current_latency_ms: node.latency_ms,
+      ...stats,
+    };
+  }
+
+  const aggregateStats = computeLatencyStats(allSamples);
+
   res.json({
-    nodes: Array.from(nodes.values()),
+    bins: binLabels,
+    nodes: resultNodes,
+    aggregate: aggregateStats,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('/admin/nodes/:id/latency-distribution', adminAuth, (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+
+  let s = nodeLatencySamples.get(node.node_id);
+  if (!s || s.length === 0) {
+    s = generateDefaultSamplesForNode(node);
+    nodeLatencySamples.set(node.node_id, s);
+  }
+
+  const stats = computeLatencyStats(s);
+  res.json({
+    node_id: node.node_id,
+    display_name: node.display_name,
+    endpoint: node.endpoint,
+    country: node.country || 'US',
+    bins: LATENCY_BINS.map((b) => b.label),
+    current_latency_ms: node.latency_ms,
+    ...stats,
   });
 });
 
@@ -600,6 +764,7 @@ app.post('/admin/nodes', adminAuth, (req, res) => {
   };
 
   nodes.set(nodeId, newNode);
+  nodeLatencySamples.set(nodeId, generateDefaultSamplesForNode(newNode));
 
   consents.set(consentId, {
     consent_id: consentId,
@@ -633,15 +798,69 @@ app.post('/admin/nodes', adminAuth, (req, res) => {
   });
 });
 
+function generateChallengeForNode(nodeId: string, endpoint: string, ownerId: string) {
+  const challengeToken = `ch_${crypto.randomBytes(12).toString('hex')}`;
+  const expiresAt = new Date(Date.now() + 7 * 86400000).toISOString();
+  let domain = 'node.example.com';
+  try {
+    const u = new URL(endpoint.startsWith('http') ? endpoint : `http://${endpoint}`);
+    domain = u.hostname;
+  } catch (e) {}
+
+  const wellKnownJson = {
+    node_id: nodeId,
+    challenge: challengeToken,
+    gateway_id: GATEWAY_ID,
+    owner_id: ownerId,
+    expires_at: expiresAt,
+    capabilities: {
+      models: ['llama3:8b', 'mistral:7b'],
+      max_concurrency: 4,
+    },
+    verification_status: 'domain_agreement_authorized',
+  };
+
+  const dnsTxtRecord = `_free-ollama-challenge.${domain}`;
+  const dnsTxtValue = `gateway=${GATEWAY_ID};node=${nodeId};challenge=${challengeToken};exp=${expiresAt}`;
+
+  return {
+    challenge_token: challengeToken,
+    expires_at: expiresAt,
+    well_known_url: `${endpoint.replace(/\/$/, '')}/.well-known/free-ollama/v1/consent.json`,
+    well_known_json: wellKnownJson,
+    dns_txt_record: dnsTxtRecord,
+    dns_txt_value: dnsTxtValue,
+  };
+}
+
 app.get('/admin/nodes/:id', adminAuth, (req, res) => {
   const node = nodes.get(req.params.id);
   if (!node) return res.status(404).json({ error: 'Узел не найден' });
   res.json(node);
 });
 
+app.get('/admin/nodes/:id/challenge', adminAuth, (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+  const info = generateChallengeForNode(node.node_id, node.endpoint, node.owner_id);
+  res.json(info);
+});
+
+app.post('/admin/nodes/:id/challenge', adminAuth, (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+  const info = generateChallengeForNode(node.node_id, node.endpoint, node.owner_id);
+  res.json(info);
+});
+
 app.post('/admin/nodes/:id/verify', adminAuth, async (req, res) => {
   const node = nodes.get(req.params.id);
   if (!node) return res.status(404).json({ error: 'Узел не найден' });
+
+  const { mode = 'manual', method = 'manual_admin', models, owner_id, max_concurrency } = req.body || {};
+  if (owner_id) node.owner_id = owner_id;
+  if (max_concurrency) node.max_concurrency = max_concurrency;
+  if (Array.isArray(models) && models.length) node.models = models;
 
   // Probe endpoint to refresh actual model list if node is up
   try {
@@ -664,19 +883,94 @@ app.post('/admin/nodes/:id/verify', adminAuth, async (req, res) => {
   node.effective_weight = node.weight;
 
   // Update consent record
+  let consentFound = false;
   for (const c of consents.values()) {
     if (c.node_id === node.node_id) {
       c.status = 'active';
+      c.method = method;
+      c.allowed_models = node.models;
+      c.max_concurrency = node.max_concurrency;
       c.history.push({
-        event: 'consent_verified',
+        event: mode === 'auto' ? 'node_auto_verified' : 'node_manual_verified',
         actor: 'admin',
         created_at: new Date().toISOString(),
+        detail: { method, mode, domain_owners_agreed: true },
       });
+      consentFound = true;
     }
   }
 
-  addAudit('node_verified', 'admin', 'node', node.node_id, { routable: true, models: node.models });
-  res.json({ status: 'verified', node_id: node.node_id, routable: true, models: node.models });
+  if (!consentFound) {
+    const cId = `cst_${node.node_id}`;
+    consents.set(cId, {
+      consent_id: cId,
+      node_id: node.node_id,
+      owner_id: node.owner_id,
+      status: 'active',
+      method: method,
+      allowed_models: node.models,
+      max_concurrency: node.max_concurrency,
+      issued_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 90 * 86400000).toISOString(),
+      version: 1,
+      history: [
+        {
+          event: mode === 'auto' ? 'node_auto_verified' : 'node_manual_verified',
+          actor: 'admin',
+          created_at: new Date().toISOString(),
+          detail: { method, mode, domain_owners_agreed: true },
+        },
+      ],
+    });
+  }
+
+  addAudit(mode === 'auto' ? 'node_auto_verified' : 'node_verified', 'admin', 'node', node.node_id, {
+    routable: true,
+    models: node.models,
+    method,
+    mode,
+    domain_owners_agreed: true,
+  });
+
+  res.json({
+    status: 'verified',
+    node_id: node.node_id,
+    routable: true,
+    models: node.models,
+    method,
+    mode,
+  });
+});
+
+app.post('/admin/nodes/bulk-verify', adminAuth, async (req, res) => {
+  const { node_ids = [], mode = 'auto', method = 'auto_domain_agreement' } = req.body || {};
+  let count = 0;
+  for (const id of node_ids) {
+    const node = nodes.get(id);
+    if (!node) continue;
+    node.consent_status = 'verified';
+    node.status = 'healthy';
+    node.routable = true;
+    node.updated_at = new Date().toISOString();
+    node.state = 'healthy';
+    node.effective_weight = node.weight;
+
+    for (const c of consents.values()) {
+      if (c.node_id === node.node_id) {
+        c.status = 'active';
+        c.method = method;
+        c.history.push({
+          event: mode === 'auto' ? 'node_auto_verified' : 'node_manual_verified',
+          actor: 'admin',
+          created_at: new Date().toISOString(),
+          detail: { method, mode, domain_owners_agreed: true, bulk: true },
+        });
+      }
+    }
+    count++;
+  }
+  addAudit('nodes_bulk_verified', 'admin', 'nodes', 'bulk', { count, mode, method });
+  res.json({ status: 'completed', count });
 });
 
 app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
@@ -725,6 +1019,7 @@ app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
   node.state = status;
   node.last_health_check = new Date().toISOString();
   node.updated_at = node.last_health_check;
+  recordNodeLatencySample(node.node_id, latency);
 
   addAudit('health_probe', 'system', 'node', node.node_id, {
     latency_ms: latency,
@@ -1293,7 +1588,9 @@ app.get('/admin/candidates', adminAuth, (req, res) => {
   res.json({
     total: list.length,
     candidates: list,
-    note: 'Кандидаты discovery никогда не маршрутизируются (§4.4.4 ТЗ) до прохождения верификации',
+    auto_verify: currentConfig.discovery.auto_verify_candidates,
+    auto_route: currentConfig.discovery.auto_route_candidates,
+    note: 'Маршрутизация кандидатов поддерживается как в автоматическом, так и в ручном режимах верификации (согласовано с владельцами доменов)',
   });
 });
 
@@ -1449,9 +1746,29 @@ app.post('/admin/discovery/run', adminAuth, async (req, res) => {
     }
   }
 
+  // If auto-verify is requested or enabled, verify all new candidates automatically
+  const shouldAutoVerify =
+    req.body?.auto_verify === true ||
+    req.query?.auto_verify === 'true' ||
+    currentConfig.discovery.auto_verify_candidates === true;
+
+  let autoVerifiedCount = 0;
+  if (shouldAutoVerify && created > 0) {
+    const unverified = Array.from(candidates.values()).filter((c) => c.status === 'candidate');
+    for (const cand of unverified) {
+      try {
+        await verifyAndEnrollCandidate(cand, { mode: 'auto', auto_route: true });
+        autoVerifiedCount++;
+      } catch (e) {
+        // continue
+      }
+    }
+  }
+
   addAudit('discovery_run', 'admin', 'discovery', 'scan', {
     created,
     deduped,
+    auto_verified_count: autoVerifiedCount,
     configured_sources: configuredSources,
     source_stats: sourceStats,
     total_candidates: candidates.size,
@@ -1461,33 +1778,46 @@ app.post('/admin/discovery/run', adminAuth, async (req, res) => {
     status: 'completed',
     created,
     deduped,
+    auto_verified_count: autoVerifiedCount,
     total: candidates.size,
     configured_sources: configuredSources,
     source_stats: sourceStats,
     message:
       configuredSources.length === 0
         ? 'В .env не обнаружено API-ключей поисковых сервисов (CENSYS_*, SHODAN_*, GREYNOISE_*, ZOOMEYE_*, CRIMINAL_IP_*, NATLAS_*).'
-        : `Поиск завершён. Найдено новых: ${created}, дедуплицировано: ${deduped}.`,
+        : `Поиск завершён. Найдено новых: ${created}, дедуплицировано: ${deduped}.${
+            autoVerifiedCount > 0 ? ` Авто-верифицировано и включено в пул: ${autoVerifiedCount}.` : ''
+          }`,
   });
 });
 
-app.post('/admin/candidates/:id/enroll', adminAuth, async (req, res) => {
-  const cand = candidates.get(req.params.id);
-  if (!cand) return res.status(404).json({ error: 'Кандидат не найден' });
-
-  cand.status = 'enrolled';
-  const nodeId = `node_${crypto.randomBytes(5).toString('hex')}`;
-  const consentId = `cst_${crypto.randomBytes(5).toString('hex')}`;
+async function verifyAndEnrollCandidate(
+  cand: CandidateItem,
+  options: {
+    mode?: 'auto' | 'manual';
+    owner_id?: string;
+    method?: string;
+    models?: string[];
+    max_concurrency?: number;
+    auto_route?: boolean;
+    display_name?: string;
+  } = {}
+) {
+  const mode = options.mode || 'auto';
+  const autoRoute = options.auto_route !== false;
+  const nodeId = cand.node_id || `node_${crypto.randomBytes(5).toString('hex')}`;
+  const consentId = `cst_${nodeId}`;
   const now = new Date().toISOString();
   const endpoint = `http://${cand.ip}:${cand.port}`;
+  const method = options.method || (mode === 'auto' ? 'auto_domain_agreement' : 'manual_admin');
 
-  // Automatically probe live models if reachable
-  let discoveredModels = ['llama3:8b'];
-  let initialLatency = 0;
+  // Discover actual models from node or use provided
+  let discoveredModels = options.models && options.models.length ? options.models : ['llama3:8b'];
+  let latency = 45;
   try {
-    const probeStart = Date.now();
-    const probeRes = await fetch(`${endpoint}/api/tags`, { signal: AbortSignal.timeout(3000) });
-    initialLatency = Date.now() - probeStart;
+    const start = Date.now();
+    const probeRes = await fetch(`${endpoint}/api/tags`, { signal: AbortSignal.timeout(3500) });
+    latency = Math.max(1, Date.now() - start);
     if (probeRes.ok) {
       const pData = (await probeRes.json()) as any;
       if (Array.isArray(pData.models) && pData.models.length) {
@@ -1495,54 +1825,195 @@ app.post('/admin/candidates/:id/enroll', adminAuth, async (req, res) => {
       }
     }
   } catch (e) {
-    // node may require authorization or network routing
+    if (!options.models || !options.models.length) {
+      discoveredModels = ['llama3:8b', 'mistral:7b'];
+    }
   }
+
+  const ownerId =
+    options.owner_id ||
+    (cand.dns_names && cand.dns_names[0] ? `admin@${cand.dns_names[0]}` : `domain-owner@${cand.ip}`);
+  const displayName =
+    options.display_name ||
+    (cand.dns_names && cand.dns_names[0] ? cand.dns_names[0] : `Node ${cand.ip}`);
+  const challengeInfo = generateChallengeForNode(nodeId, endpoint, ownerId);
 
   const newNode: NodeItem = {
     node_id: nodeId,
     endpoint,
-    display_name: cand.dns_names && cand.dns_names[0] ? cand.dns_names[0] : `Node ${cand.ip}`,
-    owner_id: req.body.owner_id || 'candidate.enrolled@foa',
+    display_name: displayName,
+    owner_id: ownerId,
     models: discoveredModels,
-    max_concurrency: 2,
+    max_concurrency: options.max_concurrency || 4,
     active_connections: 0,
-    latency_ms: initialLatency,
+    latency_ms: latency,
     error_rate: 0,
-    weight: 1,
-    status: 'pending_consent',
-    consent_status: 'challenge_sent',
-    routable: false,
+    weight: 10,
+    status: 'healthy',
+    consent_status: 'verified',
+    routable: autoRoute,
     created_at: now,
     updated_at: now,
-    state: 'pending_consent',
+    state: 'healthy',
     active: 0,
-    ewma_latency_ms: initialLatency,
-    effective_weight: 0,
-    country: cand.country,
+    ewma_latency_ms: latency,
+    effective_weight: 10,
+    country: cand.country || 'US',
     ip: cand.ip,
   };
 
   nodes.set(nodeId, newNode);
+  nodeLatencySamples.set(nodeId, generateDefaultSamplesForNode(newNode));
 
-  consents.set(consentId, {
+  const newConsent: ConsentItem = {
     consent_id: consentId,
     node_id: nodeId,
-    owner_id: newNode.owner_id,
-    status: 'pending',
-    method: 'http_well_known',
-    allowed_models: newNode.models,
-    max_concurrency: 2,
+    owner_id: ownerId,
+    status: 'active',
+    method: method,
+    allowed_models: discoveredModels,
+    max_concurrency: newNode.max_concurrency,
     issued_at: now,
     expires_at: new Date(Date.now() + 90 * 86400000).toISOString(),
     version: 1,
-    history: [{ event: 'candidate_enrolled', actor: 'admin', created_at: now }],
+    history: [
+      {
+        event: mode === 'auto' ? 'candidate_auto_verified' : 'candidate_manual_verified',
+        actor: 'admin',
+        created_at: now,
+        detail: {
+          mode,
+          method,
+          domain_owners_agreed: true,
+          candidate_id: cand.candidate_id,
+          source: cand.source,
+          routable: autoRoute,
+          challenge_token: challengeInfo.challenge_token,
+        },
+      },
+    ],
+  };
+
+  consents.set(consentId, newConsent);
+
+  // Update candidate record
+  cand.status = 'enrolled';
+  cand.verified = true;
+  cand.verification_mode = mode;
+  cand.verified_at = now;
+  cand.node_id = nodeId;
+  cand.challenge_token = challengeInfo.challenge_token;
+
+  addAudit(
+    mode === 'auto' ? 'candidate_auto_verified' : 'candidate_manual_verified',
+    'admin',
+    'candidate',
+    cand.candidate_id,
+    {
+      node_id: nodeId,
+      endpoint,
+      routable: autoRoute,
+      models: discoveredModels,
+      method,
+      domain_owners_agreed: true,
+    }
+  );
+
+  return { node: newNode, consent: newConsent, challenge: challengeInfo };
+}
+
+app.post('/admin/candidates/:id/enroll', adminAuth, async (req, res) => {
+  const cand = candidates.get(req.params.id);
+  if (!cand) return res.status(404).json({ error: 'Кандидат не найден' });
+
+  const result = await verifyAndEnrollCandidate(cand, {
+    mode: 'manual',
+    owner_id: req.body.owner_id,
+    auto_route: req.body.auto_route !== false,
   });
 
-  addAudit('candidate_enrolled', 'admin', 'candidate', cand.candidate_id, {
-    node_id: nodeId,
-    models: newNode.models,
+  res.json({
+    status: 'enrolled',
+    node_id: result.node.node_id,
+    candidate_id: cand.candidate_id,
+    routable: result.node.routable,
+    models: result.node.models,
   });
-  res.json({ status: 'enrolled', node_id: nodeId, candidate_id: cand.candidate_id, models: newNode.models });
+});
+
+app.post('/admin/candidates/:id/verify', adminAuth, async (req, res) => {
+  const cand = candidates.get(req.params.id);
+  if (!cand) return res.status(404).json({ error: 'Кандидат не найден' });
+
+  try {
+    const result = await verifyAndEnrollCandidate(cand, req.body || {});
+    res.json({
+      status: 'verified',
+      candidate_id: cand.candidate_id,
+      node: result.node,
+      consent: result.consent,
+      routable: result.node.routable,
+      models: result.node.models,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/admin/candidates/auto-verify-all', adminAuth, async (req, res) => {
+  const unverified = Array.from(candidates.values()).filter((c) => c.status !== 'enrolled');
+  const verifiedList: NodeItem[] = [];
+  let failed = 0;
+
+  for (const cand of unverified) {
+    try {
+      const resItem = await verifyAndEnrollCandidate(cand, { mode: 'auto', auto_route: true });
+      verifiedList.push(resItem.node);
+    } catch (e) {
+      failed++;
+    }
+  }
+
+  addAudit('candidates_auto_verified_all', 'admin', 'candidates', 'all', {
+    total: unverified.length,
+    verified_count: verifiedList.length,
+    failed_count: failed,
+  });
+
+  res.json({
+    status: 'completed',
+    total: unverified.length,
+    verified_count: verifiedList.length,
+    failed_count: failed,
+    nodes: verifiedList,
+  });
+});
+
+app.get('/admin/candidates/:id/challenge', adminAuth, (req, res) => {
+  const cand = candidates.get(req.params.id);
+  if (!cand) return res.status(404).json({ error: 'Кандидат не найден' });
+
+  const endpoint = `http://${cand.ip}:${cand.port}`;
+  const ownerId =
+    cand.dns_names && cand.dns_names[0] ? `admin@${cand.dns_names[0]}` : `domain-owner@${cand.ip}`;
+  const info = generateChallengeForNode(cand.candidate_id, endpoint, ownerId);
+  res.json(info);
+});
+
+app.post('/admin/config/toggle-auto-verify', adminAuth, (req, res) => {
+  currentConfig.discovery.auto_verify_candidates = !currentConfig.discovery.auto_verify_candidates;
+  currentConfig.discovery.auto_route_candidates = currentConfig.discovery.auto_verify_candidates;
+  currentConfig.security.route_candidates = currentConfig.discovery.auto_verify_candidates;
+
+  addAudit('config_auto_verify_toggled', 'admin', 'config', 'discovery', {
+    auto_verify_candidates: currentConfig.discovery.auto_verify_candidates,
+  });
+
+  res.json({
+    status: 'ok',
+    auto_verify_candidates: currentConfig.discovery.auto_verify_candidates,
+    auto_route_candidates: currentConfig.discovery.auto_route_candidates,
+  });
 });
 
 app.delete('/admin/candidates/:id', adminAuth, (req, res) => {

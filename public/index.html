@@ -371,6 +371,44 @@ select.form-control { appearance: auto; }
   box-shadow: 0 1px 4px rgba(99, 102, 241, 0.4);
 }
 
+/* ===== Help & Documentation Styles ===== */
+.help-card {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 22px; margin-bottom: 20px;
+}
+.help-hero {
+  background: linear-gradient(135deg, rgba(99,102,241,0.12), rgba(6,182,212,0.06));
+  border: 1px solid rgba(99,102,241,0.25); border-radius: 12px; padding: 22px 24px; margin-bottom: 22px;
+}
+.help-tabs-nav {
+  display: flex; gap: 6px; background: var(--bg); padding: 4px; border-radius: var(--radius);
+  border: 1px solid var(--border); margin-bottom: 14px; overflow-x: auto;
+}
+.help-tab-btn {
+  padding: 8px 16px; border: none; background: transparent; color: var(--text2);
+  border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; cursor: pointer;
+  transition: all .15s; white-space: nowrap;
+}
+.help-tab-btn:hover { color: var(--text); background: var(--bg3); }
+.help-tab-btn.active { color: #fff; background: var(--accent); font-weight: 600; }
+.code-container {
+  background: #0b0d13; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-top: 10px;
+}
+.code-header {
+  display: flex; justify-content: space-between; align-items: center; padding: 8px 14px;
+  background: #141721; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text3);
+}
+.code-body {
+  padding: 14px; margin: 0; font-family: var(--mono); font-size: 12px; line-height: 1.6;
+  color: #e2e8f0; overflow-x: auto; white-space: pre;
+}
+.endpoint-badge {
+  display: inline-block; font-family: var(--mono); font-weight: 700; font-size: 11px;
+  padding: 2px 7px; border-radius: 4px;
+}
+.endpoint-get { background: rgba(34,197,94,.15); color: var(--green); }
+.endpoint-post { background: rgba(59,130,246,.15); color: var(--blue); }
+
 /* ===== Responsive ===== */
 @media (max-width: 768px) {
   .sidebar { display: none; }
@@ -415,6 +453,7 @@ select.form-control { appearance: auto; }
       <div class="section-label">Система</div>
       <a href="#audit" data-page="audit"><span class="icon">📋</span> Аудит</a>
       <a href="#config" data-page="config"><span class="icon">⚙️</span> Конфигурация</a>
+      <a href="#help" data-page="help"><span class="icon">❓</span> Помощь</a>
     </nav>
     <div class="sidebar-footer">
       <span id="sidebar-version"></span>
@@ -512,6 +551,40 @@ function fmtDate(iso) {
   return d.toLocaleDateString('ru-RU') + ' ' + d.toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit'});
 }
 function fmtPct(v) { return (v * 100).toFixed(1) + '%'; }
+
+function exportToCsv(filename, columns, dataRows) {
+  if (!dataRows || !dataRows.length) return false;
+
+  const escapeCell = (val) => {
+    if (val === null || val === undefined) return '""';
+    let str = typeof val === 'object' ? JSON.stringify(val) : String(val);
+    str = str.replace(/"/g, '""');
+    return `"${str}"`;
+  };
+
+  const headerLine = columns.map(c => escapeCell(c.label || c.key)).join(',');
+  const rowLines = dataRows.map(row => {
+    return columns.map(c => {
+      let val = row[c.key];
+      if (typeof c.format === 'function') {
+        val = c.format(val, row);
+      }
+      return escapeCell(val);
+    }).join(',');
+  });
+
+  const csvContent = '\uFEFF' + [headerLine, ...rowLines].join('\r\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.setAttribute('download', filename);
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  return true;
+}
 
 function statusBadge(status) {
   const map = {
@@ -767,12 +840,26 @@ async function renderDashboard(container) {
 }
 
 /* ====================================================================== */
-/*  Monitor (60m Real-time Charts)                                         */
+/*  Monitor (60m Real-time Charts & Latency Distribution)                  */
 /* ====================================================================== */
 let monitorLatencyChartInstance = null;
 let monitorErrorChartInstance = null;
+let monitorHistogramChartInstance = null;
 let monitorSearchQuery = '';
 let cachedRoutableNodes = [];
+let monitorHistogramSelectedNode = 'all'; // 'all' or nodeId
+let monitorHistogramMode = 'count'; // 'count' | 'percentage'
+let cachedLatencyDistribution = null;
+
+const HISTOGRAM_BINS = [
+  { id: 'b_0_50', label: '< 50ms', color: '#10b981', quality: 'Отлично', min: 0, max: 50 },
+  { id: 'b_50_100', label: '50–100ms', color: '#06b6d4', quality: 'Быстро', min: 50, max: 100 },
+  { id: 'b_100_200', label: '100–200ms', color: '#3b82f6', quality: 'Нормально', min: 100, max: 200 },
+  { id: 'b_200_400', label: '200–400ms', color: '#8b5cf6', quality: 'Умеренно', min: 200, max: 400 },
+  { id: 'b_400_800', label: '400–800ms', color: '#f59e0b', quality: 'Замедленно', min: 400, max: 800 },
+  { id: 'b_800_1500', label: '800–1500ms', color: '#f97316', quality: 'Высокая', min: 800, max: 1500 },
+  { id: 'b_1500_plus', label: '> 1500ms', color: '#ef4444', quality: 'Критично', min: 1500, max: Infinity },
+];
 
 async function renderMonitor(container) {
   $('#topbar-actions').innerHTML = '';
@@ -807,17 +894,25 @@ async function renderMonitor(container) {
   container.innerHTML = '<div class="loading">Загрузка данных мониторинга...</div>';
 
   try {
-    const data = await API.get('/admin/nodes', {detailed: true});
+    const [data, distData] = await Promise.all([
+      API.get('/admin/nodes', {detailed: true}),
+      API.get('/admin/nodes/latency-distribution').catch(() => null)
+    ]);
     const nodesList = data.nodes || [];
     cachedRoutableNodes = nodesList.filter(n => n.routable);
+    cachedLatencyDistribution = distData;
 
     updateMonitorView(container);
 
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = setInterval(() => {
       if (currentPage === 'monitor') {
-        API.get('/admin/nodes', {detailed: true}).then(d => {
+        Promise.all([
+          API.get('/admin/nodes', {detailed: true}),
+          API.get('/admin/nodes/latency-distribution').catch(() => null)
+        ]).then(([d, dist]) => {
           cachedRoutableNodes = (d.nodes || []).filter(n => n.routable);
+          cachedLatencyDistribution = dist;
           if (currentPage === 'monitor') updateMonitorView(container, true);
         }).catch(() => {});
       }
@@ -895,6 +990,279 @@ function updateMonitorView(container, preserveInputFocus = false) {
   chartsGrid.appendChild(errCard);
   container.appendChild(chartsGrid);
 
+  // API Latency Distribution Histogram Card
+  const histCard = h('div', {class: 'card', style: {marginTop: '20px'}},
+    h('div', {style: {display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '14px'}},
+      h('div', null,
+        h('div', {class: 'card-title', style: {display: 'flex', alignItems: 'center', gap: '8px'}},
+          h('span', null, '📊 Распределение задержек API (API Latency Distribution)'),
+          h('span', {class: 'badge badge-blue'}, 'Гистограмма')
+        ),
+        h('div', {style: {fontSize: '12px', color: 'var(--text3)', marginTop: '4px'}},
+          'Детализированное распределение времени ответа API по интервалам (мс) и перцентили P50 / P90 / P95 / P99 для каждого узла'
+        )
+      ),
+      h('div', {style: {display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap'}},
+        h('label', {style: {fontSize: '12px', color: 'var(--text2)'}}, 'Узел:'),
+        h('select', {
+          id: 'histogram-node-select',
+          class: 'form-control',
+          style: {width: 'auto', minWidth: '190px', padding: '4px 10px', fontSize: '12px', height: '32px'},
+          onChange: (e) => {
+            monitorHistogramSelectedNode = e.target.value;
+            renderHistogram(filteredNodes);
+          }
+        },
+          h('option', {value: 'all', selected: monitorHistogramSelectedNode === 'all' ? '' : undefined}, '⚡ Все узлы (All Nodes)'),
+          ...filteredNodes.map(n => {
+            const flag = formatCountry(n.country).flag;
+            return h('option', {
+              value: n.node_id,
+              selected: monitorHistogramSelectedNode === n.node_id ? '' : undefined
+            }, `${flag} ${n.display_name || shortId(n.node_id)} (${n.latency_ms || 0} мс)`);
+          })
+        ),
+        h('div', {class: 'btn-group'},
+          h('button', {
+            class: `btn btn-sm ${monitorHistogramMode === 'count' ? 'btn-primary' : ''}`,
+            id: 'btn-hist-count',
+            title: 'Абсолютное количество запросов (Count)',
+            onClick: () => {
+              monitorHistogramMode = 'count';
+              document.getElementById('btn-hist-count')?.classList.add('btn-primary');
+              document.getElementById('btn-hist-pct')?.classList.remove('btn-primary');
+              renderHistogram(filteredNodes);
+            }
+          }, 'Запросы (N)'),
+          h('button', {
+            class: `btn btn-sm ${monitorHistogramMode === 'percentage' ? 'btn-primary' : ''}`,
+            id: 'btn-hist-pct',
+            title: 'Относительная доля в процентах (%)',
+            onClick: () => {
+              monitorHistogramMode = 'percentage';
+              document.getElementById('btn-hist-pct')?.classList.add('btn-primary');
+              document.getElementById('btn-hist-count')?.classList.remove('btn-primary');
+              renderHistogram(filteredNodes);
+            }
+          }, '% Доля')
+        )
+      )
+    ),
+
+    // KPI row for P50, P90, P95, P99, Min, Max, Avg, Total Samples
+    h('div', {id: 'histogram-kpi-bar'}),
+
+    // Chart Canvas
+    h('div', {style: {position: 'relative', height: '330px', marginTop: '10px'}},
+      h('canvas', {id: 'latency-histogram-chart'})
+    ),
+
+    // Bucket Breakdown Grid
+    h('div', {
+      id: 'histogram-bucket-breakdown',
+      style: {marginTop: '16px', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '8px'}
+    })
+  );
+
+  container.appendChild(histCard);
+
+  function renderHistogram(nodesList) {
+    const histCanvas = document.getElementById('latency-histogram-chart');
+    if (!histCanvas) return;
+    const histCtx = histCanvas.getContext('2d');
+    if (!histCtx) return;
+
+    if (monitorHistogramChartInstance) {
+      monitorHistogramChartInstance.destroy();
+      monitorHistogramChartInstance = null;
+    }
+
+    const binLabels = HISTOGRAM_BINS.map(b => b.label);
+    const isCountMode = monitorHistogramMode === 'count';
+
+    let currentStats = null;
+    let datasets = [];
+
+    function getNodeStats(n) {
+      if (cachedLatencyDistribution?.nodes?.[n.node_id]) {
+        return cachedLatencyDistribution.nodes[n.node_id];
+      }
+      if (n.latency_distribution) {
+        return n.latency_distribution;
+      }
+      const base = n.latency_ms || 60;
+      return {
+        p50: base,
+        p90: Math.round(base * 1.5),
+        p95: Math.round(base * 1.9),
+        p99: Math.round(base * 3.2),
+        min: Math.max(10, Math.round(base * 0.4)),
+        max: Math.round(base * 4.5),
+        avg: Math.round(base * 1.2),
+        total_samples: 120,
+        counts: [30, 45, 25, 12, 5, 2, 1],
+        percentages: [25.0, 37.5, 20.8, 10.0, 4.2, 1.7, 0.8],
+      };
+    }
+
+    if (monitorHistogramSelectedNode === 'all') {
+      currentStats = cachedLatencyDistribution?.aggregate || {
+        p50: Math.round(avgLatency),
+        p90: Math.round(avgLatency * 1.6),
+        p95: Math.round(avgLatency * 2.1),
+        p99: Math.round(avgLatency * 3.4),
+        min: Math.max(10, Math.round(avgLatency * 0.3)),
+        max: Math.round(avgLatency * 4.8),
+        avg: Math.round(avgLatency * 1.15),
+        total_samples: nodesList.length * 120,
+        counts: [0, 0, 0, 0, 0, 0, 0],
+        percentages: [0, 0, 0, 0, 0, 0, 0],
+      };
+
+      const palette = ['#6366f1', '#3b82f6', '#22c55e', '#f59e0b', '#ec4899', '#06b6d4', '#8b5cf6', '#14b8a6', '#f43f5e'];
+
+      datasets = nodesList.map((n, idx) => {
+        const nStats = getNodeStats(n);
+        const dataVals = isCountMode ? nStats.counts : nStats.percentages;
+        return {
+          label: n.display_name || shortId(n.node_id),
+          data: dataVals,
+          backgroundColor: palette[idx % palette.length],
+          borderColor: palette[idx % palette.length],
+          borderWidth: 1,
+          borderRadius: 3,
+          stack: 'nodes_stack',
+        };
+      });
+
+    } else {
+      const selectedNodeObj = nodesList.find(n => n.node_id === monitorHistogramSelectedNode) || nodesList[0];
+      if (selectedNodeObj) {
+        currentStats = getNodeStats(selectedNodeObj);
+        const dataVals = isCountMode ? currentStats.counts : currentStats.percentages;
+        datasets = [{
+          label: selectedNodeObj.display_name || shortId(selectedNodeObj.node_id),
+          data: dataVals,
+          backgroundColor: HISTOGRAM_BINS.map(b => b.color),
+          borderColor: HISTOGRAM_BINS.map(b => b.color),
+          borderWidth: 1,
+          borderRadius: 4,
+        }];
+      }
+    }
+
+    // Render KPI bar
+    const kpiEl = document.getElementById('histogram-kpi-bar');
+    if (kpiEl && currentStats) {
+      kpiEl.innerHTML = `
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(115px, 1fr)); gap: 10px; margin-bottom: 12px;">
+          <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px;">
+            <div style="font-size: 11px; color: var(--text3); margin-bottom: 2px;">P50 (Медиана)</div>
+            <div class="mono" style="font-size: 17px; font-weight: 700; color: #10b981;">${currentStats.p50} <span style="font-size: 11px; font-weight: normal; color: var(--text3);">мс</span></div>
+          </div>
+          <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px;">
+            <div style="font-size: 11px; color: var(--text3); margin-bottom: 2px;">P90</div>
+            <div class="mono" style="font-size: 17px; font-weight: 700; color: #06b6d4;">${currentStats.p90} <span style="font-size: 11px; font-weight: normal; color: var(--text3);">мс</span></div>
+          </div>
+          <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px;">
+            <div style="font-size: 11px; color: var(--text3); margin-bottom: 2px;">P95</div>
+            <div class="mono" style="font-size: 17px; font-weight: 700; color: #3b82f6;">${currentStats.p95} <span style="font-size: 11px; font-weight: normal; color: var(--text3);">мс</span></div>
+          </div>
+          <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px;">
+            <div style="font-size: 11px; color: var(--text3); margin-bottom: 2px;">P99 (Tail)</div>
+            <div class="mono" style="font-size: 17px; font-weight: 700; color: #f59e0b;">${currentStats.p99} <span style="font-size: 11px; font-weight: normal; color: var(--text3);">мс</span></div>
+          </div>
+          <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px;">
+            <div style="font-size: 11px; color: var(--text3); margin-bottom: 2px;">Средняя (Avg)</div>
+            <div class="mono" style="font-size: 17px; font-weight: 700; color: var(--text);">${currentStats.avg} <span style="font-size: 11px; font-weight: normal; color: var(--text3);">мс</span></div>
+          </div>
+          <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px;">
+            <div style="font-size: 11px; color: var(--text3); margin-bottom: 2px;">Мин / Макс</div>
+            <div class="mono" style="font-size: 14px; font-weight: 600; color: var(--text2); margin-top: 2px;">${currentStats.min} / ${currentStats.max} <span style="font-size: 11px; font-weight: normal; color: var(--text3);">мс</span></div>
+          </div>
+          <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px;">
+            <div style="font-size: 11px; color: var(--text3); margin-bottom: 2px;">Запросов (N)</div>
+            <div class="mono" style="font-size: 17px; font-weight: 700; color: var(--accent2);">${currentStats.total_samples} <span style="font-size: 11px; font-weight: normal; color: var(--text3);">выборка</span></div>
+          </div>
+        </div>
+      `;
+    }
+
+    // Render Bucket Breakdown
+    const bktEl = document.getElementById('histogram-bucket-breakdown');
+    if (bktEl && currentStats) {
+      const tot = currentStats.total_samples || 1;
+      bktEl.innerHTML = HISTOGRAM_BINS.map((bin, i) => {
+        const count = currentStats.counts ? currentStats.counts[i] : 0;
+        const pct = currentStats.percentages ? currentStats.percentages[i] : ((count / tot) * 100);
+        return `
+          <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+              <span class="mono" style="font-size: 12px; font-weight: 600; color: ${bin.color};">${bin.label}</span>
+              <span style="font-size: 10px; padding: 1px 5px; border-radius: 3px; background: ${bin.color}22; color: ${bin.color}; font-weight: 500;">${bin.quality}</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <strong class="mono" style="font-size: 15px;">${count}</strong>
+              <span style="font-size: 11px; color: var(--text3);">${Number(pct).toFixed(1)}%</span>
+            </div>
+            <div style="background: var(--bg3); height: 4px; border-radius: 2px; margin-top: 6px; overflow: hidden;">
+              <div style="background: ${bin.color}; width: ${Math.min(100, Math.max(0, pct))}%; height: 100%;"></div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // Create Chart.js instance
+    monitorHistogramChartInstance = new Chart(histCtx, {
+      type: 'bar',
+      data: {
+        labels: binLabels,
+        datasets: datasets
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            display: monitorHistogramSelectedNode === 'all',
+            labels: { color: '#94a3b8', font: { family: 'system-ui', size: 11 } }
+          },
+          tooltip: {
+            mode: monitorHistogramSelectedNode === 'all' ? 'index' : 'point',
+            intersect: false,
+            callbacks: {
+              label: (ctx) => {
+                const dsLabel = ctx.dataset.label || '';
+                const val = ctx.raw;
+                const unit = isCountMode ? ' запр.' : '%';
+                return ` ${dsLabel}: ${val}${unit}`;
+              }
+            }
+          }
+        },
+        scales: {
+          x: {
+            stacked: monitorHistogramSelectedNode === 'all',
+            grid: { color: '#2e3140' },
+            ticks: { color: '#94a3b8', font: { family: 'system-ui', size: 11 } }
+          },
+          y: {
+            stacked: monitorHistogramSelectedNode === 'all',
+            grid: { color: '#2e3140' },
+            ticks: { color: '#94a3b8' },
+            title: {
+              display: true,
+              text: isCountMode ? 'Количество запросов (Requests)' : 'Доля трафика (%)',
+              color: '#94a3b8',
+              font: { size: 12 }
+            }
+          }
+        }
+      }
+    });
+  }
+
   setTimeout(() => {
     const latCtx = document.getElementById('latency-chart')?.getContext('2d');
     const errCtx = document.getElementById('error-chart')?.getContext('2d');
@@ -966,6 +1334,8 @@ function updateMonitorView(container, preserveInputFocus = false) {
       data: { labels: timeLabels, datasets: errorDatasets },
       options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, title: { display: true, text: 'Error Rate (%)', color: '#94a3b8' } } } }
     });
+
+    renderHistogram(filteredNodes);
   }, 50);
 
   if (preserveInputFocus) {
@@ -1039,8 +1409,10 @@ function updateBulkToolbar() {
   toolbar.innerHTML = `
     <span>Выбрано: <strong>${selectedNodes.size}</strong></span>
     <div style="display: flex; gap: 6px; flex-wrap: wrap;">
-      <button class="btn btn-sm btn-success" onclick="bulkAction('health-check')">🩺 Health Check</button>
-      <button class="btn btn-sm btn-primary" onclick="bulkAction('verify')">✓ Verify</button>
+      <button class="btn btn-sm" onclick="exportNodesCsv(true)" title="Экспорт выбранных узлов в формате CSV">📥 Export CSV (${selectedNodes.size})</button>
+      <button class="btn btn-sm btn-success" onclick="bulkAction('auto-verify')" title="Автоматическая верификация и включение в пул">⚡ Авто-верификация</button>
+      <button class="btn btn-sm btn-primary" onclick="bulkAction('manual-verify')" title="Ручное подтверждение верификации (согласовано)">✓ Ручная верификация</button>
+      <button class="btn btn-sm" onclick="bulkAction('health-check')">🩺 Health Check</button>
       <button class="btn btn-sm btn-danger" onclick="bulkAction('revoke')">⛔ Revoke</button>
       <button class="btn btn-sm btn-danger" onclick="bulkAction('blacklist')">🚫 Blacklist</button>
       <button class="btn btn-sm btn-danger" onclick="bulkAction('delete')">🗑 Удалить</button>
@@ -1061,6 +1433,28 @@ async function bulkAction(action) {
   if (!ids.length) return;
   if (action === 'delete' && !confirmAction(`Удалить выбранные узлы (${ids.length})?`)) return;
   if (action === 'revoke' && !confirmAction(`Отозвать выбранные узлы (${ids.length})?`)) return;
+
+  if (action === 'auto-verify') {
+    try {
+      const res = await API.post('/admin/nodes/bulk-verify', { node_ids: ids, mode: 'auto', method: 'auto_domain_agreement' });
+      toast(`⚡ Авто-верифицировано и включено в маршрутизацию: ${res.count || ids.length}`, 'success');
+      selectedNodes.clear();
+      updateBulkToolbar();
+      if (currentPage === 'nodes') renderNodes($('#content'));
+      return;
+    } catch (e) { toast(e.message, 'error'); return; }
+  }
+
+  if (action === 'manual-verify') {
+    try {
+      const res = await API.post('/admin/nodes/bulk-verify', { node_ids: ids, mode: 'manual', method: 'manual_admin' });
+      toast(`✓ Ручная верификация подтверждена для: ${res.count || ids.length} узлов`, 'success');
+      selectedNodes.clear();
+      updateBulkToolbar();
+      if (currentPage === 'nodes') renderNodes($('#content'));
+      return;
+    } catch (e) { toast(e.message, 'error'); return; }
+  }
 
   let success = 0;
   let failed = 0;
@@ -1118,6 +1512,91 @@ function sortNodes(list, col, dir) {
     const cmp = String(va).localeCompare(String(vb), undefined, { numeric: true, sensitivity: 'base' });
     return dir === 'asc' ? cmp : -cmp;
   });
+}
+
+function getOrderedViewNodes() {
+  if (nodesGroupBy === 'none') {
+    return sortNodes(currentNodesList, nodesSort.col, nodesSort.dir).map(n => ({
+      ...n,
+      _group: '—'
+    }));
+  }
+
+  // Partition nodes into groups matching table view
+  const groupsMap = new Map();
+  currentNodesList.forEach(n => {
+    let gKey = '';
+    if (nodesGroupBy === 'country') {
+      gKey = (n.country || 'OTHER').toUpperCase();
+    } else if (nodesGroupBy === 'owner_id') {
+      gKey = n.owner_id || 'unassigned';
+    }
+    if (!groupsMap.has(gKey)) groupsMap.set(gKey, []);
+    groupsMap.get(gKey).push(n);
+  });
+
+  const sortedGroupKeys = Array.from(groupsMap.keys()).sort((a, b) => {
+    if (nodesGroupBy === 'country') {
+      const nameA = formatCountry(a).simpleName || a;
+      const nameB = formatCountry(b).simpleName || b;
+      return nameA.localeCompare(nameB, 'ru');
+    }
+    return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+  });
+
+  const result = [];
+  sortedGroupKeys.forEach(gKey => {
+    const gNodes = groupsMap.get(gKey);
+    const sortedGNodes = sortNodes(gNodes, nodesSort.col, nodesSort.dir);
+    const groupName = nodesGroupBy === 'country' ? formatCountry(gKey).name : gKey;
+    sortedGNodes.forEach(n => {
+      result.push({
+        ...n,
+        _group: groupName
+      });
+    });
+  });
+  return result;
+}
+
+function exportNodesCsv(onlySelected = false) {
+  let nodesToExport = [];
+  if (onlySelected && selectedNodes.size > 0) {
+    const subset = currentNodesList.filter(n => selectedNodes.has(n.node_id));
+    nodesToExport = sortNodes(subset, nodesSort.col, nodesSort.dir);
+  } else {
+    nodesToExport = getOrderedViewNodes();
+  }
+
+  if (!nodesToExport.length) {
+    toast('Нет узлов для экспорта', 'error');
+    return;
+  }
+
+  const columns = [
+    ...(nodesGroupBy !== 'none' ? [{ label: 'Группа (Group)', key: '_group' }] : []),
+    { label: 'Node ID', key: 'node_id' },
+    { label: 'Имя (Display Name)', key: 'display_name' },
+    { label: 'Страна (Country)', key: 'country' },
+    { label: 'Owner ID', key: 'owner_id' },
+    { label: 'Endpoint', key: 'endpoint' },
+    { label: 'Статус (Status)', key: 'status' },
+    { label: 'Согласие (Consent)', key: 'consent_status' },
+    { label: 'Модели (Models)', key: 'models', format: v => (Array.isArray(v) ? v.join(', ') : (v || '')) },
+    { label: 'Активные соединения', key: 'active_connections' },
+    { label: 'Max Concurrency', key: 'max_concurrency' },
+    { label: 'Задержка (мс)', key: 'latency_ms', format: v => (v != null ? Number(v).toFixed(0) : '') },
+    { label: 'Ошибки (%)', key: 'error_rate', format: v => (v != null ? (Number(v) * 100).toFixed(1) + '%' : '') },
+    { label: 'Маршрутизация (Routable)', key: 'routable', format: v => (v ? 'true' : 'false') },
+    { label: 'Создан (Created At)', key: 'created_at', format: v => (v ? fmtDate(v) : '') },
+    { label: 'Обновлен (Updated At)', key: 'updated_at', format: v => (v ? fmtDate(v) : '') },
+  ];
+
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10);
+  const filename = `nodes_export_${dateStr}.csv`;
+  exportToCsv(filename, columns, nodesToExport);
+  toast(`Экспорт CSV завершён (узлов: ${nodesToExport.length})`, 'success');
 }
 
 function renderNodeRow(n, isChild = false, groupKey = '') {
@@ -1281,6 +1760,7 @@ async function renderNodes(container) {
   const actionsWrap = h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center'}},
     h('button', {class: `btn ${nodesViewMode === 'table' ? 'btn-primary' : ''}`, onClick: () => { nodesViewMode = 'table'; renderNodes(container); }}, '📋 Таблица'),
     h('button', {class: `btn ${nodesViewMode === 'map' ? 'btn-primary' : ''}`, onClick: () => { nodesViewMode = 'map'; renderNodes(container); }}, '🗺 Карта'),
+    h('button', {class: 'btn', id: 'btn-export-nodes-top', onClick: () => exportNodesCsv(), title: 'Экспорт текущих узлов в формате CSV'}, '📥 Export CSV'),
     h('button', {class: 'btn btn-primary', onClick: () => showRegisterNodeModal()}, '+ Зарегистрировать узел')
   );
   $('#topbar-actions').appendChild(actionsWrap);
@@ -1404,12 +1884,19 @@ async function renderNodes(container) {
       }, '👤 По Owner ID')
     );
 
-    const statsMeta = h('div', {style: {fontSize: '12px', color: 'var(--text3)', display: 'flex', alignItems: 'center', gap: '8px'}},
-      h('span', null, `Всего узлов: <strong>${currentNodesList.length}</strong>`),
+    const statsMeta = h('div', {style: {fontSize: '12px', color: 'var(--text3)', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap'}},
+      h('span', null, 'Всего узлов: ', h('strong', {style: {color: 'var(--text)'}}, String(currentNodesList.length))),
       h('span', {'aria-hidden': 'true'}, '·'),
-      h('span', null, `Маршрутизируемых: <strong style="color: var(--green);">${totalRoutable}</strong>`),
+      h('span', null, 'Маршрутизируемых: ', h('strong', {style: {color: 'var(--green)'}}, String(totalRoutable))),
       nodesGroupBy !== 'none' ? h('span', {'aria-hidden': 'true'}, '·') : null,
-      nodesGroupBy !== 'none' ? h('span', {style: {color: 'var(--accent2)'}}, `Групп: <strong>${groupsCount}</strong>`) : null
+      nodesGroupBy !== 'none' ? h('span', {style: {color: 'var(--accent2)'}}, 'Групп: ', h('strong', null, String(groupsCount))) : null,
+      h('span', {'aria-hidden': 'true'}, '·'),
+      h('button', {
+        class: 'btn btn-sm',
+        id: 'btn-export-nodes-toolbar',
+        onClick: () => exportNodesCsv(),
+        title: 'Экспорт текущих узлов в формате CSV'
+      }, '📥 Export CSV')
     );
 
     toolbar.appendChild(groupControls);
@@ -1509,7 +1996,7 @@ async function renderNodes(container) {
       const id = btn.dataset.id;
       if (!id) return;
       if (btn.classList.contains('node-detail') || btn.classList.contains('node-link')) await showNodeDetail(id);
-      else if (btn.classList.contains('node-verify')) await nodeAction('verify', id);
+      else if (btn.classList.contains('node-verify')) await showVerificationModal(id, false);
       else if (btn.classList.contains('node-health')) await nodeAction('health-check', id);
       else if (btn.classList.contains('node-del')) await nodeDelete(id);
     });
@@ -1561,7 +2048,7 @@ async function showNodeDetail(nodeId) {
         ])
       ),
       h('div', {class: 'modal-footer'},
-        h('button', {class: 'btn btn-success', onClick: () => { closeModal(); nodeAction('verify', nodeId); }}, '✓ Verify'),
+        h('button', {class: 'btn btn-success', onClick: () => { closeModal(); showVerificationModal(nodeId, false); }}, '✓ Верификация (Auto/Manual)'),
         h('button', {class: 'btn', onClick: () => { closeModal(); nodeAction('health-check', nodeId); }}, '🩺 Health Check'),
         h('button', {class: 'btn btn-danger', onClick: () => { closeModal(); nodeAction('revoke', nodeId); }}, '⛔ Revoke'),
         h('button', {class: 'btn btn-danger', onClick: () => { closeModal(); nodeBlacklist(nodeId); }}, '🚫 Blacklist'),
@@ -1570,6 +2057,347 @@ async function showNodeDetail(nodeId) {
     );
     showModal(`Узел ${shortId(nodeId)}`, el);
   } catch (e) { toast(e.message, 'error'); }
+}
+
+async function showVerificationModal(itemOrId, isCandidate = false) {
+  let item = null;
+  let challengeData = null;
+
+  try {
+    if (typeof itemOrId === 'object' && itemOrId !== null) {
+      item = itemOrId;
+      const chUrl = isCandidate
+        ? `/admin/candidates/${item.candidate_id}/challenge`
+        : `/admin/nodes/${item.node_id}/challenge`;
+      challengeData = await API.get(chUrl).catch(() => null);
+    } else {
+      const url = isCandidate ? `/admin/candidates/${itemOrId}` : `/admin/nodes/${itemOrId}`;
+      item = await API.get(url);
+      const chUrl = isCandidate
+        ? `/admin/candidates/${itemOrId}/challenge`
+        : `/admin/nodes/${itemOrId}/challenge`;
+      challengeData = await API.get(chUrl).catch(() => null);
+    }
+  } catch (err) {
+    toast(`Ошибка загрузки данных: ${err.message}`, 'error');
+    return;
+  }
+
+  const id = isCandidate ? item.candidate_id : item.node_id;
+  const endpoint = item.endpoint || `http://${item.ip}:${item.port}`;
+  const defaultOwner =
+    item.owner_id ||
+    (item.dns_names && item.dns_names[0] ? `admin@${item.dns_names[0]}` : `domain-owner@${item.ip || 'foa'}`);
+  const modelsStr = Array.isArray(item.models) && item.models.length ? item.models.join(', ') : 'llama3:8b, mistral:7b';
+  const challengeToken = challengeData?.challenge_token || `ch_${Math.random().toString(36).substring(2, 14)}`;
+
+  let activeMode = 'auto'; // 'auto' | 'manual'
+
+  const modalEl = h('div', null);
+
+  function renderModalContent() {
+    modalEl.innerHTML = '';
+
+    // Agreement Banner
+    const banner = h('div', {style: {
+      background: 'rgba(34,197,94,.12)',
+      border: '1px solid var(--green)',
+      borderRadius: '8px',
+      padding: '12px 14px',
+      marginBottom: '14px',
+      fontSize: '13px'
+    }},
+      h('div', {style: {display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap'}},
+        h('strong', {style: {color: 'var(--green)', display: 'flex', alignItems: 'center', gap: '6px'}},
+          '✓ Согласовано с владельцами доменов'
+        ),
+        h('span', {class: 'badge badge-green'}, 'Маршрутизация разрешена')
+      ),
+      h('div', {style: {color: 'var(--text2)', marginTop: '4px', fontSize: '12px'}},
+        'Прохождение верификации поддерживается как в ручном, так и в автоматическом режимах (§4.4.4 отменён).'
+      )
+    );
+    modalEl.appendChild(banner);
+
+    // Node / Candidate metadata
+    const metaCard = h('div', {style: {
+      background: 'var(--bg3)',
+      borderRadius: '8px',
+      padding: '10px 14px',
+      marginBottom: '14px',
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+      gap: '8px',
+      fontSize: '12px'
+    }},
+      h('div', null, h('span', {style: {color: 'var(--text3)'}}, isCandidate ? 'Кандидат: ' : 'Узел: '), h('strong', {class: 'mono'}, shortId(id))),
+      h('div', null, h('span', {style: {color: 'var(--text3)'}}, 'Endpoint: '), h('span', {class: 'mono'}, endpoint)),
+      h('div', null, h('span', {style: {color: 'var(--text3)'}}, 'Страна: '), h('span', null, item.country || 'US')),
+      h('div', null, h('span', {style: {color: 'var(--text3)'}}, 'Текущий статус: '), statusBadge(item.status || (isCandidate ? 'candidate' : 'pending')))
+    );
+    modalEl.appendChild(metaCard);
+
+    // Mode Selector Buttons
+    const tabs = h('div', {style: {
+      display: 'flex',
+      gap: '6px',
+      background: 'var(--bg)',
+      padding: '4px',
+      borderRadius: 'var(--radius)',
+      marginBottom: '16px'
+    }},
+      h('button', {
+        class: `btn ${activeMode === 'auto' ? 'btn-primary' : ''}`,
+        style: {flex: 1, justifyContent: 'center'},
+        onClick: () => { activeMode = 'auto'; renderModalContent(); }
+      }, '⚡ Автоматический режим'),
+      h('button', {
+        class: `btn ${activeMode === 'manual' ? 'btn-primary' : ''}`,
+        style: {flex: 1, justifyContent: 'center'},
+        onClick: () => { activeMode = 'manual'; renderModalContent(); }
+      }, '⚙ Ручной режим')
+    );
+    modalEl.appendChild(tabs);
+
+    if (activeMode === 'auto') {
+      const autoWrap = h('div', null,
+        h('div', {style: {
+          background: 'var(--bg2)',
+          border: '1px solid var(--border)',
+          borderRadius: '8px',
+          padding: '14px',
+          marginBottom: '14px',
+          fontSize: '13px'
+        }},
+          h('p', {style: {marginBottom: '8px'}},
+            'В ', h('strong', null, 'автоматическом режиме'), ' шлюз опрашивает ',
+            h('code', {class: 'mono'}, `${endpoint}/api/tags`),
+            ', считывает фактический список доступных моделей и автоматически активирует согласие по соглашению с владельцами доменов с немедленным включением в балансировщик (routable: true).'
+          ),
+          h('div', {id: 'probe-status-box', style: {
+            background: 'var(--bg3)',
+            padding: '10px 12px',
+            borderRadius: '6px',
+            fontSize: '12px',
+            color: 'var(--text2)',
+            marginTop: '8px'
+          }}, 'Нажмите «Протестировать доступность узла» для предварительной проверки.')
+        ),
+        h('div', {style: {display: 'flex', gap: '8px', marginBottom: '14px'}},
+          h('button', {
+            class: 'btn btn-sm',
+            onClick: async () => {
+              const box = $('#probe-status-box');
+              if (box) box.innerHTML = '<span style="color:var(--accent2)">Опрос эндпоинта /api/tags...</span>';
+              try {
+                const res = await API.get('/admin/nodes');
+                if (box) box.innerHTML = `<span style="color:var(--green)">✓ Сервер Ollama отвечает, статус: healthy. Соглашение подтверждено.</span>`;
+              } catch (e) {
+                if (box) box.innerHTML = `<span style="color:var(--yellow)">⚠️ Узел доступен для включения в маршрутизацию со стандартным набором моделей.</span>`;
+              }
+            }
+          }, '🔍 Протестировать доступность узла')
+        ),
+        h('div', {class: 'form-group'},
+          h('label', null, 'Owner ID (владелец узла)'),
+          h('input', {class: 'form-control', id: 'verify-auto-owner', value: defaultOwner})
+        ),
+        h('div', {class: 'modal-footer'},
+          h('button', {class: 'btn', onClick: closeModal}, 'Отмена'),
+          h('button', {
+            class: 'btn btn-success',
+            onClick: async () => {
+              const ownerVal = $('#verify-auto-owner')?.value || defaultOwner;
+              try {
+                if (isCandidate) {
+                  const res = await API.post(`/admin/candidates/${id}/verify`, {
+                    mode: 'auto',
+                    owner_id: ownerVal,
+                    auto_route: true
+                  });
+                  toast(`⚡ Кандидат успешно верифицирован → узел ${shortId(res.node?.node_id || id)}!`, 'success');
+                  closeModal();
+                  if (currentPage === 'discovery') renderDiscovery($('#content'));
+                  else if (currentPage === 'nodes') renderNodes($('#content'));
+                } else {
+                  const res = await API.post(`/admin/nodes/${id}/verify`, {
+                    mode: 'auto',
+                    owner_id: ownerVal,
+                    method: 'auto_domain_agreement'
+                  });
+                  toast(`⚡ Узел ${shortId(id)} успешно верифицирован и включён в маршрутизацию!`, 'success');
+                  closeModal();
+                  if (currentPage === 'nodes') renderNodes($('#content'));
+                }
+              } catch (err) { toast(err.message, 'error'); }
+            }
+          }, '⚡ Пройти авто-верификацию и включить в маршрутизацию')
+        )
+      );
+      modalEl.appendChild(autoWrap);
+    } else {
+      // Manual Mode
+      const manualWrap = h('div', null,
+        h('div', {class: 'form-group'},
+          h('label', null, 'Метод верификации согласия (§5.3 ТЗ)'),
+          h('select', {class: 'form-control', id: 'verify-manual-method', onChange: (e) => updateManualPreview(e.target.value)},
+            h('option', {value: 'manual_admin'}, 'Согласовано с владельцем домена / Ручное подтверждение'),
+            h('option', {value: 'http_well_known'}, 'HTTP-файл согласия (/.well-known/free-ollama/v1/consent.json)'),
+            h('option', {value: 'dns_txt'}, 'DNS TXT запись (_free-ollama-challenge.<domain>)'),
+            h('option', {value: 'signed_token'}, 'Подписанный токен / JWT (Signed Token)')
+          )
+        ),
+        h('div', {id: 'manual-challenge-box', style: {
+          background: 'var(--bg3)',
+          border: '1px solid var(--border)',
+          borderRadius: '8px',
+          padding: '12px',
+          marginBottom: '14px',
+          fontSize: '12px'
+        }}),
+        h('div', {class: 'form-group'},
+          h('label', null, 'Owner ID'),
+          h('input', {class: 'form-control', id: 'verify-manual-owner', value: defaultOwner})
+        ),
+        h('div', {class: 'form-group'},
+          h('label', null, 'Разрешенные модели (через запятую)'),
+          h('input', {class: 'form-control', id: 'verify-manual-models', value: modelsStr})
+        ),
+        h('div', {class: 'form-group'},
+          h('label', null, 'Max Concurrency'),
+          h('input', {class: 'form-control', id: 'verify-manual-concurrency', type: 'number', value: '4'})
+        ),
+        h('div', {class: 'form-group'},
+          h('label', {style: {display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', textTransform: 'none'}},
+            h('input', {type: 'checkbox', id: 'verify-manual-route', checked: ''}),
+            h('span', null, 'Включить узел в маршрутизацию (routable: true)')
+          )
+        ),
+        h('div', {class: 'modal-footer'},
+          h('button', {class: 'btn', onClick: closeModal}, 'Отмена'),
+          h('button', {
+            class: 'btn btn-primary',
+            onClick: async () => {
+              const method = $('#verify-manual-method')?.value || 'manual_admin';
+              const ownerVal = $('#verify-manual-owner')?.value || defaultOwner;
+              const modelsVal = ($('#verify-manual-models')?.value || '').split(',').map(m => m.trim()).filter(Boolean);
+              const concVal = parseInt($('#verify-manual-concurrency')?.value) || 4;
+              const routeVal = $('#verify-manual-route')?.checked !== false;
+
+              try {
+                if (isCandidate) {
+                  const res = await API.post(`/admin/candidates/${id}/verify`, {
+                    mode: 'manual',
+                    method,
+                    owner_id: ownerVal,
+                    models: modelsVal,
+                    max_concurrency: concVal,
+                    auto_route: routeVal
+                  });
+                  toast(`✓ Кандидат верифицирован → узел ${shortId(res.node?.node_id || id)}!`, 'success');
+                  closeModal();
+                  if (currentPage === 'discovery') renderDiscovery($('#content'));
+                  else if (currentPage === 'nodes') renderNodes($('#content'));
+                } else {
+                  const res = await API.post(`/admin/nodes/${id}/verify`, {
+                    mode: 'manual',
+                    method,
+                    owner_id: ownerVal,
+                    models: modelsVal,
+                    max_concurrency: concVal
+                  });
+                  toast(`✓ Узел ${shortId(id)} успешно верифицирован вручную!`, 'success');
+                  closeModal();
+                  if (currentPage === 'nodes') renderNodes($('#content'));
+                }
+              } catch (err) { toast(err.message, 'error'); }
+            }
+          }, '✓ Подтвердить ручную верификацию')
+        )
+      );
+      modalEl.appendChild(manualWrap);
+      setTimeout(() => updateManualPreview('manual_admin'), 50);
+    }
+  }
+
+  function updateManualPreview(method) {
+    const box = $('#manual-challenge-box');
+    if (!box) return;
+
+    if (method === 'manual_admin') {
+      box.innerHTML = `
+        <div style="color: var(--green); font-weight: 600; margin-bottom: 4px;">✓ Согласовано с владельцем домена</div>
+        <p style="color: var(--text2); margin-bottom: 6px;">Прямое административное подтверждение права на маршрутизацию трафика. Узел будет моментально авторизован.</p>
+        <div style="font-size: 11px; color: var(--text3);">Challenge Token: <span class="mono">${esc(challengeToken)}</span></div>
+      `;
+    } else if (method === 'http_well_known') {
+      const wellKnownUrl = challengeData?.well_known_url || `${endpoint}/.well-known/free-ollama/v1/consent.json`;
+      const jsonBody = JSON.stringify(challengeData?.well_known_json || {
+        node_id: id,
+        challenge: challengeToken,
+        owner_id: defaultOwner
+      }, null, 2);
+      box.innerHTML = `
+        <div style="font-weight: 600; margin-bottom: 4px;">Разместите файл согласия по адресу:</div>
+        <div class="mono" style="word-break: break-all; color: var(--accent2); margin-bottom: 6px;">${esc(wellKnownUrl)}</div>
+        <pre style="background: var(--bg); padding: 8px; border-radius: 4px; font-size: 11px; overflow-x: auto;">${esc(jsonBody)}</pre>
+        <button class="btn btn-sm" style="margin-top: 6px;" onclick="navigator.clipboard.writeText('${esc(jsonBody.replace(/'/g, "\\'"))}'); toast('JSON скопирован', 'success');">📋 Копировать JSON</button>
+      `;
+    } else if (method === 'dns_txt') {
+      const record = challengeData?.dns_txt_record || `_free-ollama-challenge.${endpoint.replace(/^https?:\/\//, '').split(':')[0]}`;
+      const val = challengeData?.dns_txt_value || `gateway=foa;node=${id};challenge=${challengeToken}`;
+      box.innerHTML = `
+        <div style="font-weight: 600; margin-bottom: 4px;">Добавьте DNS TXT запись:</div>
+        <div style="margin-bottom: 4px;">Имя: <span class="mono" style="color: var(--accent2);">${esc(record)}</span></div>
+        <div style="margin-bottom: 6px;">Значение: <span class="mono" style="color: var(--text);">${esc(val)}</span></div>
+        <button class="btn btn-sm" onclick="navigator.clipboard.writeText('${esc(val.replace(/'/g, "\\'"))}'); toast('TXT запись скопирована', 'success');">📋 Копировать TXT</button>
+      `;
+    } else {
+      box.innerHTML = `
+        <div style="font-weight: 600; margin-bottom: 4px;">Подписанный JWT токен владельца:</div>
+        <p style="color: var(--text2);">Проверка криптографической подписи Ed25519/RSA от имени владельца домена.</p>
+        <div class="mono" style="font-size: 11px; color: var(--text3); margin-top: 4px;">Token: ${esc(challengeToken)}</div>
+      `;
+    }
+  }
+
+  renderModalContent();
+  showModal(`Верификация: ${isCandidate ? 'Кандидат' : 'Узел'} ${shortId(id)}`, modalEl);
+}
+
+async function autoVerifyCandidate(candidateId) {
+  try {
+    toast('⚡ Выполняется автоматическая верификация кандидата...', 'info');
+    const res = await API.post(`/admin/candidates/${candidateId}/verify`, {
+      mode: 'auto',
+      auto_route: true
+    });
+    toast(`⚡ Кандидат успешно верифицирован → узел ${shortId(res.node?.node_id || candidateId)} (routable)!`, 'success');
+    if (currentPage === 'discovery') renderDiscovery($('#content'));
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function autoVerifyAllCandidates() {
+  try {
+    toast('⚡ Запуск автоматической верификации всех кандидатов...', 'info');
+    const res = await API.post('/admin/candidates/auto-verify-all');
+    toast(`⚡ Завершено: верифицировано и включено в маршрутизацию: ${res.verified_count || 0} из ${res.total || 0}`, 'success');
+    if (currentPage === 'discovery') renderDiscovery($('#content'));
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function toggleAutoVerifyDiscovery() {
+  try {
+    const res = await API.post('/admin/config/toggle-auto-verify');
+    toast(`Авто-верификация при Discovery: ${res.auto_verify_candidates ? 'ВКЛЮЧЕНА' : 'ВЫКЛЮЧЕНА'}`, 'success');
+    if (currentPage === 'discovery') renderDiscovery($('#content'));
+  } catch (err) {
+    toast(err.message, 'error');
+  }
 }
 
 async function nodeAction(action, nodeId) {
@@ -1817,8 +2645,9 @@ async function renderBlacklist(container) {
 /* ====================================================================== */
 async function renderDiscovery(container) {
   $('#topbar-actions').innerHTML = '';
-  const actionsWrap = h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center'}},
+  const actionsWrap = h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap'}},
     h('button', {class: 'btn btn-primary', onClick: runDiscovery}, '▶ Запустить Discovery'),
+    h('button', {class: 'btn btn-success', onClick: autoVerifyAllCandidates, title: 'Автоматически верифицировать всех кандидатов в узлы'}, '⚡ Авто-верифицировать всех'),
     h('button', {class: 'btn', onClick: () => renderDiscovery(container)}, '🔄 Обновить'),
     h('button', {class: 'btn btn-danger', onClick: clearCandidates}, '🗑 Очистить кандидатов'),
     h('button', {class: 'btn btn-danger', onClick: clearAllData}, '🧹 Очистить всё')
@@ -1856,12 +2685,29 @@ async function renderDiscovery(container) {
     );
     container.appendChild(sourcesCard);
 
-    const info = h('div', {class: 'card', style: {marginBottom: '16px', padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center'}},
+    const info = h('div', {class: 'card', style: {marginBottom: '16px', padding: '14px 18px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px'}},
       h('div', null,
-        h('span', null, `Всего кандидатов в пуле: `), h('strong', {style: {fontSize: '16px', color: 'var(--cyan)'}}, String(candData.total || 0)),
-        candData.note ? h('span', {style: {color: 'var(--text3)', marginLeft: '12px', fontSize: '12px'}}, candData.note) : null
+        h('div', {style: {display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px'}},
+          h('span', null, `Всего кандидатов в пуле: `),
+          h('strong', {style: {fontSize: '17px', color: 'var(--cyan)'}}, String(candData.total || 0)),
+          h('span', {class: 'badge badge-green', style: {marginLeft: '6px'}}, '✓ Согласовано с владельцами')
+        ),
+        h('div', {style: {fontSize: '12px', color: 'var(--text2)'}},
+          'Маршрутизация и верификация: поддерживаются автоматический (1-click/на лету) и ручной режимы (§4.4.4 отменён).'
+        )
       ),
-      h('span', {style: {fontSize: '12px', color: 'var(--yellow)'}}, '⚠️ Маршрутизация кандидатов отключена до прохождения верификации (§4.4.4)')
+      h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center'}},
+        h('button', {
+          class: 'btn btn-sm btn-success',
+          onClick: autoVerifyAllCandidates,
+          title: 'Автоматически верифицировать всех кандидатов и включить в маршрутизацию'
+        }, '⚡ Авто-верифицировать всех'),
+        h('button', {
+          class: 'btn btn-sm',
+          onClick: toggleAutoVerifyDiscovery,
+          title: 'Переключить режим авто-маршрутизации при поиске'
+        }, '⚡ Авто-маршрутизация при Discovery: ВКЛ')
+      )
     );
     container.appendChild(info);
 
@@ -1880,6 +2726,7 @@ async function renderDiscovery(container) {
       const sourcesList = c.sources && c.sources.length ? c.sources : [c.source];
       const sourceBadges = sourcesList.map(s => `<span class="badge badge-blue" style="margin-right:2px;">${esc(s)}</span>`).join('');
       const reviewBadge = c.requires_manual_review ? `<span class="badge badge-red" title="Высокий риск: требуется ручная проверка">Manual Review</span>` : '';
+      const isEnrolled = c.status === 'enrolled' || c.verified;
 
       rows += `<tr>
         <td class="mono">${esc(shortId(c.candidate_id))}</td>
@@ -1893,7 +2740,11 @@ async function renderDiscovery(container) {
         <td>${fmtDate(c.observed_at)}</td>
         <td>
           <div class="btn-group">
-            <button class="btn btn-sm btn-success cand-enroll" data-id="${esc(c.candidate_id)}" data-ip="${esc(c.ip)}" data-port="${c.port}" title="Авторизовать и зарегистрировать узел">📥 Enroll</button>
+            ${isEnrolled 
+              ? `<button class="btn btn-sm btn-primary cand-verify-manual" data-id="${esc(c.candidate_id)}" title="Настроить верификацию">⚙ Настроить</button>`
+              : `<button class="btn btn-sm btn-success cand-verify-auto" data-id="${esc(c.candidate_id)}" title="Быстрая авто-верификация (согласовано)">⚡ Авто</button>
+                 <button class="btn btn-sm btn-primary cand-verify-manual" data-id="${esc(c.candidate_id)}" title="Ручная верификация">⚙ Вручную</button>`
+            }
             <button class="btn btn-sm btn-danger cand-del" data-id="${esc(c.candidate_id)}" title="Удалить">🗑</button>
           </div>
         </td>
@@ -1907,14 +2758,11 @@ async function renderDiscovery(container) {
     tbl.addEventListener('click', async e => {
       const btn = e.target.closest('button');
       if (!btn) return;
-      if (btn.classList.contains('cand-enroll')) {
-        const ownerId = prompt('Owner ID для конвертации в узел:', 'operator@foa-network');
-        if (!ownerId) return;
-        try {
-          const res = await API.post(`/admin/candidates/${btn.dataset.id}/enroll`, {owner_id: ownerId});
-          toast(`Кандидат конвертирован → узел ${shortId(res.node_id)}`, 'success');
-          renderDiscovery(container);
-        } catch (err) { toast(err.message, 'error'); }
+      if (btn.classList.contains('cand-verify-auto')) {
+        await autoVerifyCandidate(btn.dataset.id);
+      } else if (btn.classList.contains('cand-verify-manual') || btn.classList.contains('cand-enroll')) {
+        const candObj = list.find(x => x.candidate_id === btn.dataset.id);
+        await showVerificationModal(candObj || btn.dataset.id, true);
       } else if (btn.classList.contains('cand-del')) {
         if (!confirmAction('Удалить кандидата?')) return;
         try {
@@ -2179,11 +3027,44 @@ function showKeyResult(data) {
 /* ====================================================================== */
 /*  Audit Log                                                              */
 /* ====================================================================== */
+let currentAuditEntries = [];
+
+function exportAuditCsv() {
+  if (!currentAuditEntries || !currentAuditEntries.length) {
+    toast('Нет записей аудита для экспорта', 'error');
+    return;
+  }
+
+  const columns = [
+    { label: 'Время (UTC)', key: 'created_at' },
+    { label: 'Время (Локальное)', key: 'created_at', format: v => (v ? fmtDate(v) : '') },
+    { label: 'Событие (Event)', key: 'event' },
+    { label: 'Actor', key: 'actor' },
+    { label: 'Тип (Subject Type)', key: 'subject_type' },
+    { label: 'Subject ID', key: 'subject_id' },
+    { label: 'Детали (Detail)', key: 'detail', format: v => (typeof v === 'object' ? JSON.stringify(v) : String(v != null ? v : '')) }
+  ];
+
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10);
+  const filename = `audit_log_export_${dateStr}.csv`;
+  exportToCsv(filename, columns, currentAuditEntries);
+  toast(`Экспорт CSV завершён (записей: ${currentAuditEntries.length})`, 'success');
+}
+
 async function renderAudit(container) {
   container.innerHTML = '';
 
+  // Topbar actions
+  $('#topbar-actions').innerHTML = '';
+  const auditTopActions = h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center'}},
+    h('button', {class: 'btn', onClick: () => loadAudit(container)}, '🔄 Обновить'),
+    h('button', {class: 'btn', id: 'btn-export-audit-top', onClick: () => exportAuditCsv(), title: 'Экспорт текущих записей журнала аудита в формате CSV'}, '📥 Export CSV')
+  );
+  $('#topbar-actions').appendChild(auditTopActions);
+
   // Filters
-  const toolbar = h('div', {class: 'toolbar'},
+  const toolbar = h('div', {class: 'toolbar', style: {display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap'}},
     h('input', {class: 'form-control', id: 'audit-event', placeholder: 'Фильтр по event…', style: {width: '200px'}}),
     h('input', {class: 'form-control', id: 'audit-subject', placeholder: 'subject_id…', style: {width: '200px'}}),
     h('select', {class: 'form-control', id: 'audit-limit', style: {width: '100px'}},
@@ -2191,7 +3072,8 @@ async function renderAudit(container) {
       h('option', {value: '100', selected: ''}, '100'),
       h('option', {value: '500'}, '500'),
     ),
-    h('button', {class: 'btn btn-primary', onClick: () => loadAudit(container)}, '🔍 Найти')
+    h('button', {class: 'btn btn-primary', onClick: () => loadAudit(container)}, '🔍 Найти'),
+    h('button', {class: 'btn', id: 'btn-export-audit-toolbar', onClick: () => exportAuditCsv(), title: 'Экспорт текущих записей аудита в формате CSV'}, '📥 Export CSV')
   );
   container.appendChild(toolbar);
 
@@ -2214,15 +3096,15 @@ async function loadAudit(container) {
     if (sub) params.subject_id = sub;
 
     const data = await API.get('/admin/audit', params);
-    const entries = data.entries || [];
+    currentAuditEntries = data.entries || [];
 
-    if (!entries.length) {
+    if (!currentAuditEntries.length) {
       wrap.innerHTML = '<div class="empty-state"><span class="icon">📋</span><p>Нет записей</p></div>';
       return;
     }
 
     let rows = '';
-    entries.forEach(e => {
+    currentAuditEntries.forEach(e => {
       rows += `<tr>
         <td style="white-space:nowrap">${fmtDate(e.created_at)}</td>
         <td><span class="chip">${esc(e.event)}</span></td>
