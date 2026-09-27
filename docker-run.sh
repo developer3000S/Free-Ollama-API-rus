@@ -3,26 +3,55 @@ set -e
 
 echo "=== Free Ollama API Gateway: Docker Run Script ==="
 
-# 1. Проверка и удаление старых образов проекта
-echo "Checking for old Docker images..."
-OLD_IMAGES=$(docker images -q free-ollama-api-gateway 2>/dev/null || true)
-if [ -n "$OLD_IMAGES" ]; then
-  echo "Found old images of free-ollama-api-gateway. Removing..."
-  docker rmi -f $OLD_IMAGES || true
-else
-  echo "No old free-ollama-api-gateway images found."
+# 1. Проверка наличия .env файла
+if [ ! -f .env ]; then
+  echo "Файл .env не найден. Создаю дефолтный .env из .env.example..."
+  if [ -f .env.example ]; then
+    cp .env.example .env
+  else
+    cat << 'EOF' > .env
+PORT=3000
+GATEWAY_ID=foa-gw-main-01
+FOA_ADMIN_TOKEN=foa-admin-secret
+FOA_AUDITOR_TOKEN=foa-auditor-secret
+FOA_SERVER__PORT=3000
+FOA_SERVER__HOST=0.0.0.0
+POSTGRES_PASSWORD=postgres_foa_password
+GATEWAY_JWT_SECRET=foa-jwt-dev-secret-key
+EOF
+  fi
 fi
 
-# Очистка dangling и композитных образов проекта
-docker image prune -f --filter label=com.docker.compose.project=free-ollama-api-gateway 2>/dev/null || true
+# 2. Проверка TLS-сертификатов для Nginx
+if [ ! -f deploy/tls/fullchain.pem ] || [ ! -f deploy/tls/privkey.pem ]; then
+  echo "Генерация самоподписанного TLS-сертификата для Nginx..."
+  mkdir -p deploy/tls
+  openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout deploy/tls/privkey.pem \
+    -out deploy/tls/fullchain.pem \
+    -subj "/CN=localhost" 2>/dev/null || true
+fi
 
-# 2. Сборка без использования кэша (--no-cache)
-echo "Building Docker containers without cache (--no-cache)..."
+# 3. Удаление старых зависших образов
+echo "Проверка старых Docker образов..."
+OLD_IMAGES=$(docker images -q free-ollama-api-gateway 2>/dev/null || true)
+if [ -n "$OLD_IMAGES" ]; then
+  echo "Удаление старых образов..."
+  docker rmi -f $OLD_IMAGES 2>/dev/null || true
+fi
+
+# 4. Сборка контейнеров
+echo "Сборка Docker-контейнеров..."
 docker compose build --no-cache
 
-# 3. Запуск контейнеров в фоне
-echo "Starting containers with docker compose up -d..."
+# 5. Запуск
+echo "Запуск сервисов..."
 docker compose up -d
 
-echo "=== Gateway is running successfully! ==="
+echo ""
+echo "=== Сервисы успешно запущены! ==="
+echo "Панель управления и API доступны по адресам:"
+echo " - HTTP:  http://localhost:3000"
+echo " - HTTPS: https://localhost:8443 (или порт из FOA_HTTPS_PORT)"
+echo ""
 docker compose ps

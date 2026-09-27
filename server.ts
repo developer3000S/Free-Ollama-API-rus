@@ -34,7 +34,7 @@ export function reloadEnv() {
 reloadEnv();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_ID = process.env.GATEWAY_ID || 'foa-gw-main-01';
 const VERSION = '1.0.0';
 
