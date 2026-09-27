@@ -275,7 +275,7 @@ function seedInitialData() {
       endpoint: 'http://198.51.100.22:11434',
       display_name: 'US-East FastCluster',
       owner_id: 'ops@cloudscale.net',
-      models: ['llama3:8b', 'llama3:70b', 'mistral:7b'],
+      models: ['llama3', 'llama3:8b', 'llama3:70b', 'mistral', 'mistral:7b'],
       max_concurrency: 4,
       active_connections: 1,
       latency_ms: 45,
@@ -298,7 +298,7 @@ function seedInitialData() {
       endpoint: 'http://198.51.100.58:11434',
       display_name: 'US-West Inference Hub',
       owner_id: 'ops@cloudscale.net',
-      models: ['llama3:8b', 'qwen2:7b'],
+      models: ['llama3', 'llama3:8b', 'qwen2', 'qwen2:7b'],
       max_concurrency: 2,
       active_connections: 0,
       latency_ms: 62,
@@ -321,7 +321,7 @@ function seedInitialData() {
       endpoint: 'http://203.0.113.14:11434',
       display_name: 'DE-Frankfurt Dedicated',
       owner_id: 'berlin-lab@research.de',
-      models: ['llama3:8b', 'mixtral:8x7b', 'phi3:mini'],
+      models: ['llama3', 'llama3:8b', 'mixtral:8x7b', 'phi3:mini'],
       max_concurrency: 4,
       active_connections: 2,
       latency_ms: 88,
@@ -2110,12 +2110,50 @@ app.post('/admin/config/reload', adminAuth, (req, res) => {
 });
 
 // --- Ollama Compatible User API ---
+// Helper: Check if a node supports the requested model (flexible tag matching)
+function isModelSupportedByNode(node: NodeItem, targetModel: string): boolean {
+  if (!node.routable || !Array.isArray(node.models) || !node.models.length) return false;
+  if (!targetModel) return true;
+
+  const req = targetModel.trim().toLowerCase();
+  const reqBase = req.split(':')[0];
+  const reqTag = req.includes(':') ? req.split(':')[1] : '';
+
+  return node.models.some((m) => {
+    const mLower = m.trim().toLowerCase();
+    if (mLower === req) return true;
+
+    const mBase = mLower.split(':')[0];
+    const mTag = mLower.includes(':') ? mLower.split(':')[1] : '';
+
+    // If base names match (e.g. "llama3" vs "llama3:8b" or "llama3:latest")
+    if (mBase === reqBase) {
+      // If user requested without tag (e.g. "llama3"), match any tag ("8b", "latest", "70b", etc.)
+      if (!reqTag) return true;
+      // If user requested "latest", match any tag or base
+      if (reqTag === 'latest') return true;
+      // If node has untagged or latest, match
+      if (!mTag || mTag === 'latest') return true;
+      // Exact tag match
+      if (mTag === reqTag) return true;
+    }
+
+    return false;
+  });
+}
+
 // Helper: Get routable models
 function getRoutableModels() {
   const modelsSet = new Set<string>();
   for (const node of nodes.values()) {
     if (node.routable) {
-      node.models.forEach((m) => modelsSet.add(m));
+      node.models.forEach((m) => {
+        modelsSet.add(m);
+        // Also add base untagged name (e.g. "llama3" for "llama3:8b")
+        if (m.includes(':')) {
+          modelsSet.add(m.split(':')[0]);
+        }
+      });
     }
   }
   return Array.from(modelsSet);
@@ -2148,11 +2186,12 @@ app.get('/api/tags', (req, res) => {
 app.post('/api/generate', async (req, res) => {
   const { model, prompt, stream } = req.body;
   const targetModel = model || 'llama3:8b';
-  const routable = Array.from(nodes.values()).filter((n) => n.routable && n.models.includes(targetModel));
+  let routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
 
   if (!routable.length) {
+    const available = getRoutableModels();
     return res.status(503).json({
-      error: `Модель '${targetModel}' временно недоступна в пуле авторизованных узлов`,
+      error: `Модель '${targetModel}' временно недоступна в пуле авторизованных узлов. Доступные модели: ${available.slice(0, 10).join(', ')}`,
     });
   }
 
@@ -2166,7 +2205,7 @@ app.post('/api/generate', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body),
-      signal: AbortSignal.timeout(35000),
+      signal: AbortSignal.timeout(4000),
     });
 
     if (upstreamRes.ok) {
@@ -2249,11 +2288,12 @@ app.post('/api/generate', async (req, res) => {
 app.post('/api/chat', async (req, res) => {
   const { model, messages, stream } = req.body;
   const targetModel = model || 'llama3:8b';
-  const routable = Array.from(nodes.values()).filter((n) => n.routable && n.models.includes(targetModel));
+  let routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
 
   if (!routable.length) {
+    const available = getRoutableModels();
     return res.status(503).json({
-      error: `Модель '${targetModel}' временно недоступна в пуле авторизованных узлов`,
+      error: `Модель '${targetModel}' временно недоступна в пуле авторизованных узлов. Доступные модели: ${available.slice(0, 10).join(', ')}`,
     });
   }
 
@@ -2266,7 +2306,7 @@ app.post('/api/chat', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body),
-      signal: AbortSignal.timeout(35000),
+      signal: AbortSignal.timeout(4000),
     });
 
     if (upstreamRes.ok) {
@@ -2376,12 +2416,13 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', (req, res) => {
   const { model, messages, stream } = req.body;
   const targetModel = model || 'llama3:8b';
-  const routable = Array.from(nodes.values()).filter((n) => n.routable && n.models.includes(targetModel));
+  let routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
 
   if (!routable.length) {
+    const available = getRoutableModels();
     return res.status(503).json({
       error: {
-        message: `Model '${targetModel}' is not available on any authorized node.`,
+        message: `Model '${targetModel}' is not available on any authorized node. Available models: ${available.slice(0, 10).join(', ')}`,
         type: 'service_unavailable',
       },
     });

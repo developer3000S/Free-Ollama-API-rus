@@ -24,8 +24,14 @@ fi
 
 # 2. Проверка TLS-сертификатов для Nginx
 if [ ! -f deploy/tls/fullchain.pem ] || [ ! -f deploy/tls/privkey.pem ]; then
-  echo "Генерация самоподписанного TLS-сертификата для Nginx..."
+  echo "Генерация самоподписанного TLS-сертификата для Nginx с Subject Alternative Names (SAN)..."
   mkdir -p deploy/tls
+  HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+  openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout deploy/tls/privkey.pem \
+    -out deploy/tls/fullchain.pem \
+    -subj "/CN=${HOST_IP:-localhost}" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${HOST_IP:-127.0.0.1}" 2>/dev/null || \
   openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
     -keyout deploy/tls/privkey.pem \
     -out deploy/tls/fullchain.pem \

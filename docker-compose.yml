@@ -101,6 +101,7 @@ services:
         soft: 8192
         hard: 8192
     ports:
+      - "${FOA_HTTP_PORT:-8080}:80"
       - "${FOA_HTTPS_PORT:-8443}:443"
     volumes:
       - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
