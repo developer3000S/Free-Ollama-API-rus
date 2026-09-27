@@ -409,6 +409,62 @@ select.form-control { appearance: auto; }
 .endpoint-get { background: rgba(34,197,94,.15); color: var(--green); }
 .endpoint-post { background: rgba(59,130,246,.15); color: var(--blue); }
 
+/* ===== FAQ Accordion Styles ===== */
+.faq-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+.faq-item {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  transition: border-color .2s;
+}
+.faq-item.open {
+  border-color: rgba(99, 102, 241, 0.45);
+}
+.faq-question {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 13px 18px;
+  cursor: pointer;
+  user-select: none;
+  font-weight: 500;
+  font-size: 13.5px;
+  color: var(--text);
+  background: transparent;
+  transition: background .15s;
+}
+.faq-question:hover {
+  background: var(--bg3);
+}
+.faq-question .faq-chevron {
+  transition: transform .2s ease;
+  font-size: 11px;
+  color: var(--text2);
+}
+.faq-item.open .faq-chevron {
+  transform: rotate(180deg);
+  color: var(--accent);
+}
+.faq-answer {
+  display: none;
+  padding: 0 18px 15px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text2);
+  border-top: 1px solid transparent;
+}
+.faq-item.open .faq-answer {
+  display: block;
+  border-top-color: var(--border);
+  padding-top: 12px;
+}
+
 /* ===== Responsive ===== */
 @media (max-width: 768px) {
   .sidebar { display: none; }
@@ -3211,6 +3267,20 @@ function copyHelpCode(btn) {
   toast('Скопировано в буфер обмена', 'success');
 }
 
+function toggleFaqItem(el) {
+  const item = el.closest('.faq-item');
+  if (item) {
+    item.classList.toggle('open');
+  }
+}
+
+function toggleAllFaq() {
+  const items = document.querySelectorAll('.faq-item');
+  if (!items.length) return;
+  const anyClosed = Array.from(items).some(i => !i.classList.contains('open'));
+  items.forEach(i => i.classList.toggle('open', anyClosed));
+}
+
 async function renderHelp(container) {
   $('#topbar-actions').innerHTML = '';
   const origin = window.location.origin;
@@ -3317,6 +3387,90 @@ print(response.choices[0].message.content)`;
           <button class="btn" style="padding: 2px 8px; font-size: 11px;" data-code="${escAttr(pythonCode)}" onclick="copyHelpCode(this)">Копировать Python</button>
         </div>
         <pre style="padding: 12px; font-family: monospace; font-size: 12px; color: #a5f3fc; overflow-x: auto; margin: 0;">${esc(pythonCode)}</pre>
+      </div>
+    </div>
+
+    <div class="help-card" id="help-faq-section">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; flex-wrap: wrap; gap: 8px;">
+        <h3 style="font-size: 16px; font-weight: 600; color: var(--text);">❓ 4. Часто задаваемые вопросы (FAQ)</h3>
+        <button class="btn btn-xs" style="font-size: 11px; padding: 3px 10px;" onclick="toggleAllFaq()">Развернуть / Свернуть все</button>
+      </div>
+      <p style="color: var(--text2); font-size: 13px; margin-bottom: 14px;">
+        Ответы на распространенные технические проблемы, ошибки подключения и рекомендации по настройке запросов к шлюзу:
+      </p>
+
+      <div class="faq-list">
+        <!-- FAQ 1 -->
+        <div class="faq-item">
+          <div class="faq-question" onclick="toggleFaqItem(this)">
+            <span>🔒 Ошибка 401 Unauthorized: не принимается API-ключ</span>
+            <span class="faq-chevron">▼</span>
+          </div>
+          <div class="faq-answer">
+            Убедитесь, что в HTTP-заголовке передается правильный префикс: <code>Authorization: Bearer &lt;ваш_ключ&gt;</code>.<br>
+            API-ключ должен быть создан в разделе <strong>«API-ключи»</strong> и находиться в активном статусе (<code>Active</code>). Проверьте, что в токене отсутствуют случайные пробелы и переносы строк, а префикс соответствует <code>foa_live_...</code>.
+          </div>
+        </div>
+
+        <!-- FAQ 2 -->
+        <div class="faq-item">
+          <div class="faq-question" onclick="toggleFaqItem(this)">
+            <span>🌐 Ошибка 503 Service Unavailable: нет доступных или здоровых узлов</span>
+            <span class="faq-chevron">▼</span>
+          </div>
+          <div class="faq-answer">
+            Шлюз направляет трафик исключительно на узлы с подтвержденным согласием владельца и статусом <code>Verified</code> / <code>Healthy</code>. Если все узлы в пуле недоступны или перегружены, возвращается код 503.<br>
+            <strong>Решение:</strong> Проверьте состояние узлов в разделах <strong>«Узлы»</strong> и <strong>«Monitor»</strong>. Если требуются дополнительные мощности, перейдите в <strong>«Discovery»</strong> и проведите автоматическую или ручную верификацию кандидатов.
+          </div>
+        </div>
+
+        <!-- FAQ 3 -->
+        <div class="faq-item">
+          <div class="faq-question" onclick="toggleFaqItem(this)">
+            <span>🧠 Ошибка 404 Not Found: запрашиваемая модель не найдена</span>
+            <span class="faq-chevron">▼</span>
+          </div>
+          <div class="faq-answer">
+            Модель должна присутствовать в списке разрешенных моделей хотя бы одного активного узла, имеющего право обслуживать эту модель по условиям согласия.<br>
+            Выполните запрос <code>GET /api/tags</code> или <code>GET /v1/models</code> для получения точного перечня доступных тегов моделей (например, <code>llama3:latest</code>, <code>mistral:7b</code>, <code>qwen2.5:coder</code>).
+          </div>
+        </div>
+
+        <!-- FAQ 4 -->
+        <div class="faq-item">
+          <div class="faq-question" onclick="toggleFaqItem(this)">
+            <span>⏱️ Разрыв соединения или 504 Gateway Timeout при объемных ответах</span>
+            <span class="faq-chevron">▼</span>
+          </div>
+          <div class="faq-answer">
+            При генерации длинных текстов запросы могут выполняться продолжительное время. Для предотвращения разрыва HTTP-соединения промежуточными прокси используйте <strong>потоковый режим (Streaming)</strong>:<br>
+            - В Ollama API: передавайте флаг <code>"stream": true</code> (ответ поступает чанками в формате NDJSON).<br>
+            - В OpenAI-совместимом API: передавайте <code>"stream": true</code> (ответ поступает как Server-Sent Events).
+          </div>
+        </div>
+
+        <!-- FAQ 5 -->
+        <div class="faq-item">
+          <div class="faq-question" onclick="toggleFaqItem(this)">
+            <span>⚠️ Ошибка 429 Too Many Requests: исчерпан лимит запросов</span>
+            <span class="faq-chevron">▼</span>
+          </div>
+          <div class="faq-answer">
+            Шлюз защищает подключенные узлы от перегрузки с помощью многоуровневых лимитов: RPS на пользователя, лимит параллельных запросов (Concurrency) и дневные квоты.<br>
+            При получении ошибки 429 соблюдайте интервал ожидания из заголовка <code>Retry-After</code> и используйте стратегию повторов с экспоненциальной задержкой (Exponential Backoff). Администратор системы может изменить квоты в разделе <strong>«Конфигурация»</strong>.
+          </div>
+        </div>
+
+        <!-- FAQ 6 -->
+        <div class="faq-item">
+          <div class="faq-question" onclick="toggleFaqItem(this)">
+            <span>🌍 Поддержка CORS при обращении из браузера или веб-интерфейсов</span>
+            <span class="faq-chevron">▼</span>
+          </div>
+          <div class="faq-answer">
+            Шлюз полностью настроен для поддержки CORS (Cross-Origin Resource Sharing). Заголовки <code>Access-Control-Allow-Origin: *</code> и <code>Access-Control-Allow-Headers: Authorization, Content-Type</code> автоматически возвращаются на запросы, включая preflight <code>OPTIONS</code>. Шлюз можно подключать напрямую в Open WebUI, LibreChat, SillyTavern или браузерные расширения.
+          </div>
+        </div>
       </div>
     </div>
   `;
