@@ -16,6 +16,9 @@
 
 - [Что это и зачем](#что-это-и-зачем)
 - [Быстрый старт](#быстрый-старт)
+- [Варианты запуска сервера и API](#варианты-запуска-сервера-и-api)
+- [Генерация и настройка SSL-сертификатов (SAN)](#генерация-и-настройка-ssl-сертификатов-san)
+- [Настройка CORS для веб-разработки](#настройка-cors-для-веб-разработки)
 - [Пользовательский API](#пользовательский-api)
 - [OpenAI-совместимый API (`/v1/*`)](#openai-совместимый-api-v1)
 - [Владелец узла: согласие за 5 минут](#владелец-узла-согласие-за-5-минут)
@@ -112,6 +115,309 @@ cp .env.example .env    # обязательно: POSTGRES_PASSWORD, FOA_ADMIN_T
 docker compose up -d --build
 docker compose --profile discovery up -d   # + worker инвентаризации (трафик не маршрутизируется)
 ```
+
+---
+
+## Варианты запуска сервера и API
+
+Шлюз поддерживает несколько сценариев запуска и подключения в зависимости от вашей инфраструктуры:
+
+### 1. Запуск в Docker Compose (Production / Рекомендуемый)
+
+Полноценный отказоустойчивый стек: 2 реплики шлюза, Nginx (HTTP + TLS с поддержкой SAN), PostgreSQL, Redis и Prometheus.
+
+#### Вариант 1.1: Быстрый запуск одной командой через скрипт
+Скрипт `docker-run.sh` автоматически проверит и создаст `.env` файл (если он отсутствует), выпустит актуальный TLS-сертификат с Subject Alternative Names (SAN) для вашего сервера и поднимет все контейнеры:
+```bash
+chmod +x docker-run.sh
+./docker-run.sh
+```
+
+#### Вариант 1.2: Ручной запуск через Docker Compose
+```bash
+# Подготовка окружения
+cp .env.example .env
+
+# Сборка и запуск в фоновом режиме
+docker compose build --no-cache
+docker compose up -d
+
+# Просмотр статуса контейнеров
+docker compose ps
+
+# Просмотр логов
+docker compose logs -f gateway-a
+
+# Остановка всех сервисов
+docker compose down
+```
+
+---
+
+### 2. Прямой запуск без Docker (Node.js / Разработка)
+
+Для запуска напрямую на хост-машине требуется Node.js ≥ 18:
+```bash
+# Установка зависимостей
+npm install
+
+# Компиляция TypeScript
+npm run build
+
+# Запуск шлюза
+npm start
+```
+Шлюз и веб-панель управления станут доступны по адресу: **`http://localhost:3000`**.
+
+Для разработки с автоматической перезагрузкой:
+```bash
+npm run dev
+```
+
+---
+
+### 3. Таблица портов и сетевых интерфейсов
+
+| Порт | Протокол | Сервис / Назначение |
+|---|---|---|
+| **3000** | HTTP | Напрямой доступ к шлюзу FOA Gateway (Web UI + REST API) |
+| **8080** | HTTP | Nginx Ingress балансировщик (чистый HTTP без шифрования) |
+| **8443** | HTTPS | Nginx Ingress балансировщик с TLS-шифрованием (HTTP/2) |
+| **9090** | HTTP | Метрики Prometheus (внутренняя сеть Docker) |
+
+---
+
+### 4. Варианты выполнения запросов и работы с сертификатами
+
+#### Способ А: HTTPS с самоподписанным сертификатом (самый быстрый)
+Используйте флаг `-k` (или `--insecure`) в `curl`, чтобы игнорировать проверку цепочки доверия самоподписанного сертификата:
+```bash
+export FREE_API_KEY="foa_live_xxxxxxxxxxxxxxxxxxxxxxxx"
+
+curl -k -X POST https://147.45.125.8:8443/api/chat \
+  -H "Authorization: Bearer $FREE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3",
+    "messages": [{"role": "user", "content": "Привет!"}]
+  }'
+```
+
+#### Способ Б: HTTPS с проверкой доверенного сертификата (`--cacert`)
+Шлюз генерирует сертификат с расширением Subject Alternative Names (SAN), в который включен IP-адрес сервера (`IP Address: 147.45.125.8`).
+
+Если требуется перевыпустить сертификат для нового IP или домена:
+```bash
+./deploy/tls/generate-cert.sh 147.45.125.8
+docker compose restart nginx
+```
+Выполнение запроса с указанием корневого сертификата шлюза:
+```bash
+curl --cacert deploy/tls/fullchain.pem -X POST https://147.45.125.8:8443/api/chat \
+  -H "Authorization: Bearer $FREE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3",
+    "messages": [{"role": "user", "content": "Привет!"}]
+  }'
+```
+
+#### Способ В: Установка сертификата в системное хранилище ОС
+Чтобы утилита `curl`, браузеры и SDK доверяли сертификату по умолчанию без указания дополнительных флагов:
+
+**В Ubuntu / Debian:**
+```bash
+sudo cp deploy/tls/fullchain.pem /usr/local/share/ca-certificates/foa-gateway.crt
+sudo update-ca-certificates
+```
+После этого стандартный запрос по HTTPS работает без флагов:
+```bash
+curl -X POST https://147.45.125.8:8443/api/chat \
+  -H "Authorization: Bearer $FREE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "llama3", "messages": [{"role": "user", "content": "Привет!"}]}'
+```
+
+#### Способ Г: Запросы по обычному HTTP (без SSL)
+Если шифрование не требуется (локальная сеть, изолированный контур, разработка):
+- **Напрямую к порту шлюза (3000):**
+  ```bash
+  curl -X POST http://147.45.125.8:3000/api/chat \
+    -H "Authorization: Bearer $FREE_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"model": "llama3", "messages": [{"role": "user", "content": "Привет!"}]}'
+  ```
+- **Через Nginx балансировщик (8080):**
+  ```bash
+  curl -X POST http://147.45.125.8:8080/api/chat \
+    -H "Authorization: Bearer $FREE_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"model": "llama3", "messages": [{"role": "user", "content": "Привет!"}]}'
+  ```
+
+---
+
+### 5. Автоматическое обновление репозитория
+
+Для быстрой отправки изменений на GitHub доступен скрипт `update.sh`:
+```bash
+chmod +x update.sh
+./update.sh "Описание внесенных изменений"
+```
+Скрипт автоматически добавит файлы, создаст коммит и выполнит пуш в ветку `main`. Файлы секретов (`.env`) и приватные данные автоматически игнорируются `.gitignore`.
+
+---
+
+## Генерация и настройка SSL-сертификатов (SAN)
+
+### 1. Причина ошибки `SSL: certificate subject name mismatch`
+
+При обращении к шлюзу по HTTPS через утилиту `curl`, SDK или браузер вы можете столкнуться с ошибкой:
+```text
+curl: (60) SSL: certificate subject name 'localhost' does not match target hostname '147.45.125.8'
+```
+
+**Почему это происходит:**
+В соответствии со стандартами безопасности RFC 2818 и RFC 5280, TLS-клиенты проверяют, что хост или IP-адрес, к которому выполняется подключение, строго указан в расширении **Subject Alternative Name (SAN)** сертификата (например, `IP Address: 147.45.125.8` или `DNS: api.example.com`).
+
+Если сертификат был сгенерирован со стандартным `CN=localhost` без расширения SAN, клиент не может подтвердить принадлежность сертификата адресу `147.45.125.8` и прерывает соединение.
+
+---
+
+### 2. Быстрое устранение: Автоматический скрипт перевыпуска
+
+В проект встроен скрипт `deploy/tls/generate-cert.sh`, который автоматически определяет все внешние и локальные IP-адреса хоста и выпускает сертификат с корректными SAN:
+
+```bash
+# Выпуск сертификата с указанием вашего внешнего IP или домена:
+./deploy/tls/generate-cert.sh 147.45.125.8
+
+# Перезапуск Nginx для применения нового сертификата:
+docker compose restart nginx
+```
+
+Скрипт выполняет следующие действия:
+1. Создает файл конфигурации `deploy/tls/openssl.cnf` с расширением `v3_req` и секцией `[alt_names]`.
+2. Добавляет в `subjectAltName` записи:
+   - `DNS.1 = localhost`
+   - `IP.1 = 127.0.0.1`
+   - `IP.2 = 147.45.125.8` (и все сетевые интерфейсы хоста).
+3. Генерирует закрытый ключ `deploy/tls/privkey.pem` и сертификат `deploy/tls/fullchain.pem` сроком действия на 365 дней.
+
+---
+
+### 3. Ручная генерация через OpenSSL (если нужно настроить вручную)
+
+Если вам требуется выпустить сертификат вручную с индивидуальными доменными именами и IP-адресами:
+
+1. **Создайте конфигурационный файл `deploy/tls/openssl.cnf`:**
+   ```ini
+   [req]
+   distinguished_name = req_distinguished_name
+   x509_extensions = v3_req
+   prompt = no
+
+   [req_distinguished_name]
+   CN = 147.45.125.8
+
+   [v3_req]
+   keyUsage = keyEncipherment, dataEncipherment, digitalSignature
+   extendedKeyUsage = serverAuth
+   subjectAltName = @alt_names
+
+   [alt_names]
+   DNS.1 = localhost
+   DNS.2 = api.ollama-gateway.local
+   IP.1 = 127.0.0.1
+   IP.2 = 147.45.125.8
+   ```
+
+2. **Выполните генерацию ключа и сертификата:**
+   ```bash
+   openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+     -config deploy/tls/openssl.cnf \
+     -keyout deploy/tls/privkey.pem \
+     -out deploy/tls/fullchain.pem
+   ```
+
+3. **Проверьте наличие расширения SAN в сгенерированном сертификате:**
+   ```bash
+   openssl x509 -in deploy/tls/fullchain.pem -text -noout | grep -A 2 "Subject Alternative Name"
+   ```
+   *Ожидаемый вывод:*
+   ```text
+   X509v3 Subject Alternative Name:
+       DNS:localhost, DNS:api.ollama-gateway.local, IP Address:127.0.0.1, IP Address:147.45.125.8
+   ```
+
+---
+
+### 4. Настройка доверия клиентов к самоподписанному сертификату
+
+После генерации сертификата с SAN ошибка `subject name mismatch` устранена. Теперь клиент должен доверять самому центру сертификации (так как сертификат самоподписанный):
+
+#### Способ 1: Использование флага `--cacert` (рекомендуется для скриптов)
+Укажите сгенерированный файл `fullchain.pem` в качестве доверенного CA:
+```bash
+curl --cacert deploy/tls/fullchain.pem -X POST https://147.45.125.8:8443/api/chat \
+  -H "Authorization: Bearer $FREE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "llama3", "messages": [{"role": "user", "content": "Привет!"}]}'
+```
+
+#### Способ 2: Использование флага `-k` / `--insecure` (для быстрой отладки)
+```bash
+curl -k -X POST https://147.45.125.8:8443/api/chat \
+  -H "Authorization: Bearer $FREE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "llama3", "messages": [{"role": "user", "content": "Привет!"}]}'
+```
+
+#### Способ 3: Установка сертификата в системное хранилище ОС
+**В Linux (Ubuntu / Debian):**
+```bash
+sudo cp deploy/tls/fullchain.pem /usr/local/share/ca-certificates/foa-gateway.crt
+sudo update-ca-certificates
+```
+После этого `curl`, Python `requests` и браузеры на сервере будут доверять шлюзу напрямую без дополнительных ключей.
+
+**В Node.js (при разработке внешних ботов / бэкендов):**
+```bash
+export NODE_EXTRA_CA_CERTS="/path/to/deploy/tls/fullchain.pem"
+```
+
+**В Python (OpenAI SDK / LangChain / Requests):**
+```bash
+export REQUESTS_CA_BUNDLE="/path/to/deploy/tls/fullchain.pem"
+export SSL_CERT_FILE="/path/to/deploy/tls/fullchain.pem"
+```
+
+---
+
+## Настройка CORS для веб-разработки
+
+Для удобной интеграции с фронтенд-приложениями (Vite, Next.js, Nuxt, React, Open WebUI, LibreChat) сервер шлюза поддерживает гибкую настройку разрешенных доменов через переменные окружения.
+
+### 1. Переменная `CORS_ALLOWED_ORIGINS`
+
+В файле `.env` задается список разрешенных адресов через запятую либо знак `*`:
+
+```env
+# Разрешить все источники (удобно для локальной разработки и тестов):
+CORS_ALLOWED_ORIGINS=*
+
+# Либо перечислить конкретные домены разработки и продакшена:
+CORS_ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,https://chat.mycompany.com
+```
+
+### 2. Возможности и поддерживаемые заголовки:
+- **Поддержка wildcard поддоменов**: можно указывать маски вида `*.mycompany.com`.
+- **Поддержка cookies и заголовков авторизации**: `credentials: true`.
+- **Автоматическая обработка preflight-запросов**: HTTP `OPTIONS` с кодом 204.
+- **Разрешенные методы**: `GET, POST, PUT, DELETE, OPTIONS, PATCH`.
+- **Разрешенные заголовки**: `Content-Type, Authorization, X-Requested-With, Accept, Origin, X-Gateway-Key, Cache-Control`.
+- **Экспортируемые заголовки**: `Content-Length, Content-Range, Retry-After, X-Gateway-Node`.
+- Запросы от не-браузерных клиентов (`curl`, серверные демоны, Python/Go скрипты без заголовка `Origin`) всегда пропускаются без блокировки.
 
 ---
 

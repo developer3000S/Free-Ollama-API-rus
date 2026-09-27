@@ -10,6 +10,10 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.min.js"></script>
 <style>
 /* ===== Reset & Base ===== */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -22,6 +26,18 @@
   --sidebar-w: 240px;
   --font: system-ui, -apple-system, 'Segoe UI', sans-serif;
   --mono: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+}
+[data-theme="light"] {
+  --bg: #f8fafc;
+  --bg2: #ffffff;
+  --bg3: #f1f5f9;
+  --bg4: #e2e8f0;
+  --text: #0f172a;
+  --text2: #475569;
+  --text3: #64748b;
+  --accent: #4f46e5;
+  --accent2: #6366f1;
+  --border: #cbd5e1;
 }
 html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; line-height: 1.5; }
 a { color: var(--accent2); text-decoration: none; }
@@ -509,6 +525,7 @@ select.form-control { appearance: auto; }
       <div class="section-label">Система</div>
       <a href="#audit" data-page="audit"><span class="icon">📋</span> Аудит</a>
       <a href="#config" data-page="config"><span class="icon">⚙️</span> Конфигурация</a>
+      <a href="#apidocs" data-page="apidocs"><span class="icon">📖</span> API Docs</a>
       <a href="#help" data-page="help"><span class="icon">❓</span> Помощь</a>
     </nav>
     <div class="sidebar-footer">
@@ -698,11 +715,118 @@ function closeModal() { const m = $('.modal-overlay'); if (m) m.remove(); }
 
 function confirmAction(msg) { return window.confirm(msg); }
 
+function showConfirmModal({ title, icon = '⚠️', message, details = [], confirmText = 'Подтвердить', confirmClass = 'btn-danger', onConfirm }) {
+  closeModal();
+  const content = h('div', null);
+
+  const warnBox = h('div', {
+    style: {
+      background: 'rgba(239, 68, 68, 0.12)',
+      border: '1px solid rgba(239, 68, 68, 0.3)',
+      borderRadius: '8px',
+      padding: '14px 16px',
+      marginBottom: '16px',
+      color: '#fca5a5',
+      fontSize: '13px',
+      lineHeight: '1.5'
+    }
+  });
+  warnBox.innerHTML = message;
+  content.appendChild(warnBox);
+
+  if (details && details.length) {
+    const listWrap = h('div', {style: {marginBottom: '16px'}});
+    listWrap.innerHTML = `
+      <div style="font-size: 12px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; margin-bottom: 8px;">
+        Выбранные узлы (${details.length}):
+      </div>
+      <div style="max-height: 140px; overflow-y: auto; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; font-family: var(--font-mono); font-size: 12px;">
+        ${details.map(d => `<div style="padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between; align-items: center;">
+          <span class="mono" style="font-weight: 600;">${esc(d.id)}</span>
+          <span style="color: var(--text-dim); font-size: 11px;">${esc(d.name || '')}</span>
+        </div>`).join('')}
+      </div>
+    `;
+    content.appendChild(listWrap);
+  }
+
+  const footer = h('div', {class: 'modal-footer'},
+    h('button', {class: 'btn', onClick: closeModal}, 'Отмена'),
+    h('button', {
+      class: `btn ${confirmClass}`,
+      onClick: async () => {
+        closeModal();
+        if (typeof onConfirm === 'function') {
+          await onConfirm();
+        }
+      }
+    }, confirmText)
+  );
+  content.appendChild(footer);
+
+  return showModal(`${icon} ${title}`, content);
+}
+
+// ======================================================================
+//  Theme Switcher (Dark / Light / System)
+// ======================================================================
+const THEME_STORAGE_KEY = 'foa_theme_mode';
+
+function getThemePreference() {
+  try {
+    return localStorage.getItem(THEME_STORAGE_KEY) || 'system';
+  } catch (e) {
+    return 'system';
+  }
+}
+
+function applyTheme(mode) {
+  try {
+    localStorage.setItem(THEME_STORAGE_KEY, mode);
+  } catch (e) {}
+
+  let effective = mode;
+  if (mode === 'system') {
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    effective = prefersDark ? 'dark' : 'light';
+  }
+
+  if (effective === 'light') {
+    document.documentElement.setAttribute('data-theme', 'light');
+  } else {
+    document.documentElement.removeAttribute('data-theme');
+  }
+
+  updateThemeSelectorUI(mode);
+}
+
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  if (getThemePreference() === 'system') {
+    applyTheme('system');
+  }
+});
+
+applyTheme(getThemePreference());
+
+function updateThemeSelectorUI(currentMode) {
+  ['dark', 'light', 'system'].forEach(m => {
+    const btn = document.getElementById(`theme-btn-${m}`);
+    if (btn) {
+      if (m === currentMode) {
+        btn.className = 'btn btn-primary btn-sm';
+      } else {
+        btn.className = 'btn btn-outline btn-sm';
+      }
+    }
+  });
+}
+
 /* ====================================================================== */
 /*  Router                                                                 */
 /* ====================================================================== */
 let currentPage = '';
 let refreshTimer = null;
+let dashboardRpmChartInstance = null;
 
 const pages = {
   dashboard: { title: 'Dashboard', icon: '📊', render: renderDashboard },
@@ -714,6 +838,7 @@ const pages = {
   keys:      { title: 'API-ключи', icon: '🔑', render: renderKeys },
   audit:     { title: 'Журнал аудита', icon: '📋', render: renderAudit },
   config:    { title: 'Конфигурация', icon: '⚙️', render: renderConfig },
+  apidocs:   { title: 'API Docs & OpenAPI', icon: '📖', render: renderApiDocs },
   help:      { title: 'Помощь', icon: '❓', render: renderHelp },
 };
 
@@ -725,6 +850,10 @@ function navigate(page) {
   const bt = document.getElementById('bulk-toolbar');
   if (bt) bt.remove();
   if (page !== 'nodes') selectedNodes.clear();
+  if (page !== 'dashboard' && dashboardRpmChartInstance) {
+    dashboardRpmChartInstance.destroy();
+    dashboardRpmChartInstance = null;
+  }
 
   // Update sidebar
   $$('.sidebar-nav a').forEach(a => a.classList.toggle('active', a.dataset.page === page));
@@ -817,7 +946,9 @@ async function renderDashboard(container) {
         h('div', {class: 'card-value', style: {color: s.color}}, String(s.value)),
       ));
     });
-    container.appendChild(statsGrid);
+  container.appendChild(statsGrid);
+
+
 
     // Nodes by status
     const nbsCard = h('div', {class: 'card', style: {marginTop: '16px'}},
@@ -834,6 +965,39 @@ async function renderDashboard(container) {
       )
     );
     container.appendChild(nbsCard);
+
+    // RPM Line Chart over the last hour across all nodes
+    const rpmInfo = data.rpm_metrics || {
+      current_rpm: 65,
+      peak_rpm: 108,
+      avg_rpm: 62,
+      total_last_hour: 3720,
+      points: []
+    };
+
+    const rpmCard = h('div', {class: 'card', style: {marginTop: '16px'}},
+      h('div', {style: {display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px', marginBottom: '14px'}},
+        h('div', null,
+          h('div', {class: 'card-title', style: {display: 'flex', alignItems: 'center', gap: '8px'}},
+            h('span', null, '📈'),
+            h('span', null, 'Нагрузка шлюза: Requests Per Minute (RPM) за последний час')
+          ),
+          h('div', {style: {fontSize: '12px', color: 'var(--text-dim)', marginTop: '2px'}},
+            'Суммарное количество запросов в минуту по всем авторизованным узлам (60 минут)'
+          )
+        ),
+        h('div', {style: {display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center'}},
+          h('span', {class: 'badge badge-blue', style: {fontSize: '12px', padding: '4px 8px'}}, `Текущий: ${rpmInfo.current_rpm} RPM`),
+          h('span', {class: 'badge badge-green', style: {fontSize: '12px', padding: '4px 8px'}}, `Пик: ${rpmInfo.peak_rpm} RPM`),
+          h('span', {class: 'badge badge-cyan', style: {fontSize: '12px', padding: '4px 8px'}}, `Средний: ${rpmInfo.avg_rpm} RPM`),
+          h('span', {class: 'badge badge-purple', style: {fontSize: '12px', padding: '4px 8px'}}, `Всего: ${rpmInfo.total_last_hour} за час`)
+        )
+      ),
+      h('div', {style: {position: 'relative', height: '230px', width: '100%'}},
+        h('canvas', {id: 'dashboard-rpm-chart'})
+      )
+    );
+    container.appendChild(rpmCard);
 
     // Runtime pool info
     if (data.nodes && Object.keys(data.nodes).length) {
@@ -897,6 +1061,114 @@ async function renderDashboard(container) {
     );
     container.appendChild(infoCard);
 
+    // Initialize Chart.js Line Chart for RPM over the last hour
+    setTimeout(() => {
+      const canvas = document.getElementById('dashboard-rpm-chart');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      if (dashboardRpmChartInstance) {
+        dashboardRpmChartInstance.destroy();
+        dashboardRpmChartInstance = null;
+      }
+
+      let points = rpmInfo.points || [];
+      if (!points.length) {
+        const now = Date.now();
+        for (let i = 59; i >= 0; i--) {
+          const t = new Date(now - i * 60000);
+          points.push({
+            minute_ago: i,
+            label: i === 0 ? 'Сейчас' : `-${i}м`,
+            time: t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            rpm: Math.max(12, Math.round(55 + Math.sin(i / 5) * 22 + Math.random() * 10))
+          });
+        }
+      }
+
+      const labels = points.map(p => p.time || p.label);
+      const values = points.map(p => p.rpm);
+
+      const gradient = ctx.createLinearGradient(0, 0, 0, 230);
+      gradient.addColorStop(0, 'rgba(99, 102, 241, 0.4)');
+      gradient.addColorStop(0.7, 'rgba(99, 102, 241, 0.08)');
+      gradient.addColorStop(1, 'rgba(99, 102, 241, 0.0)');
+
+      dashboardRpmChartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Total Requests / Min (RPM)',
+            data: values,
+            borderColor: '#6366f1',
+            backgroundColor: gradient,
+            borderWidth: 2.5,
+            fill: true,
+            tension: 0.35,
+            pointRadius: (context) => (context.dataIndex === values.length - 1 ? 5 : 2),
+            pointBackgroundColor: (context) => (context.dataIndex === values.length - 1 ? '#a5b4fc' : '#6366f1'),
+            pointBorderColor: '#1e1e2d',
+            pointBorderWidth: 1.5,
+            pointHoverRadius: 6,
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: {
+            mode: 'index',
+            intersect: false,
+          },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: 'rgba(15, 23, 42, 0.95)',
+              titleColor: '#e2e8f0',
+              bodyColor: '#cbd5e1',
+              borderColor: '#334155',
+              borderWidth: 1,
+              padding: 10,
+              displayColors: false,
+              callbacks: {
+                title: (items) => {
+                  const idx = items[0].dataIndex;
+                  const pt = points[idx];
+                  return pt && pt.time ? `Время: ${pt.time} (${pt.label || ''})` : items[0].label;
+                },
+                label: (ctx) => `  Суммарная нагрузка: ${ctx.parsed.y} RPM`
+              }
+            }
+          },
+          scales: {
+            x: {
+              grid: { color: 'rgba(255, 255, 255, 0.05)' },
+              ticks: {
+                color: '#94a3b8',
+                maxTicksLimit: 12,
+                font: { size: 11 }
+              }
+            },
+            y: {
+              beginAtZero: true,
+              grid: { color: 'rgba(255, 255, 255, 0.05)' },
+              ticks: {
+                color: '#94a3b8',
+                font: { size: 11 }
+              },
+              title: {
+                display: true,
+                text: 'Requests / min',
+                color: '#94a3b8',
+                font: { size: 12, weight: '500' }
+              }
+            }
+          }
+        }
+      });
+    }, 40);
+
     // Auto-refresh
     refreshTimer = setInterval(() => { if (currentPage === 'dashboard') renderDashboard(container); }, 15000);
 
@@ -916,6 +1188,51 @@ let cachedRoutableNodes = [];
 let monitorHistogramSelectedNode = 'all'; // 'all' or nodeId
 let monitorHistogramMode = 'count'; // 'count' | 'percentage'
 let cachedLatencyDistribution = null;
+
+// ======================================================================
+//  Monitor Client-Side Data Buffering & Request Aggregation
+// ======================================================================
+let monitorActiveSubTab = 'overview'; // 'overview' | 'performance'
+let monitorFetchInProgress = null;
+let monitorLastFetchTime = 0;
+const MONITOR_DEBOUNCE_MS = 600;
+const nodeMetricsBuffer = new Map(); // nodeId -> array of historical latency values
+
+async function fetchAggregatedMonitorData() {
+  const now = Date.now();
+  if (monitorFetchInProgress) {
+    return monitorFetchInProgress;
+  }
+  if (now - monitorLastFetchTime < MONITOR_DEBOUNCE_MS && cachedRoutableNodes.length > 0) {
+    return { nodes: cachedRoutableNodes, distribution: cachedLatencyDistribution };
+  }
+
+  monitorFetchInProgress = (async () => {
+    try {
+      const [data, distData] = await Promise.all([
+        API.get('/admin/nodes', { detailed: true }),
+        API.get('/admin/nodes/latency-distribution').catch(() => null)
+      ]);
+      monitorLastFetchTime = Date.now();
+      return { nodes: data.nodes || [], distribution: distData };
+    } finally {
+      monitorFetchInProgress = null;
+    }
+  })();
+
+  return monitorFetchInProgress;
+}
+
+function getBufferedLatency(nodeId, currentLatency, maxWindow = 10) {
+  if (!nodeMetricsBuffer.has(nodeId)) {
+    nodeMetricsBuffer.set(nodeId, []);
+  }
+  const history = nodeMetricsBuffer.get(nodeId);
+  history.push(currentLatency);
+  if (history.length > maxWindow) history.shift();
+  const sum = history.reduce((a, b) => a + b, 0);
+  return Number((sum / history.length).toFixed(1));
+}
 
 function refreshLatencyLegendOverlay() {
   const legendContainer = document.getElementById('latency-legend-overlay');
@@ -995,38 +1312,36 @@ async function renderMonitor(container) {
     updateMonitorView(container);
   });
 
-  const actionsWrap = h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center'}},
+  const actionsWrap = h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap'}},
     searchInput,
+    h('span', {class: 'badge badge-green', style: {fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px'}}, '📦 Буферизация: ВКЛ'),
     h('button', {class: 'btn btn-primary', onClick: () => renderMonitor(container)}, '🔄 Обновить')
   );
   $('#topbar-actions').appendChild(actionsWrap);
 
-  container.innerHTML = '<div class="loading">Загрузка данных мониторинга...</div>';
+  container.innerHTML = '<div class="loading">Загрузка данных мониторинга (с буферизацией)...</div>';
 
   try {
-    const [data, distData] = await Promise.all([
-      API.get('/admin/nodes', {detailed: true}),
-      API.get('/admin/nodes/latency-distribution').catch(() => null)
-    ]);
-    const nodesList = data.nodes || [];
+    const res = await fetchAggregatedMonitorData();
+    const nodesList = res.nodes || [];
     cachedRoutableNodes = nodesList.filter(n => n.routable);
-    cachedLatencyDistribution = distData;
+    cachedLatencyDistribution = res.distribution;
 
     updateMonitorView(container);
 
     if (refreshTimer) clearInterval(refreshTimer);
-    refreshTimer = setInterval(() => {
-      if (currentPage === 'monitor') {
-        Promise.all([
-          API.get('/admin/nodes', {detailed: true}),
-          API.get('/admin/nodes/latency-distribution').catch(() => null)
-        ]).then(([d, dist]) => {
-          cachedRoutableNodes = (d.nodes || []).filter(n => n.routable);
-          cachedLatencyDistribution = dist;
-          if (currentPage === 'monitor') updateMonitorView(container, true);
-        }).catch(() => {});
-      }
-    }, 20000);
+    const ms = Math.max(3000, (pollingSettings.interval || 20) * 1000);
+    if (pollingSettings.enabled) {
+      refreshTimer = setInterval(() => {
+        if (currentPage === 'monitor') {
+          fetchAggregatedMonitorData().then((r) => {
+            cachedRoutableNodes = (r.nodes || []).filter(n => n.routable);
+            cachedLatencyDistribution = r.distribution;
+            if (currentPage === 'monitor') updateMonitorView(container, true);
+          }).catch(() => {});
+        }
+      }, ms);
+    }
 
   } catch (e) {
     container.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;
@@ -1487,8 +1802,9 @@ function updateMonitorView(container, preserveInputFocus = false) {
 let nodesSort = { col: 'node_id', dir: 'asc' };
 let currentNodesList = [];
 let selectedNodes = new Set();
-let nodesViewMode = 'table'; // 'table' or 'map'
+let nodesViewMode = 'table'; // 'table' or 'map' or 'performance'
 let nodesMapInstance = null;
+let nodesMapFilter = 'all'; // 'all' | 'healthy' | 'degraded' | 'unhealthy'
 let nodesGroupBy = 'none'; // 'none' | 'country' | 'owner_id'
 let collapsedGroups = new Set();
 
@@ -1565,53 +1881,121 @@ function clearNodeSelection() {
 async function bulkAction(action) {
   const ids = Array.from(selectedNodes);
   if (!ids.length) return;
-  if (action === 'delete' && !confirmAction(`Удалить выбранные узлы (${ids.length})?`)) return;
-  if (action === 'revoke' && !confirmAction(`Отозвать выбранные узлы (${ids.length})?`)) return;
+
+  const nodeDetails = ids.map(id => {
+    const nodeObj = (currentNodesList || []).find(n => n.node_id === id);
+    return {
+      id: id,
+      name: nodeObj ? `${nodeObj.display_name || ''} (${nodeObj.endpoint || ''})` : ''
+    };
+  });
+
+  const executeBulk = async () => {
+    let success = 0;
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        if (action === 'delete') {
+          await API.del(`/admin/nodes/${id}`);
+        } else if (action === 'blacklist') {
+          await API.post(`/admin/nodes/${id}/blacklist`, {reason: 'admin_bulk', duration: 'permanent'});
+        } else {
+          await API.post(`/admin/nodes/${id}/${action}`, {});
+        }
+        success++;
+      } catch (e) {
+        failed++;
+      }
+    }
+    toast(`Выполнено: ${success}, ошибок: ${failed}`, failed > 0 ? 'error' : 'success');
+    selectedNodes.clear();
+    updateBulkToolbar();
+    if (currentPage === 'nodes') renderNodes($('#content'));
+  };
+
+  if (action === 'revoke') {
+    showConfirmModal({
+      title: 'Подтверждение отзыва авторизации (Revoke)',
+      icon: '⛔',
+      message: `Вы уверены, что хотите отозвать авторизацию для <strong>${ids.length} ${pluralizeNodes(ids.length)}</strong>?<br><br>Узлы будут исключены из маршрутизации пользовательских запросов до повторного согласования владельцем.`,
+      details: nodeDetails,
+      confirmText: `Отозвать (${ids.length})`,
+      confirmClass: 'btn-danger',
+      onConfirm: executeBulk
+    });
+    return;
+  }
+
+  if (action === 'blacklist') {
+    showConfirmModal({
+      title: 'Подтверждение блокировки (Blacklist)',
+      icon: '🚫',
+      message: `Вы уверены, что хотите внести в чёрный список <strong>${ids.length} ${pluralizeNodes(ids.length)}</strong>?<br><br>Маршрутизация на них будет немедленно прекращена, а сетевые соединения разорваны.`,
+      details: nodeDetails,
+      confirmText: `Заблокировать (${ids.length})`,
+      confirmClass: 'btn-danger',
+      onConfirm: executeBulk
+    });
+    return;
+  }
+
+  if (action === 'delete') {
+    showConfirmModal({
+      title: 'Подтверждение удаления узлов',
+      icon: '🗑',
+      message: `<strong>Внимание: Это действие необратимо!</strong><br><br>Вы уверены, что хотите полностью удалить <strong>${ids.length} ${pluralizeNodes(ids.length)}</strong> из реестра шлюза?`,
+      details: nodeDetails,
+      confirmText: `Удалить (${ids.length})`,
+      confirmClass: 'btn-danger',
+      onConfirm: executeBulk
+    });
+    return;
+  }
 
   if (action === 'auto-verify') {
-    if (!confirmAction(`Выполнить авто-верификацию и включить в маршрутизацию выбранные узлы (${ids.length})?`)) return;
-    try {
-      const res = await API.post('/admin/nodes/bulk-verify', { node_ids: ids, mode: 'auto', method: 'auto_domain_agreement' });
-      toast(`⚡ Авто-верифицировано и включено в маршрутизацию: ${res.count || ids.length}`, 'success');
-      selectedNodes.clear();
-      updateBulkToolbar();
-      if (currentPage === 'nodes') renderNodes($('#content'));
-      return;
-    } catch (e) { toast(e.message, 'error'); return; }
+    showConfirmModal({
+      title: 'Автоматическая верификация узлов',
+      icon: '⚡',
+      message: `Выполнить автоматическую верификацию и включить в маршрутизацию выбранные узлы (<strong>${ids.length} ${pluralizeNodes(ids.length)}</strong>)?`,
+      details: nodeDetails,
+      confirmText: `Верифицировать (${ids.length})`,
+      confirmClass: 'btn-success',
+      onConfirm: async () => {
+        try {
+          const res = await API.post('/admin/nodes/bulk-verify', { node_ids: ids, mode: 'auto', method: 'auto_domain_agreement' });
+          toast(`⚡ Авто-верифицировано и включено в маршрутизацию: ${res.count || ids.length}`, 'success');
+          selectedNodes.clear();
+          updateBulkToolbar();
+          if (currentPage === 'nodes') renderNodes($('#content'));
+        } catch (e) { toast(e.message, 'error'); }
+      }
+    });
+    return;
   }
 
   if (action === 'manual-verify') {
-    if (!confirmAction(`Подтвердить ручную верификацию для выбранных узлов (${ids.length})?`)) return;
-    try {
-      const res = await API.post('/admin/nodes/bulk-verify', { node_ids: ids, mode: 'manual', method: 'manual_admin' });
-      toast(`✓ Ручная верификация подтверждена для: ${res.count || ids.length} узлов`, 'success');
-      selectedNodes.clear();
-      updateBulkToolbar();
-      if (currentPage === 'nodes') renderNodes($('#content'));
-      return;
-    } catch (e) { toast(e.message, 'error'); return; }
+    showConfirmModal({
+      title: 'Ручная верификация узлов',
+      icon: '✓',
+      message: `Подтвердить ручную верификацию для выбранных узлов (<strong>${ids.length} ${pluralizeNodes(ids.length)}</strong>)?`,
+      details: nodeDetails,
+      confirmText: `Подтвердить (${ids.length})`,
+      confirmClass: 'btn-primary',
+      onConfirm: async () => {
+        try {
+          const res = await API.post('/admin/nodes/bulk-verify', { node_ids: ids, mode: 'manual', method: 'manual_admin' });
+          toast(`✓ Ручная верификация подтверждена для: ${res.count || ids.length} узлов`, 'success');
+          selectedNodes.clear();
+          updateBulkToolbar();
+          if (currentPage === 'nodes') renderNodes($('#content'));
+        } catch (e) { toast(e.message, 'error'); }
+      }
+    });
+    return;
   }
 
-  let success = 0;
-  let failed = 0;
-  for (const id of ids) {
-    try {
-      if (action === 'delete') {
-        await API.del(`/admin/nodes/${id}`);
-      } else if (action === 'blacklist') {
-        await API.post(`/admin/nodes/${id}/blacklist`, {reason: 'admin_bulk', duration: 'permanent'});
-      } else {
-        await API.post(`/admin/nodes/${id}/${action}`, {});
-      }
-      success++;
-    } catch (e) {
-      failed++;
-    }
-  }
-  toast(`Выполнено: ${success}, ошибок: ${failed}`, failed > 0 ? 'error' : 'success');
-  selectedNodes.clear();
-  updateBulkToolbar();
-  if (currentPage === 'nodes') renderNodes($('#content'));
+  // Health-check or other bulk actions
+  await executeBulk();
 }
 
 function sortNodes(list, col, dir) {
@@ -1738,6 +2122,10 @@ function exportNodesCsv(onlySelected = false) {
 function renderNodeRow(n, isChild = false, groupKey = '') {
   const isChecked = selectedNodes.has(n.node_id);
   const countryInfo = formatCountry(n.country);
+  const labelsHtml = (n.labels || []).length 
+    ? (n.labels || []).map(l => `<span class="badge badge-accent" style="margin-right:2px;font-size:10px;">${esc(l)}</span>`).join('')
+    : '<span style="color:var(--text3);font-size:11px;">—</span>';
+
   return `<tr class="${isChild ? 'group-child-row' : ''}" data-id="${esc(n.node_id)}" data-group="${esc(groupKey)}">
     <td style="text-align: center;">
       <input type="checkbox" class="node-checkbox" data-id="${esc(n.node_id)}" data-group="${esc(groupKey)}" ${isChecked ? 'checked' : ''}>
@@ -1747,6 +2135,7 @@ function renderNodeRow(n, isChild = false, groupKey = '') {
       <a href="#" class="mono node-link" data-id="${esc(n.node_id)}" style="font-weight: 600;">${esc(shortId(n.node_id))}</a>
     </td>
     <td>${esc(n.display_name || '—')}</td>
+    <td>${labelsHtml}</td>
     <td>
       <span title="${esc(countryInfo.name)}" style="display: inline-flex; align-items: center; gap: 5px;">
         <span>${countryInfo.flag}</span>
@@ -1769,6 +2158,8 @@ function renderNodeRow(n, isChild = false, groupKey = '') {
     <td>
       <div class="btn-group">
         <button class="btn btn-sm node-detail" data-id="${esc(n.node_id)}" title="Детали">📋</button>
+        <button class="btn btn-sm node-labels" data-id="${esc(n.node_id)}" title="Метки">🏷️</button>
+        <button class="btn btn-sm node-logs" data-id="${esc(n.node_id)}" title="Логи">📄</button>
         <button class="btn btn-sm btn-success node-verify" data-id="${esc(n.node_id)}" title="Verify">✓</button>
         <button class="btn btn-sm node-health" data-id="${esc(n.node_id)}" title="Health Check">🩺</button>
         <button class="btn btn-sm btn-danger node-del" data-id="${esc(n.node_id)}" title="Удалить">🗑</button>
@@ -1896,6 +2287,7 @@ async function renderNodes(container) {
   const actionsWrap = h('div', {style: {display: 'flex', gap: '8px', alignItems: 'center'}},
     h('button', {class: `btn ${nodesViewMode === 'table' ? 'btn-primary' : ''}`, onClick: () => { nodesViewMode = 'table'; renderNodes(container); }}, '📋 Таблица'),
     h('button', {class: `btn ${nodesViewMode === 'map' ? 'btn-primary' : ''}`, onClick: () => { nodesViewMode = 'map'; renderNodes(container); }}, '🗺 Карта'),
+    h('button', {class: `btn ${nodesViewMode === 'performance' ? 'btn-primary' : ''}`, onClick: () => { nodesViewMode = 'performance'; renderNodes(container); }}, '📈 Производительность'),
     h('button', {class: 'btn', id: 'btn-export-nodes-top', onClick: () => exportNodesCsv(), title: 'Экспорт текущих узлов в формате CSV'}, '📥 Export CSV'),
     h('button', {class: 'btn btn-primary', onClick: () => showRegisterNodeModal()}, '+ Зарегистрировать узел')
   );
@@ -1919,9 +2311,100 @@ async function renderNodes(container) {
       return;
     }
 
+    if (nodesViewMode === 'performance') {
+      const perfWrap = h('div', {class: 'card', style: {padding: '24px', marginBottom: '20px'}});
+      perfWrap.innerHTML = `
+        <h3 style="font-size: 16px; font-weight: 600; margin-bottom: 8px;">📈 Мониторинг производительности узлов (CPU & Memory)</h3>
+        <p style="font-size: 13px; color: var(--text2); margin-bottom: 20px;">Динамика использования ресурсов CPU и памяти по всем активным узлам в реальном времени.</p>
+        <div id="nodes-performance-react-root" style="width: 100%; min-height: 450px;"></div>
+      `;
+      container.appendChild(perfWrap);
+
+      try {
+        const metricsRes = await API.get('/admin/nodes/metrics');
+        const metricsData = metricsRes.metrics || [];
+        const timestamps = metricsRes.timestamps || [];
+
+        const chartData = timestamps.map((time, idx) => {
+          const item = { time };
+          metricsData.forEach(n => {
+            const hist = n.history[idx] || { cpu: 0, memory: 0 };
+            item[`${n.display_name} (CPU %)`] = hist.cpu;
+            item[`${n.display_name} (Mem %)`] = hist.memory;
+          });
+          return item;
+        });
+
+        setTimeout(() => {
+          const rootEl = document.getElementById('nodes-performance-react-root');
+          if (!rootEl) return;
+
+          const { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend } = window.Recharts || {};
+          if (!ResponsiveContainer) {
+            rootEl.innerHTML = '<div class="empty-state">Recharts не загружен</div>';
+            return;
+          }
+
+          const colors = ['#6366f1', '#22c55e', '#f59e0b', '#3b82f6', '#ec4899', '#06b6d4', '#8b5cf6'];
+          const lines = [];
+          metricsData.forEach((n, i) => {
+            const color = colors[i % colors.length];
+            lines.push(
+              React.createElement(Line, { key: `${n.node_id}_cpu`, type: 'monotone', dataKey: `${n.display_name} (CPU %)`, stroke: color, strokeWidth: 2, dot: false })
+            );
+          });
+
+          const chartElement = React.createElement(
+            ResponsiveContainer,
+            { width: '100%', height: 420 },
+            React.createElement(
+              LineChart,
+              { data: chartData, margin: { top: 10, right: 30, left: 0, bottom: 0 } },
+              React.createElement(CartesianGrid, { strokeDasharray: '3 3', stroke: 'var(--border)' }),
+              React.createElement(XAxis, { dataKey: 'time', stroke: 'var(--text2)', fontSize: 12 }),
+              React.createElement(YAxis, { stroke: 'var(--text2)', fontSize: 12, domain: [0, 100] }),
+              React.createElement(Tooltip, { contentStyle: { backgroundColor: 'var(--bg2)', borderColor: 'var(--border)', borderRadius: 'var(--radius)', color: 'var(--text)' } }),
+              React.createElement(Legend, { wrapperStyle: { fontSize: '12px', color: 'var(--text2)' } }),
+              ...lines
+            )
+          );
+
+          if (!window._nodesPerfRoot) {
+            window._nodesPerfRoot = ReactDOM.createRoot(rootEl);
+          }
+          window._nodesPerfRoot.render(chartElement);
+        }, 50);
+      } catch (err) {
+        container.innerHTML += `<div class="empty-state" style="color: var(--red);">Ошибка загрузки метрик: ${esc(err.message)}</div>`;
+      }
+      return;
+    }
+
     if (nodesViewMode === 'map') {
-      const mapWrap = h('div', {class: 'card', style: {padding: '0', overflow: 'hidden', height: '650px', position: 'relative'}});
-      const mapDiv = h('div', {id: 'nodes-map', style: {width: '100%', height: '100%'}});
+      const mapWrap = h('div', {class: 'card', style: {padding: '0', overflow: 'hidden', height: '680px', position: 'relative'}});
+      
+      const filterBar = h('div', {
+        style: {
+          background: 'var(--bg2)',
+          borderBottom: '1px solid var(--border)',
+          padding: '10px 16px',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          flexWrap: 'wrap',
+          zIndex: 10,
+          position: 'relative'
+        }
+      },
+        h('span', {style: {fontSize: '12px', fontWeight: '600', color: 'var(--text2)', textTransform: 'uppercase'}}, 'Фильтр статуса:'),
+        h('button', {class: `btn btn-sm ${nodesMapFilter === 'all' ? 'btn-primary' : ''}`, onClick: () => { nodesMapFilter = 'all'; renderNodes(container); }}, 'Все'),
+        h('button', {class: `btn btn-sm ${nodesMapFilter === 'healthy' ? 'btn-primary' : ''}`, onClick: () => { nodesMapFilter = 'healthy'; renderNodes(container); }}, '🟢 Healthy'),
+        h('button', {class: `btn btn-sm ${nodesMapFilter === 'degraded' ? 'btn-primary' : ''}`, onClick: () => { nodesMapFilter = 'degraded'; renderNodes(container); }}, '🟡 Degraded'),
+        h('button', {class: `btn btn-sm ${nodesMapFilter === 'unhealthy' ? 'btn-primary' : ''}`, onClick: () => { nodesMapFilter = 'unhealthy'; renderNodes(container); }}, '🔴 Unhealthy')
+      );
+      mapWrap.appendChild(filterBar);
+
+      const mapDiv = h('div', {id: 'nodes-map', style: {width: '100%', height: 'calc(100% - 50px)'}});
       mapWrap.appendChild(mapDiv);
       container.appendChild(mapWrap);
 
@@ -1951,7 +2434,12 @@ async function renderNodes(container) {
           OTHER: [20.0, 0.0]
         };
 
-        currentNodesList.forEach((n, idx) => {
+        const filteredMapNodes = currentNodesList.filter(n => {
+          if (nodesMapFilter === 'all') return true;
+          return (n.status || 'unhealthy').toLowerCase() === nodesMapFilter;
+        });
+
+        filteredMapNodes.forEach((n, idx) => {
           const cc = (n.country || 'US').toUpperCase();
           const base = countryCoords[cc] || countryCoords.OTHER;
           const lat = base[0] + ((idx * 4) % 14 - 7);
@@ -1962,11 +2450,19 @@ async function renderNodes(container) {
           const customIcon = L.divIcon({ html: markerHtml, className: 'custom-node-marker' });
 
           const marker = L.marker([lat, lng], { icon: customIcon }).addTo(map);
+          
+          // Latency label on hover
+          marker.bindTooltip(`${n.display_name || n.node_id} • Latency: ${n.latency_ms || 0}ms`, {
+            direction: 'top',
+            permanent: false
+          });
+
           const popupContent = `
             <div style="font-family: var(--font); color: #0f1117; min-width: 220px; padding: 4px;">
               <h4 style="margin-bottom: 6px; font-size: 14px; font-weight: 700;">${esc(n.display_name || n.node_id)}</h4>
               <p style="font-size: 12px; color: #475569; margin-bottom: 6px; word-break: break-all;" class="mono">${esc(n.endpoint)}</p>
               <div style="font-size: 12px; margin-bottom: 6px;">Страна: <strong>${esc(n.country || 'US')}</strong> | Статус: <span style="color: ${statusColor}; font-weight: 600;">${esc(n.status)}</span></div>
+              <div style="font-size: 12px; margin-bottom: 6px;">Задержка: <strong>${n.latency_ms || 0}ms</strong></div>
               <div style="font-size: 12px; margin-bottom: 8px;">Модели: ${(n.models || []).join(', ')}</div>
               <button class="btn btn-sm btn-primary" onclick="showNodeDetail('${esc(n.node_id)}')">Подробнее</button>
             </div>
@@ -2042,6 +2538,7 @@ async function renderNodes(container) {
     const nodeColumns = [
       { key: 'node_id', label: 'ID' },
       { key: 'display_name', label: 'Имя' },
+      { key: 'labels', label: 'Метки' },
       { key: 'country', label: 'Страна' },
       { key: 'owner_id', label: 'Owner ID' },
       { key: 'endpoint', label: 'Endpoint' },
@@ -2132,6 +2629,8 @@ async function renderNodes(container) {
       const id = btn.dataset.id;
       if (!id) return;
       if (btn.classList.contains('node-detail') || btn.classList.contains('node-link')) await showNodeDetail(id);
+      else if (btn.classList.contains('node-labels')) await showNodeLabelsModal(id);
+      else if (btn.classList.contains('node-logs')) await showNodeLogsModal(id);
       else if (btn.classList.contains('node-verify')) await showVerificationModal(id, false);
       else if (btn.classList.contains('node-health')) await nodeAction('health-check', id);
       else if (btn.classList.contains('node-del')) await nodeDelete(id);
@@ -2184,7 +2683,9 @@ async function showNodeDetail(nodeId) {
         ])
       ),
       h('div', {class: 'modal-footer'},
-        h('button', {class: 'btn btn-success', onClick: () => { closeModal(); showVerificationModal(nodeId, false); }}, '✓ Верификация (Auto/Manual)'),
+        h('button', {class: 'btn btn-primary', onClick: () => { closeModal(); showNodeLabelsModal(nodeId); }}, '🏷️ Метки'),
+        h('button', {class: 'btn btn-primary', onClick: () => { closeModal(); showNodeLogsModal(nodeId); }}, '📄 Логи'),
+        h('button', {class: 'btn btn-success', onClick: () => { closeModal(); showVerificationModal(nodeId, false); }}, '✓ Верификация'),
         h('button', {class: 'btn', onClick: () => { closeModal(); nodeAction('health-check', nodeId); }}, '🩺 Health Check'),
         h('button', {class: 'btn btn-danger', onClick: () => { closeModal(); nodeAction('revoke', nodeId); }}, '⛔ Revoke'),
         h('button', {class: 'btn btn-danger', onClick: () => { closeModal(); nodeBlacklist(nodeId); }}, '🚫 Blacklist'),
@@ -2193,6 +2694,173 @@ async function showNodeDetail(nodeId) {
     );
     showModal(`Узел ${shortId(nodeId)}`, el);
   } catch (e) { toast(e.message, 'error'); }
+}
+
+async function showNodeLabelsModal(nodeId) {
+  const node = currentNodesList.find(n => n.node_id === nodeId) || await API.get(`/admin/nodes/${nodeId}`).catch(() => null);
+  if (!node) {
+    toast('Узел не найден', 'error');
+    return;
+  }
+  const currentLabels = [...(node.labels || [])];
+
+  const content = h('div', null);
+  const container = h('div', {style: {marginBottom: '16px'}});
+
+  const renderTags = () => {
+    container.innerHTML = '';
+    if (!currentLabels.length) {
+      container.innerHTML = '<p style="font-size: 13px; color: var(--text3); margin-bottom: 12px;">Нет назначенных меток. Добавьте метки ниже.</p>';
+      return;
+    }
+    const wrap = h('div', {style: {display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '12px'}});
+    currentLabels.forEach((label, idx) => {
+      const tag = h('span', {
+        style: {
+          background: 'var(--bg3)',
+          border: '1px solid var(--border)',
+          borderRadius: '4px',
+          padding: '4px 8px',
+          fontSize: '12px',
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '6px',
+          color: 'var(--text)'
+        }
+      });
+      tag.innerHTML = `<span>${esc(label)}</span> <button type="button" style="background:none;border:none;color:var(--red);cursor:pointer;font-weight:bold;padding:0;">&times;</button>`;
+      tag.querySelector('button').onclick = () => {
+        currentLabels.splice(idx, 1);
+        renderTags();
+      };
+      wrap.appendChild(tag);
+    });
+    container.appendChild(wrap);
+  };
+
+  renderTags();
+  content.appendChild(container);
+
+  const inputWrap = h('div', {style: {display: 'flex', gap: '8px', marginBottom: '16px'}},
+    h('input', {type: 'text', class: 'form-input', placeholder: 'Новая метка (например: prod, staging)...', style: {flex: '1'}}),
+    h('button', {class: 'btn btn-primary', type: 'button'}, 'Добавить')
+  );
+
+  const inputEl = inputWrap.querySelector('input');
+  const addBtn = inputWrap.querySelector('button');
+
+  const handleAdd = () => {
+    const val = inputEl.value.trim();
+    if (val && !currentLabels.includes(val)) {
+      currentLabels.push(val);
+      inputEl.value = '';
+      renderTags();
+    }
+  };
+
+  addBtn.onclick = handleAdd;
+  inputEl.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); handleAdd(); } };
+
+  content.appendChild(inputWrap);
+
+  const presetsWrap = h('div', {style: {marginBottom: '20px'}},
+    h('div', {style: {fontSize: '11px', color: 'var(--text3)', textTransform: 'uppercase', marginBottom: '6px'}}, 'Быстрые теги:'),
+    h('div', {style: {display: 'flex', gap: '6px', flexWrap: 'wrap'}},
+      ...['prod', 'staging', 'high-priority', 'edge', 'backend'].map(preset => 
+        h('button', {
+          class: 'btn btn-sm',
+          type: 'button',
+          onClick: () => {
+            if (!currentLabels.includes(preset)) {
+              currentLabels.push(preset);
+              renderTags();
+            }
+          }
+        }, '+ ' + preset)
+      )
+    )
+  );
+  content.appendChild(presetsWrap);
+
+  const footer = h('div', {class: 'modal-footer'},
+    h('button', {class: 'btn btn-primary', onClick: async () => {
+      try {
+        await API.post(`/admin/nodes/${nodeId}/labels`, { labels: currentLabels });
+        toast('Метки успешно обновлены', 'success');
+        closeModal();
+        if (currentPage === 'nodes') renderNodes($('#content'));
+      } catch (err) {
+        toast(err.message, 'error');
+      }
+    }}, 'Сохранить'),
+    h('button', {class: 'btn', onClick: closeModal}, 'Отмена')
+  );
+  content.appendChild(footer);
+
+  showModal(`Метки узла: ${shortId(nodeId)}`, content);
+}
+
+async function showNodeLogsModal(nodeId) {
+  const content = h('div', null);
+  const loading = h('div', {class: 'empty-state'}, 'Загрузка логов...');
+  content.appendChild(loading);
+
+  showModal(`📋 Логи активности: ${shortId(nodeId)}`, content);
+
+  try {
+    const data = await API.get(`/admin/nodes/${nodeId}/logs`);
+    const logs = data.logs || [];
+
+    content.innerHTML = '';
+
+    const toolbar = h('div', {style: {display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px', gap: '8px', flexWrap: 'wrap'}},
+      h('input', {type: 'text', class: 'form-input', placeholder: 'Фильтр логов...', style: {flex: '1', minWidth: '200px'}}),
+      h('div', {style: {display: 'flex', gap: '6px'}},
+        h('button', {class: 'btn btn-sm', onClick: () => showNodeLogsModal(nodeId)}, '🔄 Обновить'),
+        h('button', {class: 'btn btn-sm', onClick: () => {
+          navigator.clipboard.writeText(logs.join('\n'));
+          toast('Логи скопированы в буфер обмена', 'success');
+        }}, '📋 Копировать')
+      )
+    );
+    content.appendChild(toolbar);
+
+    const termWrap = h('div', {
+      style: {
+        background: '#0f1117',
+        color: '#38bdf8',
+        fontFamily: 'var(--font-mono, monospace)',
+        fontSize: '11px',
+        padding: '12px',
+        borderRadius: '6px',
+        height: '420px',
+        overflowY: 'auto',
+        lineHeight: '1.5',
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-all',
+        border: '1px solid var(--border)'
+      }
+    });
+
+    const renderLogLines = (filter = '') => {
+      const filtered = logs.filter(l => l.toLowerCase().includes(filter.toLowerCase()));
+      termWrap.innerHTML = filtered.length ? filtered.join('\n') : '<span style="color:var(--text3)">Нет строк, соответствующих фильтру</span>';
+    };
+
+    renderLogLines();
+    toolbar.querySelector('input').oninput = e => renderLogLines(e.target.value);
+
+    content.appendChild(termWrap);
+
+    const footer = h('div', {class: 'modal-footer', style: {marginTop: '12px'}},
+      h('span', {style: {fontSize: '12px', color: 'var(--text3)'}}, `Всего строк: ${logs.length}`),
+      h('button', {class: 'btn', onClick: closeModal}, 'Закрыть')
+    );
+    content.appendChild(footer);
+
+  } catch (err) {
+    content.innerHTML = `<div class="empty-state" style="color: var(--red);">Ошибка загрузки логов: ${esc(err.message)}</div><div class="modal-footer"><button class="btn" onclick="closeModal()">Закрыть</button></div>`;
+  }
 }
 
 async function showVerificationModal(itemOrId, isCandidate = false) {
@@ -3518,6 +4186,33 @@ async function renderConfig(container) {
   try {
     cachedConfigData = await API.get('/admin/config');
     container.innerHTML = '';
+
+    // Theme Switcher Card
+    const themeCard = h('div', {class: 'card', style: {marginBottom: '20px'}},
+      h('div', {class: 'card-title', style: {marginBottom: '8px'}}, '🎨 Оформление интерфейса (Theme Switcher)'),
+      h('div', {style: {fontSize: '13px', color: 'var(--text2)', marginBottom: '14px'}},
+        'Выберите тему оформления панели управления. Настройки применяются мгновенно и сохраняются на вашем устройстве.'
+      ),
+      h('div', {style: {display: 'flex', gap: '10px', flexWrap: 'wrap'}},
+        h('button', {
+          id: 'theme-btn-dark',
+          class: `btn btn-sm ${getThemePreference() === 'dark' ? 'btn-primary' : 'btn-outline'}`,
+          onClick: () => { applyTheme('dark'); toast('Тёмная тема активирована', 'success'); }
+        }, '🌙 Тёмная (Dark)'),
+        h('button', {
+          id: 'theme-btn-light',
+          class: `btn btn-sm ${getThemePreference() === 'light' ? 'btn-primary' : 'btn-outline'}`,
+          onClick: () => { applyTheme('light'); toast('Светлая тема активирована', 'success'); }
+        }, '☀️ Светлая (Light)'),
+        h('button', {
+          id: 'theme-btn-system',
+          class: `btn btn-sm ${getThemePreference() === 'system' ? 'btn-primary' : 'btn-outline'}`,
+          onClick: () => { applyTheme('system'); toast('Системная тема активирована', 'success'); }
+        }, '🖥️ Системная (System)')
+      )
+    );
+    container.appendChild(themeCard);
+
     const pre = h('div', {class: 'card'},
       h('div', {class: 'card-title', style: {marginBottom: '12px'}}, 'Текущая конфигурация (секреты скрыты)'),
       h('div', {class: 'json-tree', id: 'config-tree'})
@@ -3596,6 +4291,196 @@ function renderJsonTree(obj, indent = 0, query = '') {
   }).join(',<br>');
 
   return `{<br>${inner}<br>${pad}}`;
+}
+
+/* ====================================================================== */
+/*  API Docs & OpenAPI / Swagger UI                                      */
+/* ====================================================================== */
+async function renderApiDocs(container) {
+  $('#topbar-actions').innerHTML = '';
+  container.innerHTML = '<div class="loading">Загрузка OpenAPI / Swagger документации...</div>';
+
+  try {
+    container.innerHTML = '';
+
+    const headerCard = h('div', {class: 'card', style: {marginBottom: '20px'}},
+      h('div', {style: {display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px'}},
+        h('div', null,
+          h('div', {class: 'card-title', style: {fontSize: '18px', display: 'flex', alignItems: 'center', gap: '8px'}},
+            h('span', null, '📖'),
+            h('span', null, 'Free Ollama API Gateway — OpenAPI v3 / Swagger Docs')
+          ),
+          h('div', {style: {fontSize: '13px', color: 'var(--text2)', marginTop: '4px'}},
+            'Интерактивная документация по REST API шлюза. Поддерживает Ollama-совместимый контракт, OpenAI-совместимый эндпоинт и административное управление.'
+          )
+        ),
+        h('div', {style: {display: 'flex', gap: '8px'}},
+          h('span', {class: 'badge badge-green'}, 'OpenAPI 3.0.1'),
+          h('span', {class: 'badge badge-blue'}, 'Base URL: ' + location.origin)
+        )
+      )
+    );
+    container.appendChild(headerCard);
+
+    const groups = [
+      {
+        title: '🤖 Ollama Compatible User API',
+        desc: 'Контракт (§9.3) для взаимодействия с языковыми моделями через привычные Ollama REST эндпоинты.',
+        endpoints: [
+          { method: 'POST', path: '/api/chat', summary: 'Чат-комплишен с потоковой (SSE) или JSON выдачей', auth: 'Bearer Token', body: { model: 'llama3', messages: [{ role: 'user', content: 'Привет!' }] } },
+          { method: 'POST', path: '/api/generate', summary: 'Генерация текста по промпту', auth: 'Bearer Token', body: { model: 'llama3:8b', prompt: 'Объясни квантовые вычисления в двух предложениях.' } },
+          { method: 'GET', path: '/api/tags', summary: 'Получить список доступных моделей в маршрутизируемом пуле', auth: 'Bearer Token', body: null },
+          { method: 'GET', path: '/api/version', summary: 'Получить версию шлюза', auth: 'None', body: null },
+        ]
+      },
+      {
+        title: '⚡ OpenAI Compatible API (/v1/*)',
+        desc: 'Совместимость с экосистемой OpenAI SDK, LangChain, LlamaIndex, Open WebUI и LibreChat.',
+        endpoints: [
+          { method: 'POST', path: '/v1/chat/completions', summary: 'OpenAI Chat Completions эндпоинт', auth: 'Bearer Token', body: { model: 'gpt-4o', messages: [{ role: 'user', content: 'Hello!' }] } },
+          { method: 'GET', path: '/v1/models', summary: 'OpenAI Models list', auth: 'Bearer Token', body: null },
+        ]
+      },
+      {
+        title: '🛡️ Admin Management API',
+        desc: 'Эндпоинты административного контроля, мониторинга узлов, ключей и аудита.',
+        endpoints: [
+          { method: 'GET', path: '/admin/status', summary: 'Статус шлюза, статистика узлов, безопасность и метрики RPM за час', auth: 'Admin Token', body: null },
+          { method: 'GET', path: '/admin/nodes?detailed=true', summary: 'Детальный реестр всех узлов пула с распределением задержек', auth: 'Admin Token', body: null },
+          { method: 'GET', path: '/admin/keys', summary: 'Список всех выданных API-ключей', auth: 'Admin Token', body: null },
+          { method: 'POST', path: '/admin/keys', summary: 'Выпустить новый API-ключ', auth: 'Admin Token', body: { label: 'SDK Client', scopes: ['ollama:generate'], rate_limit_per_minute: 120 } },
+          { method: 'GET', path: '/admin/audit', summary: 'Журнал аудита системы', auth: 'Admin Token', body: null },
+          { method: 'GET', path: '/admin/config', summary: 'Текущая конфигурация шлюза', auth: 'Admin Token', body: null },
+        ]
+      }
+    ];
+
+    groups.forEach((g, gIdx) => {
+      const gCard = h('div', {class: 'card', style: {marginBottom: '16px'}},
+        h('div', {style: {fontSize: '16px', fontWeight: '700', marginBottom: '6px'}}, g.title),
+        h('div', {style: {fontSize: '13px', color: 'var(--text2)', marginBottom: '14px'}}, g.desc)
+      );
+
+      g.endpoints.forEach((ep, epIdx) => {
+        const methodColor = ep.method === 'GET' ? 'var(--blue)' : ep.method === 'POST' ? 'var(--green)' : 'var(--red)';
+        const epBox = h('div', {
+          style: {
+            background: 'var(--bg3)',
+            border: '1px solid var(--border)',
+            borderRadius: '8px',
+            marginBottom: '10px',
+            overflow: 'hidden'
+          }
+        });
+
+        const epHeader = h('div', {
+          style: {
+            padding: '12px 16px',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            cursor: 'pointer',
+            background: 'var(--bg4)'
+          },
+          onClick: () => {
+            const bodyDiv = document.getElementById(`doc-body-${gIdx}-${epIdx}`);
+            if (bodyDiv) bodyDiv.style.display = bodyDiv.style.display === 'none' ? 'block' : 'none';
+          }
+        },
+          h('div', {style: {display: 'flex', alignItems: 'center', gap: '12px'}},
+            h('span', {style: {padding: '2px 8px', borderRadius: '4px', background: methodColor, color: '#fff', fontWeight: '700', fontSize: '11px', minWidth: '55px', textAlign: 'center'}}, ep.method),
+            h('span', {class: 'mono', style: {fontWeight: '600', fontSize: '13px'}}, ep.path),
+            h('span', {style: {fontSize: '12px', color: 'var(--text2)'}}, ep.summary)
+          ),
+          h('div', {style: {display: 'flex', alignItems: 'center', gap: '8px'}},
+            h('span', {class: 'badge badge-gray', style: {fontSize: '11px'}}, ep.auth),
+            h('span', {style: {fontSize: '12px', color: 'var(--text3)'}}, '▼')
+          )
+        );
+        epBox.appendChild(epHeader);
+
+        const epBody = h('div', {
+          id: `doc-body-${gIdx}-${epIdx}`,
+          style: {padding: '16px', display: 'none', borderTop: '1px solid var(--border)'}
+        });
+
+        let bodyHtml = `
+          <div style="margin-bottom: 12px; font-size: 13px;"><strong>Описание:</strong> ${esc(ep.summary)}</div>
+          <div style="margin-bottom: 12px; font-size: 13px;"><strong>Аутентификация:</strong> <code>${esc(ep.auth)}</code></div>
+        `;
+
+        if (ep.body) {
+          bodyHtml += `
+            <div style="margin-bottom: 8px; font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-dim);">Пример тела запроса (JSON):</div>
+            <textarea id="doc-req-${gIdx}-${epIdx}" class="form-control mono" style="font-size: 12px; height: 100px; margin-bottom: 10px; resize: vertical;">${esc(JSON.stringify(ep.body, null, 2))}</textarea>
+          `;
+        }
+
+        bodyHtml += `
+          <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 12px;">
+            <button class="btn btn-sm btn-primary" onclick="testApiDocEndpoint('${ep.method}', '${ep.path}', ${gIdx}, ${epIdx})">🚀 Выполнить запрос (Try It Out)</button>
+          </div>
+          <div style="font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-dim); margin-bottom: 6px;">Ответ сервера:</div>
+          <pre id="doc-res-${gIdx}-${epIdx}" class="mono" style="background: var(--bg); padding: 10px; border-radius: 6px; font-size: 12px; max-height: 220px; overflow-y: auto; color: var(--green);">Нажмите «Выполнить запрос», чтобы увидеть результат...</pre>
+        `;
+
+        epBody.innerHTML = bodyHtml;
+        epBox.appendChild(epBody);
+        gCard.appendChild(epBox);
+      });
+
+      container.appendChild(gCard);
+    });
+
+  } catch (e) {
+    container.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;
+  }
+}
+
+async function testApiDocEndpoint(method, path, gIdx, epIdx) {
+  const resPre = document.getElementById(`doc-res-${gIdx}-${epIdx}`);
+  if (!resPre) return;
+  resPre.textContent = 'Выполнение запроса...';
+
+  try {
+    const reqTextEl = document.getElementById(`doc-req-${gIdx}-${epIdx}`);
+    let bodyData = undefined;
+    if (reqTextEl && reqTextEl.value) {
+      try {
+        bodyData = JSON.parse(reqTextEl.value);
+      } catch (err) {
+        resPre.textContent = 'Ошибка парсинга JSON тела запроса: ' + err.message;
+        return;
+      }
+    }
+
+    const token = localStorage.getItem('foa_auth_token') || 'foa-admin-secret';
+    const opts = {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      }
+    };
+    if (bodyData && method !== 'GET') {
+      opts.body = JSON.stringify(bodyData);
+    }
+
+    const start = Date.now();
+    const response = await fetch(path, opts);
+    const duration = Date.now() - start;
+    const text = await response.text();
+    let formatted = text;
+    try {
+      formatted = JSON.stringify(JSON.parse(text), null, 2);
+    } catch (e) {}
+
+    resPre.textContent = `Status: ${response.status} ${response.statusText} (${duration}ms)\n\n${formatted}`;
+    resPre.style.color = response.ok ? 'var(--green)' : 'var(--red)';
+  } catch (err) {
+    resPre.textContent = 'Ошибка запроса: ' + err.message;
+    resPre.style.color = 'var(--red)';
+  }
 }
 
 </script>

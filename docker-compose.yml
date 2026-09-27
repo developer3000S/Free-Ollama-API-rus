@@ -16,6 +16,7 @@ x-gateway-common: &gateway-common
     GATEWAY_ID: "foa-gw-main-01"
     FOA_SERVER__HOST: 0.0.0.0
     FOA_SERVER__PORT: "3000"
+    CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
     FOA_ADMIN_TOKEN: ${FOA_ADMIN_TOKEN:-foa-admin-secret}
     FOA_AUDITOR_TOKEN: ${FOA_AUDITOR_TOKEN:-foa-auditor-secret}
     FOA_STORAGE__DATABASE_URL: postgresql://foa:${POSTGRES_PASSWORD:-postgres_foa_password}@postgres:5432/foa

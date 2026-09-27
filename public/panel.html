@@ -7,6 +7,8 @@
 <meta name="description" content="Managed proxy gateway over an authorized Ollama node pool with consent gating, discovery, and admin dashboard">
 <meta property="og:title" content="Free Ollama API Gateway">
 <meta property="og:description" content="Managed proxy gateway over an authorized Ollama node pool with consent gating, discovery, and admin dashboard">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <style>
 /* ===== Reset & Base ===== */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -294,6 +296,7 @@ select.form-control { appearance: auto; }
       <div class="section-label">Система</div>
       <a href="#audit" data-page="audit"><span class="icon">📋</span> Аудит</a>
       <a href="#config" data-page="config"><span class="icon">⚙️</span> Конфигурация</a>
+      <a href="#apidocs" data-page="apidocs"><span class="icon">📖</span> API Docs</a>
     </nav>
     <div class="sidebar-footer">
       <span id="sidebar-version"></span>
@@ -472,6 +475,67 @@ function showModal(title, contentEl, opts = {}) {
 function closeModal() { const m = $('.modal-overlay'); if (m) m.remove(); }
 
 function confirmAction(msg) { return window.confirm(msg); }
+
+function pluralizeNodes(count) {
+  const mod10 = count % 10;
+  const mod100 = count % 100;
+  if (mod100 >= 11 && mod100 <= 19) return 'узлов';
+  if (mod10 === 1) return 'узел';
+  if (mod10 >= 2 && mod10 <= 4) return 'узла';
+  return 'узлов';
+}
+
+function showConfirmModal({ title, icon = '⚠️', message, details = [], confirmText = 'Подтвердить', confirmClass = 'btn-danger', onConfirm }) {
+  closeModal();
+  const content = h('div', null);
+
+  const warnBox = h('div', {
+    style: {
+      background: 'rgba(239, 68, 68, 0.12)',
+      border: '1px solid rgba(239, 68, 68, 0.3)',
+      borderRadius: '8px',
+      padding: '14px 16px',
+      marginBottom: '16px',
+      color: '#fca5a5',
+      fontSize: '13px',
+      lineHeight: '1.5'
+    }
+  });
+  warnBox.innerHTML = message;
+  content.appendChild(warnBox);
+
+  if (details && details.length) {
+    const listWrap = h('div', {style: {marginBottom: '16px'}});
+    listWrap.innerHTML = `
+      <div style="font-size: 12px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; margin-bottom: 8px;">
+        Выбранные узлы (${details.length}):
+      </div>
+      <div style="max-height: 140px; overflow-y: auto; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; font-family: var(--font-mono); font-size: 12px;">
+        ${details.map(d => `<div style="padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between; align-items: center;">
+          <span class="mono" style="font-weight: 600;">${esc(d.id)}</span>
+          <span style="color: var(--text-dim); font-size: 11px;">${esc(d.name || '')}</span>
+        </div>`).join('')}
+      </div>
+    `;
+    content.appendChild(listWrap);
+  }
+
+  const footer = h('div', {class: 'modal-footer'},
+    h('button', {class: 'btn', onClick: closeModal}, 'Отмена'),
+    h('button', {
+      class: `btn ${confirmClass}`,
+      onClick: async () => {
+        closeModal();
+        if (typeof onConfirm === 'function') {
+          await onConfirm();
+        }
+      }
+    }, confirmText)
+  );
+  content.appendChild(footer);
+
+  return showModal(`${icon} ${title}`, content);
+}
 
 /* ====================================================================== */
 /*  Router                                                                 */
@@ -720,29 +784,79 @@ function clearNodeSelection() {
 async function bulkAction(action) {
   const ids = Array.from(selectedNodes);
   if (!ids.length) return;
-  if (action === 'delete' && !confirmAction(`Удалить выбранные узлы (${ids.length})?`)) return;
-  if (action === 'revoke' && !confirmAction(`Отозвать выбранные узлы (${ids.length})?`)) return;
 
-  let success = 0;
-  let failed = 0;
-  for (const id of ids) {
-    try {
-      if (action === 'delete') {
-        await API.del(`/admin/nodes/${id}`);
-      } else if (action === 'blacklist') {
-        await API.post(`/admin/nodes/${id}/blacklist`, {reason: 'admin_bulk', duration: 'permanent'});
-      } else {
-        await API.post(`/admin/nodes/${id}/${action}`, {});
+  const nodeDetails = ids.map(id => {
+    const nodeObj = (currentNodesList || []).find(n => n.node_id === id);
+    return {
+      id: id,
+      name: nodeObj ? `${nodeObj.display_name || ''} (${nodeObj.endpoint || ''})` : ''
+    };
+  });
+
+  const executeBulk = async () => {
+    let success = 0;
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        if (action === 'delete') {
+          await API.del(`/admin/nodes/${id}`);
+        } else if (action === 'blacklist') {
+          await API.post(`/admin/nodes/${id}/blacklist`, {reason: 'admin_bulk', duration: 'permanent'});
+        } else {
+          await API.post(`/admin/nodes/${id}/${action}`, {});
+        }
+        success++;
+      } catch (e) {
+        failed++;
       }
-      success++;
-    } catch (e) {
-      failed++;
     }
+    toast(`Выполнено: ${success}, ошибок: ${failed}`, failed > 0 ? 'error' : 'success');
+    selectedNodes.clear();
+    updateBulkToolbar();
+    if (currentPage === 'nodes') renderNodes($('#content'));
+  };
+
+  if (action === 'revoke') {
+    showConfirmModal({
+      title: 'Подтверждение отзыва авторизации (Revoke)',
+      icon: '⛔',
+      message: `Вы уверены, что хотите отозвать авторизацию для <strong>${ids.length} ${pluralizeNodes(ids.length)}</strong>?<br><br>Узлы будут исключены из маршрутизации пользовательских запросов до повторного согласования владельцем.`,
+      details: nodeDetails,
+      confirmText: `Отозвать (${ids.length})`,
+      confirmClass: 'btn-danger',
+      onConfirm: executeBulk
+    });
+    return;
   }
-  toast(`Выполнено: ${success}, ошибок: ${failed}`, failed > 0 ? 'error' : 'success');
-  selectedNodes.clear();
-  updateBulkToolbar();
-  if (currentPage === 'nodes') renderNodes($('#content'));
+
+  if (action === 'blacklist') {
+    showConfirmModal({
+      title: 'Подтверждение блокировки (Blacklist)',
+      icon: '🚫',
+      message: `Вы уверены, что хотите внести в чёрный список <strong>${ids.length} ${pluralizeNodes(ids.length)}</strong>?<br><br>Маршрутизация на них будет немедленно прекращена, а сетевые соединения разорваны.`,
+      details: nodeDetails,
+      confirmText: `Заблокировать (${ids.length})`,
+      confirmClass: 'btn-danger',
+      onConfirm: executeBulk
+    });
+    return;
+  }
+
+  if (action === 'delete') {
+    showConfirmModal({
+      title: 'Подтверждение удаления узлов',
+      icon: '🗑',
+      message: `<strong>Внимание: Это действие необратимо!</strong><br><br>Вы уверены, что хотите полностью удалить <strong>${ids.length} ${pluralizeNodes(ids.length)}</strong> из реестра шлюза?`,
+      details: nodeDetails,
+      confirmText: `Удалить (${ids.length})`,
+      confirmClass: 'btn-danger',
+      onConfirm: executeBulk
+    });
+    return;
+  }
+
+  // Health-check or verify
+  await executeBulk();
 }
 
 function sortNodes(list, col, dir) {

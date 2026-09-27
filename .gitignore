@@ -21,6 +21,8 @@ logs/
 secrets/
 *.pem
 *.key
+!deploy/tls/*.pem
+!deploy/tls/openssl.cnf
 
 # IDE
 .idea/
