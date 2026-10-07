@@ -57,6 +57,7 @@ echo ""
 echo "=== Сервисы успешно запущены! ==="
 echo "Панель управления и API доступны по адресам:"
 echo " - HTTP:  http://localhost:3000"
+echo " - HTTP (через Nginx, без SSL):  http://localhost:8080 (или порт из FOA_HTTP_PORT)"
 echo " - HTTPS: https://localhost:8443 (или порт из FOA_HTTPS_PORT)"
 echo ""
 docker compose ps

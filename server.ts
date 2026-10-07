@@ -38,6 +38,13 @@ const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_ID = process.env.GATEWAY_ID || 'foa-gw-main-01';
 const VERSION = '1.0.0';
 
+// Публичные порты ingress-балансировщика (nginx): `${FOA_HTTP_PORT:-8080}:80` и
+// `${FOA_HTTPS_PORT:-8443}:443` в docker-compose.yml. Шлюзу они нужны, чтобы
+// сообщать клиентам оба варианта подключения — в том числе plain-HTTP для программ,
+// отклоняющих самоподписанный сертификат (DEPTH_ZERO_SELF_SIGNED_CERT).
+const PUBLIC_HTTP_PORT = process.env.FOA_HTTP_PORT || '8080';
+const PUBLIC_HTTPS_PORT = process.env.FOA_HTTPS_PORT || '8443';
+
 // Configurable CORS settings via .env (e.g. CORS_ALLOWED_ORIGINS="http://localhost:5173,http://localhost:3000" or "*")
 const rawCorsOrigins = (process.env.CORS_ALLOWED_ORIGINS || process.env.CORS_ORIGIN || '*').trim();
 const allowedCorsOrigins = rawCorsOrigins
@@ -697,15 +704,220 @@ const adminAuth = (req: Request, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : (req.query.token as string);
 
+  // Токены читаются на каждом запросе, чтобы POST /admin/config/reload
+  // (перечитывающий .env) применял новые значения без рестарта.
   const configuredAdminToken = process.env.FOA_ADMIN_TOKEN || 'foa-admin-secret';
   const configuredAuditorToken = process.env.FOA_AUDITOR_TOKEN || 'foa-auditor-secret';
 
-  // Allow configured tokens, or any reasonable non-empty token in dev preview
-  if (token && (token === configuredAdminToken || token === configuredAuditorToken || token.length >= 4)) {
+  // Допускаются только точно совпадающие токены администратора/аудитора.
+  if (!token || (token !== configuredAdminToken && token !== configuredAuditorToken)) {
+    return res.status(401).json({ error: 'Необходима авторизация администратора (Bearer токен)' });
+  }
+
+  // Роли (§2.2, §9.6): токен администратора — полный доступ, токен аудитора —
+  // только чтение. ЗНАЧЕНИЕ ПО УМОЛЧАНИЮ 'foa-admin-secret' — это административный
+  // токен, поэтому роль определяется именно по совпадению с ним.
+  const isAdmin = token === configuredAdminToken;
+  if (!isAdmin && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    return res.status(403).json({ error: 'Токен аудитора допускает только операции чтения (GET)' });
+  }
+  (req as any).adminRole = isAdmin ? 'admin' : 'auditor';
+
+  return next();
+};
+
+// Authentication Middleware для пользовательского API (§9.2):
+// Authorization: Bearer <foa_live_...> — действующий, не отозванный
+// и не просроченный ключ из реестра apiKeys.
+const userAuth = (req: Request, res: Response, next: NextFunction) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+
+  if (!token) {
+    return res
+      .status(401)
+      .json({ error: 'Требуется API-ключ: заголовок Authorization: Bearer <foa_live_...>' });
+  }
+
+  const now = new Date();
+  for (const key of apiKeys.values()) {
+    if (key.raw_key !== token || key.revoked) continue;
+    if (key.expires_at && new Date(key.expires_at) < now) {
+      return res.status(401).json({ error: 'Срок действия API-ключа истёк' });
+    }
+    key.last_used_at = now.toISOString();
+    // Ключ нужен middleware requireScopes / applyLimits, идущим следом в цепочке.
+    (req as any).apiKey = key;
     return next();
   }
 
-  return res.status(401).json({ error: 'Необходима авторизация администратора (Bearer токен)' });
+  return res.status(401).json({ error: 'Недействительный API-ключ' });
+};
+
+// Authorization по скоупам (§9.2): пропускает запрос, если у ключа есть
+// хотя бы один из требуемых скоупов, иначе 403.
+const requireScopes = (...scopes: string[]) => {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const key: ApiKeyItem = (req as any).apiKey;
+    const granted: string[] = Array.isArray(key?.scopes) ? key.scopes : [];
+    if (scopes.some((s) => granted.includes(s))) {
+      return next();
+    }
+    return res.status(403).json({
+      error: `Недостаточно прав: требуется один из скоупов [${scopes.join(', ')}], у ключа — [${granted.join(', ')}]`,
+    });
+  };
+};
+
+// --- Лимиты, квоты и проверка размера запроса (§7.5, §12.4.2–12.4.3) ---
+// In-memory sliding window за 60 секунд. Состояние локально для процесса
+// (см. README, «Состояние и хранение данных»).
+const LIMIT_WINDOW_MS = 60_000;
+
+function pruneWindow(hits: number[], now: number): number[] {
+  const cutoff = now - LIMIT_WINDOW_MS;
+  let i = 0;
+  while (i < hits.length && hits[i] <= cutoff) i++;
+  return i > 0 ? hits.slice(i) : hits;
+}
+
+// 0 — лимит не превышен, иначе число секунд до освобождения окна.
+function windowRetryAfter(hits: number[], limit: number, now: number): number {
+  if (hits.length >= limit) {
+    return Math.max(1, Math.ceil((hits[0] + LIMIT_WINDOW_MS - now) / 1000));
+  }
+  return 0;
+}
+
+const userRpm = new Map<string, number[]>(); // key_id -> временные метки
+const modelRpm = new Map<string, number[]>(); // `${key_id}|${model}` -> метки
+let globalRpm: number[] = []; // глобальный поток
+const inflight = new Map<string, number>(); // key_id -> активные запросы
+const inflightStreams = new Map<string, number>(); // key_id -> активные стримы
+
+function rateLimited(res: Response, scope: string, limit: number, retryAfter: number) {
+  res.setHeader('Retry-After', String(retryAfter));
+  return res.status(429).json({
+    error: `Превышен лимит запросов (${scope} ≤ ${limit}/мин). Повторите через ${retryAfter} с.`,
+    retry_after: retryAfter,
+  });
+}
+
+// applyLimits проверяет размер тела, квоты payload, RPM (пользователь /
+// глобально / на модель) и параллельные запросы. Счётчики инкрементируются
+// только если все проверки прошли — иначе отвергнутый запрос не съедает квоту.
+const applyLimits = (opts: { perModel?: boolean; body?: 'prompt' | 'chat' | 'openai' } = {}) => {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const key: ApiKeyItem = (req as any).apiKey;
+    const limits = currentConfig.limits;
+    const now = Date.now();
+    const keyId = key.key_id;
+
+    // 1. Размер запроса (§12.4.2)
+    const contentLength = Number(req.headers['content-length'] || 0);
+    if (contentLength > limits.max_request_bytes) {
+      return res
+        .status(413)
+        .json({ error: `Тело запроса превышает max_request_bytes (${limits.max_request_bytes} байт)` });
+    }
+
+    // 2. Квоты payload (§12.4.2)
+    const body: Record<string, any> = req.body || {};
+    if (opts.body === 'prompt') {
+      const prompt: string = typeof body.prompt === 'string' ? body.prompt : '';
+      if (Buffer.byteLength(prompt, 'utf8') > limits.max_prompt_bytes) {
+        return res
+          .status(400)
+          .json({ error: `Промпт превышает max_prompt_bytes (${limits.max_prompt_bytes} байт)` });
+      }
+      const numPredict = body.options?.num_predict;
+      if (typeof numPredict === 'number' && numPredict > limits.max_num_predict) {
+        return res.status(400).json({ error: `num_predict превышает max_num_predict (${limits.max_num_predict})` });
+      }
+    } else if (opts.body === 'chat' || opts.body === 'openai') {
+      const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
+      if (messages.length > limits.max_messages) {
+        return res.status(400).json({ error: `Число сообщений превышает max_messages (${limits.max_messages})` });
+      }
+      for (const m of messages) {
+        const content: string = typeof m?.content === 'string' ? m.content : '';
+        if (Buffer.byteLength(content, 'utf8') > limits.max_message_bytes) {
+          return res
+            .status(400)
+            .json({ error: `Сообщение превышает max_message_bytes (${limits.max_message_bytes} байт)` });
+        }
+      }
+      const cap =
+        opts.body === 'openai' ? body.max_tokens ?? body.max_completion_tokens : body.options?.num_predict;
+      if (typeof cap === 'number' && cap > limits.max_num_predict) {
+        return res.status(400).json({ error: `Лимит генерации превышает max_num_predict (${limits.max_num_predict})` });
+      }
+    }
+
+    // 3. RPM на пользователя (явный лимит ключа приоритетнее общего)
+    const userLimit = key.rate_limit_per_minute ?? limits.requests_per_minute_per_user;
+    const userHits = pruneWindow(userRpm.get(keyId) || [], now);
+    let retryAfter = windowRetryAfter(userHits, userLimit, now);
+    if (retryAfter) {
+      userRpm.set(keyId, userHits);
+      return rateLimited(res, 'на пользователя', userLimit, retryAfter);
+    }
+
+    // 4. Глобальный RPM
+    const globalHits = pruneWindow(globalRpm, now);
+    retryAfter = windowRetryAfter(globalHits, limits.requests_per_minute_global, now);
+    if (retryAfter) {
+      userRpm.set(keyId, userHits);
+      globalRpm = globalHits;
+      return rateLimited(res, 'глобальный', limits.requests_per_minute_global, retryAfter);
+    }
+
+    // 5. RPM на модель
+    let modelId = '';
+    if (opts.perModel && body.model) {
+      modelId = `${keyId}|${String(body.model).toLowerCase()}`;
+      const modelHits = pruneWindow(modelRpm.get(modelId) || [], now);
+      retryAfter = windowRetryAfter(modelHits, limits.requests_per_minute_per_model, now);
+      if (retryAfter) {
+        userRpm.set(keyId, userHits);
+        globalRpm = globalHits;
+        modelRpm.set(modelId, modelHits);
+        return rateLimited(res, `на модель ${body.model}`, limits.requests_per_minute_per_model, retryAfter);
+      }
+      modelRpm.set(modelId, modelHits);
+    }
+
+    // 6. Параллельные запросы (отдельно для стримов, §12.4.2)
+    const isStream = body.stream === true;
+    const inflightMap = isStream ? inflightStreams : inflight;
+    const inflightLimit = isStream
+      ? limits.concurrent_stream_requests_per_user
+      : limits.concurrent_requests_per_user;
+    const current = inflightMap.get(keyId) || 0;
+    if (current >= inflightLimit) {
+      return res
+        .status(429)
+        .json({ error: `Превышен лимит одновременных запросов (${inflightLimit} на пользователя)` });
+    }
+    inflightMap.set(keyId, current + 1);
+
+    // Фиксируем попадания в окна только для пропущенного запроса
+    userHits.push(now);
+    userRpm.set(keyId, userHits);
+    globalHits.push(now);
+    globalRpm = globalHits;
+
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      inflightMap.set(keyId, Math.max(0, (inflightMap.get(keyId) || 1) - 1));
+    };
+    res.on('close', release);
+    req.on('aborted', release);
+
+    next();
+  };
 };
 
 // --- Operational Routes ---
@@ -2374,11 +2586,40 @@ function getRoutableModels() {
   return Array.from(modelsSet);
 }
 
-app.get('/api/version', (req, res) => {
+app.get('/api/version', userAuth, (req, res) => {
   res.json({ version: '0.1.32' });
 });
 
-app.get('/api/tags', (req, res) => {
+// Публичный список вариантов подключения к шлюзу (§9.3): HTTPS по умолчанию и
+// запасной plain-HTTP для клиентов, отклоняющих самоподписанный сертификат
+// (DEPTH_ZERO_SELF_SIGNED_CERT). Аутентификации не требует — это базовые URL,
+// ключ всё равно нужен в Authorization.
+app.get('/api/endpoints', (req, res) => {
+  // nginx проксирует с `Host $host` (без порта), а публичный порт известен из
+  // FOA_HTTP_PORT / FOA_HTTPS_PORT, поэтому хост берём из запроса, а порты — из конфигурации.
+  const hostname = req.hostname || 'localhost';
+  const makeUrl = (scheme: string, port: string) => `${scheme}://${hostname}:${port}`;
+
+  const endpoints = [
+    {
+      scheme: 'https',
+      url: makeUrl('https', PUBLIC_HTTPS_PORT),
+      label: 'HTTPS (основной)',
+      description: 'Основной эндпоинт с TLS-шифрованием. Используется по умолчанию.',
+    },
+    {
+      scheme: 'http',
+      url: makeUrl('http', PUBLIC_HTTP_PORT),
+      label: 'HTTP (без SSL)',
+      description:
+        'Обычный HTTP без шифрования. Для программ и SDK, которые отклоняют самоподписанный сертификат шлюза (например, ошибка DEPTH_ZERO_SELF_SIGNED_CERT).',
+    },
+  ];
+
+  res.json({ gateway_id: GATEWAY_ID, version: VERSION, endpoints });
+});
+
+app.get('/api/tags', userAuth, requireScopes('ollama:read'), applyLimits(), (req, res) => {
   const modelNames = getRoutableModels();
   const models = modelNames.map((name) => ({
     name,
@@ -2398,7 +2639,7 @@ app.get('/api/tags', (req, res) => {
   res.json({ models });
 });
 
-app.post('/api/generate', async (req, res) => {
+app.post('/api/generate', userAuth, requireScopes('ollama:generate'), applyLimits({ perModel: true, body: 'prompt' }), async (req, res) => {
   const { model, prompt, stream } = req.body;
   const targetModel = model || 'llama3:8b';
   let routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
@@ -2500,7 +2741,7 @@ app.post('/api/generate', async (req, res) => {
   }, 40);
 });
 
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', userAuth, requireScopes('ollama:generate'), applyLimits({ perModel: true, body: 'chat' }), async (req, res) => {
   const { model, messages, stream } = req.body;
   const targetModel = model || 'llama3:8b';
   let routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
@@ -2598,7 +2839,7 @@ app.post('/api/chat', async (req, res) => {
   }, 40);
 });
 
-app.post('/api/embed', (req, res) => {
+app.post('/api/embed', userAuth, requireScopes('ollama:embed', 'ollama:generate'), applyLimits(), (req, res) => {
   const { input } = req.body;
   const count = Array.isArray(input) ? input.length : 1;
   const embeddings = Array(count)
@@ -2612,7 +2853,7 @@ app.post('/api/embed', (req, res) => {
 });
 
 // --- OpenAI Compatible API (/v1/*) ---
-app.get('/v1/models', (req, res) => {
+app.get('/v1/models', userAuth, requireScopes('ollama:read'), applyLimits(), (req, res) => {
   const modelNames = getRoutableModels();
   res.json({
     object: 'list',
@@ -2628,7 +2869,7 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-app.post('/v1/chat/completions', (req, res) => {
+app.post('/v1/chat/completions', userAuth, requireScopes('ollama:generate'), applyLimits({ perModel: true, body: 'openai' }), (req, res) => {
   const { model, messages, stream } = req.body;
   const targetModel = model || 'llama3:8b';
   let routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));

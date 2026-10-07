@@ -1,14 +1,24 @@
 # Free Ollama API Gateway
 
-Управляемый прокси-шлюз с Ollama-совместимым API поверх пула узлов Ollama, **владелец
-которых явно подтвердил участие**. Реализация ТЗ [`ТЗ.md`](ТЗ.md) (версия 1.0.0).
+Управляемый прокси-шлюз с Ollama-совместимым API поверх пула узлов Ollama,
+владельцы которых явно подтвердили участие. Реализация технического задания
+[`ТЗ.md`](ТЗ.md) (версия 1.0).
 
-> **Ключевое положение (§1.1, §2.1, §19).** Шлюз не является «поисковиком бесплатных
-> LLM». Пользовательский трафик уходит только на узлы, прошедшие подтверждение
-> владения и активное согласие. Обнаруженные в интернете хосты Ollama становятся
-> не узлами, а **кандидатами**: они не получают трафик никогда, пока владелец сам
-> не зарегистрирует узел и не подтвердит владение (§4.4.4). Обход этого условия
-> блокируется не только кодом, но и проверкой конфигурации на старте.
+> **Статус сборки.** Текущий код — это Node.js/TypeScript-реализация
+> (Express, один файл `server.ts`), сменившая первоначальный Python-вариант
+> (коммит `4790479 build: migrate from Python to Node.js`). Реализованы
+> пользовательский и OpenAI-совместимый контракты, административный API,
+> веб-панель и модуль discovery; состояние хранится **в оперативной памяти**
+> процесса, поэтому перезапуск сбрасывает его к демо-данным. Что именно
+> реализовано, а что осталось на этапе прототипа — см. раздел
+> [Статус реализации по ТЗ](#статус-реализации-по-тз) и
+> [Ограничения](#ограничения-и-что-не-реализовано).
+>
+> **Ключевое положение (§1.1, §2.1, §19).** Шлюз не является «поисковиком
+> бесплатных LLM». Пользовательский трафик уходит только на узлы, прошедшие
+> подтверждение владения и активное согласие. Обнаруженные в интернете хосты
+> Ollama становятся не узлами, а **кандидатами**: они не получают трафик никогда,
+> пока владелец сам не зарегистрирует узел и не подтвердит владение (§4.4.4).
 
 ---
 
@@ -16,23 +26,23 @@
 
 - [Что это и зачем](#что-это-и-зачем)
 - [Быстрый старт](#быстрый-старт)
-- [Варианты запуска сервера и API](#варианты-запуска-сервера-и-api)
+- [Варианты запуска сервера и подключения](#варианты-запуска-сервера-и-подключения)
 - [Генерация и настройка SSL-сертификатов (SAN)](#генерация-и-настройка-ssl-сертификатов-san)
 - [Настройка CORS для веб-разработки](#настройка-cors-для-веб-разработки)
-- [Пользовательский API](#пользовательский-api)
+- [Пользовательский API (Ollama-совместимый, `/api/*`)](#пользовательский-api-ollama-совместимый-api)
 - [OpenAI-совместимый API (`/v1/*`)](#openai-совместимый-api-v1)
-- [Владелец узла: согласие за 5 минут](#владелец-узла-согласие-за-5-минут)
-- [Администратор: реестр, ключи, отзыв](#администратор-реестр-ключи-отзыв)
+- [Веб-панель администратора](#веб-панель-администратора)
+- [Административный API (`/admin/*`)](#административный-api-admin)
 - [Discovery (§4)](#discovery-4)
 - [Конфигурация](#конфигурация)
 - [Наблюдаемость](#наблюдаемость)
-- [Масштабирование](#масштабирование)
-- [Миграции](#миграции)
+- [Состояние и хранение данных](#состояние-и-хранение-данных)
 - [Безопасность и этика](#безопасность-и-этика)
-- [Тесты и качество](#тесты-и-качество)
-- [Критерии приемки (§17)](#критерии-приемки-17)
-- [Структура кода](#структура-кода)
+- [Сборка и качество](#сборка-и-качество)
+- [Структура репозитория](#структура-репозитория)
+- [Статус реализации по ТЗ](#статус-реализации-по-тз)
 - [Ограничения и что не реализовано](#ограничения-и-что-не-реализовано)
+- [Скрипт `update.sh`](#скрипт-updatesh)
 
 ---
 
@@ -40,154 +50,118 @@
 
 Три контура в одном процессе (§3.2):
 
-| Контур | Кто им пользуется | Код |
+| Контур | Кто им пользуется | Где реализован |
 |---|---|---|
-| Пользовательский Ollama-совместимый API | держатели ключей `foa_…` | `foa/api/user.py` |
-| Административный API + self-service владельца | администратор, аудитор, владельцы узлов | `foa/api/admin.py`, `foa/cli/owner.py` |
-| Служебный (health, discovery, реестр) | фоновые циклы той реплики, которой включена роль | `foa/services/`, `foa/core/appstate.py` |
+| Пользовательский Ollama-совместимый API | клиенты с ключами `foa_live_…` (выдаёт администратор) | `server.ts`, маршруты `/api/*` |
+| OpenAI-совместимый API | клиенты, использующие SDK OpenAI | `server.ts`, маршруты `/v1/*` |
+| Административный API + веб-панель | администратор, аудитор | `server.ts`, маршруты `/admin/*` + `public/index.html` |
+| Служебный (health, ready, metrics, discovery) | балансировщики, Prometheus, фоновые задачи | `server.ts` + `deploy/` |
 
 Пользователь шлюза видит обычный Ollama API и не знает (и не должен знать), какой
-именно узел обработал запрос. Владелец узла видит метаданные обращений и в любой
-момент отзывает согласие. Администратор управляет реестром, лимитами и блэклистом.
+именно узел обработал запрос. Администратор управляет реестром узлов, согласиями,
+блэклистом, ключами и кандидатами discovery через панель или REST API.
+
+> Демо-данные при старте: 7 узлов в регионах US/DE/JP/NL/FR (6 маршрутизируемых,
+> 1 в `pending_consent`), 2 кандидата и загрузочная запись аудита. Удалить их
+> можно запросом `POST /admin/demo/clear` (см. [Состояние и хранение](#состояние-и-хранение-данных)).
 
 ---
 
 ## Быстрый старт
 
-Требуется Python ≥ 3.11 (проверено на 3.11.2).
+### 1. Запуск в Docker (рекомендуется)
 
-```bash
-git clone git@github.com:developer3000S/Free-Ollama-API.git
-cd Free-Ollama-API
-python3.11 -m venv .venv
-.venv/bin/pip install -e .            # зависимости из pyproject.toml (включая драйвер asyncpg)
-# опционально: .venv/bin/pip install -e '.[dev]'   (pytest, ruff, mypy)
-# опционально: .venv/bin/pip install -e '.[redis]'  — пакет для redis-бэкенда лимитов (см. «Ограничения»)
-```
+Полный стек: 2 реплики шлюза, Nginx (HTTP + TLS с поддержкой SAN), PostgreSQL,
+Redis и Prometheus.
 
-Конфигурация для знакомства — стартовый стенд на локальном SQLite, без секретов:
-
-```bash
-cp .env.example .env                  # заполните токены и GATEWAY_* (см. ниже)
-.venv/bin/foa-gateway --config config.example.yaml --check-config
-# → конфигурация корректна: безопасный режим по умолчанию (§13)
-
-.venv/bin/foa-gateway --config config.example.yaml --print-config   # действующие значения, секреты маскируются
-.venv/bin/foa-gateway --config config.example.yaml                  # запуск на 127.0.0.1:8080
-```
-
-После запуска:
-
-| Адрес | Назначение |
-|---|---|
-| `GET /healthz` | процесс жив: `{"status":"ok"}` |
-| `GET /readyz` | готовность обслуживать: `{"status","routable_nodes","version"}`; `503`, если маршрутизируемых узлов 0 |
-| `GET /metrics` | Prometheus (§11.4) — наружу не публиковать |
-| `GET /docs` | OpenAPI-интерфейс (`/openapi.json`) |
-
-Флаги `foa-gateway`: `--config`, `--host`, `--port`, `--log-level`, `--reload`,
-`--check-config`, `--print-config`. Путь к файлу также задаётся переменной
-`FOA_CONFIG_FILE` (по умолчанию `./config.yaml`, его отсутствие — не ошибка).
-
-Контейнеризованная топология (§14.1) — 2 реплики шлюза, отдельный health-checker,
-Prometheus и nginx с TLS. Быстрый путь — скрипт `docker-start.sh`, который делает
-все предварительные шаги сам:
-
-```bash
-./docker-start.sh                      # .env + секреты + TLS → очистка → сборка без кэша → up -d
-./docker-start.sh --no-build           # поднять существующий образ (очистка и сборка пропускаются)
-./docker-start.sh --profile discovery  # + worker инвентаризации (трафик не маршрутизируется)
-./docker-start.sh down                 # остановить (тома, образы, .env и сертификаты сохраняются)
-```
-
-Скрипт создаёт `.env` из `.env.example`, генерирует пустые секреты через
-`openssl rand` (значения в вывод не печатаются), выпускает самоподписанный
-сертификат в `deploy/tls/` — без него nginx не поднимется. Перед сборкой
-останавливает прежний стек и удаляет образы, собранные этим compose-проектом
-(базовые `postgres`/`redis`/`nginx`/`prometheus` не трогает: на общей машине их
-может переиспользовать другой проект), затем собирает их с `--no-cache --pull` —
-иначе слой `requirements.txt` взял бы из кэша старый набор пакетов — и ждёт, пока
-контейнер шлюза перейдёт в `healthy` (штатный `HEALTHCHECK` образа). Ручной
-запуск тоже поддерживается:
-
-```bash
-cp .env.example .env    # обязательно: POSTGRES_PASSWORD, FOA_ADMIN_TOKEN, ...
-docker compose up -d --build
-docker compose --profile discovery up -d   # + worker инвентаризации (трафик не маршрутизируется)
-```
-
----
-
-## Варианты запуска сервера и API
-
-Шлюз поддерживает несколько сценариев запуска и подключения в зависимости от вашей инфраструктуры:
-
-### 1. Запуск в Docker Compose (Production / Рекомендуемый)
-
-Полноценный отказоустойчивый стек: 2 реплики шлюза, Nginx (HTTP + TLS с поддержкой SAN), PostgreSQL, Redis и Prometheus.
-
-#### Вариант 1.1: Быстрый запуск одной командой через скрипт
-Скрипт `docker-run.sh` автоматически проверит и создаст `.env` файл (если он отсутствует), выпустит актуальный TLS-сертификат с Subject Alternative Names (SAN) для вашего сервера и поднимет все контейнеры:
 ```bash
 chmod +x docker-run.sh
 ./docker-run.sh
 ```
 
-#### Вариант 1.2: Ручной запуск через Docker Compose
-```bash
-# Подготовка окружения
-cp .env.example .env
+Скрипт `docker-run.sh`:
+1. Создаст `.env` из `.env.example`, если его нет.
+2. Проверит TLS-сертификат в `deploy/tls/` и перевыпустит его (с SAN для
+   `147.45.125.8` и всех сетевых интерфейсов хоста), если сертификата нет или в
+   нём нет нужного IP.
+3. Удалит прежние образы `free-ollama-api-gateway` и пересоберёт стек
+   (`docker compose build --no-cache`).
+4. Поднимет сервисы (`docker compose up -d`) и выведет `docker compose ps`.
 
-# Сборка и запуск в фоновом режиме
+Эквивалент вручную:
+
+```bash
+cp .env.example .env    # заполните FOA_ADMIN_TOKEN, FOA_AUDITOR_TOKEN, POSTGRES_PASSWORD
 docker compose build --no-cache
 docker compose up -d
-
-# Просмотр статуса контейнеров
-docker compose ps
-
-# Просмотр логов
 docker compose logs -f gateway-a
-
-# Остановка всех сервисов
 docker compose down
 ```
 
----
+### 2. Прямой запуск без Docker (Node.js ≥ 18)
 
-### 2. Прямой запуск без Docker (Node.js / Разработка)
-
-Для запуска напрямую на хост-машине требуется Node.js ≥ 18:
 ```bash
-# Установка зависимостей
-npm install
-
-# Компиляция TypeScript
-npm run build
-
-# Запуск шлюза
-npm start
-```
-Шлюз и веб-панель управления станут доступны по адресу: **`http://localhost:3000`**.
-
-Для разработки с автоматической перезагрузкой:
-```bash
-npm run dev
+npm install        # зависимости из package.json (express, cors)
+npm run build      # esbuild → dist/server.cjs
+npm start          # node dist/server.cjs → http://localhost:3000
 ```
 
+Для разработки с горячей перезагрузкой:
+
+```bash
+npm run dev        # tsx server.ts
+```
+
+### 3. Что доступно после запуска
+
+| Адрес | Назначение |
+|---|---|
+| `GET /` , `/panel` | веб-панель администратора (React + Chart.js, см. [далее](#веб-панель-администратора)) |
+| `GET /healthz` | процесс жив: `{"status":"ok","version":"1.0.0"}` |
+| `GET /readyz` | готовность обслуживать: `{"status","routable_nodes","version"}`; `503`, если маршрутизируемых узлов 0 |
+| `GET /metrics` | выгрузка Prometheus (см. [Наблюдаемость](#наблюдаемость)) |
+| `GET /api/endpoints` | публичный список вариантов подключения (HTTPS + запасной HTTP) |
+| `GET /api/tags` | агрегатный список моделей маршрутизируемых узлов |
+
 ---
 
-### 3. Таблица портов и сетевых интерфейсов
+## Варианты запуска сервера и подключения
 
-| Порт | Протокол | Сервис / Назначение |
+### Таблица портов и сетевых интерфейсов
+
+| Порт | Протокол | Сервис / назначение |
 |---|---|---|
-| **3000** | HTTP | Напрямой доступ к шлюзу FOA Gateway (Web UI + REST API) |
+| **3000** | HTTP | Прямой доступ к шлюзу FOA (веб-панель + REST API) |
 | **8080** | HTTP | Nginx Ingress балансировщик (чистый HTTP без шифрования) |
-| **8443** | HTTPS | Nginx Ingress балансировщик с TLS-шифрованием (HTTP/2) |
+| **8443** | HTTPS | Nginx Ingress балансировщик с TLS-шифрованием |
 | **9090** | HTTP | Метрики Prometheus (внутренняя сеть Docker) |
 
----
+Порты ingress-балансировщика настраиваются переменными `FOA_HTTP_PORT` и
+`FOA_HTTPS_PORT` (по умолчанию 8080 и 8443).
 
-### 4. Варианты выполнения запросов и работы с сертификатами
+### Варианты выполнения запросов и работы с сертификатами
+
+#### Способ 0: запросы по обычному HTTP (без SSL) — если программа ругается на сертификат
+Шлюз принимает трафик не только по HTTPS, но и по обычному HTTP через тот же Nginx
+балансировщик (порт 8080). Если ваша программа выдаёт ошибку сертификата при обращении
+к `https://147.45.125.8:8443` (например, `DEPTH_ZERO_SELF_SIGNED_CERT`), используйте
+`http://147.45.125.8:8080` — те же эндпоинты, тот же API-ключ, но без TLS:
+
+```bash
+export FREE_API_KEY="foa_live_xxxxxxxxxxxxxxxxxxxxxxxx"
+
+curl -X POST http://147.45.125.8:8080/api/chat \
+  -H "Authorization: Bearer $FREE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3",
+    "messages": [{"role": "user", "content": "Привет!"}]
+  }'
+```
+
+Это рекомендуемый способ для клиентов, которые не дают доверять самоподписанному
+сертификату (строгие SDK, Node.js `fetch`, мобильные приложения). Для OpenAI-совместимого
+контракта базовый URL будет `http://147.45.125.8:8080/v1`.
 
 #### Способ А: HTTPS с самоподписанным сертификатом (самый быстрый)
 Используйте флаг `-k` (или `--insecure`) в `curl`, чтобы игнорировать проверку цепочки доверия самоподписанного сертификата:
@@ -222,7 +196,7 @@ curl --cacert deploy/tls/fullchain.pem -X POST https://147.45.125.8:8443/api/cha
   }'
 ```
 
-#### Способ В: Установка сертификата в системное хранилище ОС
+#### Способ В: установка сертификата в системное хранилище ОС
 Чтобы утилита `curl`, браузеры и SDK доверяли сертификату по умолчанию без указания дополнительных флагов:
 
 **В Ubuntu / Debian:**
@@ -238,33 +212,25 @@ curl -X POST https://147.45.125.8:8443/api/chat \
   -d '{"model": "llama3", "messages": [{"role": "user", "content": "Привет!"}]}'
 ```
 
-#### Способ Г: Запросы по обычному HTTP (без SSL)
-Если шифрование не требуется (локальная сеть, изолированный контур, разработка):
-- **Напрямую к порту шлюза (3000):**
-  ```bash
-  curl -X POST http://147.45.125.8:3000/api/chat \
-    -H "Authorization: Bearer $FREE_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{"model": "llama3", "messages": [{"role": "user", "content": "Привет!"}]}'
-  ```
-- **Через Nginx балансировщик (8080):**
-  ```bash
-  curl -X POST http://147.45.125.8:8080/api/chat \
-    -H "Authorization: Bearer $FREE_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{"model": "llama3", "messages": [{"role": "user", "content": "Привет!"}]}'
-  ```
-
----
-
-### 5. Автоматическое обновление репозитория
-
-Для быстрой отправки изменений на GitHub доступен скрипт `update.sh`:
+**В Node.js (при разработке внешних ботов / бэкендов):**
 ```bash
-chmod +x update.sh
-./update.sh "Описание внесенных изменений"
+export NODE_EXTRA_CA_CERTS="/path/to/deploy/tls/fullchain.pem"
 ```
-Скрипт автоматически добавит файлы, создаст коммит и выполнит пуш в ветку `main`. Файлы секретов (`.env`) и приватные данные автоматически игнорируются `.gitignore`.
+
+**В Python (OpenAI SDK / LangChain / Requests):**
+```bash
+export REQUESTS_CA_BUNDLE="/path/to/deploy/tls/fullchain.pem"
+export SSL_CERT_FILE="/path/to/deploy/tls/fullchain.pem"
+```
+
+#### Способ Г: запросы напрямую к порту шлюза (3000)
+Если шифрование не требуется (локальная сеть, изолированный контур, разработка):
+```bash
+curl -X POST http://147.45.125.8:3000/api/chat \
+  -H "Authorization: Bearer $FREE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "llama3", "messages": [{"role": "user", "content": "Привет!"}]}'
+```
 
 ---
 
@@ -282,9 +248,7 @@ curl: (60) SSL: certificate subject name 'localhost' does not match target hostn
 
 Если сертификат был сгенерирован со стандартным `CN=localhost` без расширения SAN, клиент не может подтвердить принадлежность сертификата адресу `147.45.125.8` и прерывает соединение.
 
----
-
-### 2. Быстрое устранение: Автоматический скрипт перевыпуска
+### 2. Быстрое устранение: автоматический скрипт перевыпуска
 
 В проект встроен скрипт `deploy/tls/generate-cert.sh`, который автоматически определяет все внешние и локальные IP-адреса хоста и выпускает сертификат с корректными SAN:
 
@@ -303,8 +267,6 @@ docker compose restart nginx
    - `IP.1 = 127.0.0.1`
    - `IP.2 = 147.45.125.8` (и все сетевые интерфейсы хоста).
 3. Генерирует закрытый ключ `deploy/tls/privkey.pem` и сертификат `deploy/tls/fullchain.pem` сроком действия на 365 дней.
-
----
 
 ### 3. Ручная генерация через OpenSSL (если нужно настроить вручную)
 
@@ -350,47 +312,9 @@ docker compose restart nginx
        DNS:localhost, DNS:api.ollama-gateway.local, IP Address:127.0.0.1, IP Address:147.45.125.8
    ```
 
----
-
 ### 4. Настройка доверия клиентов к самоподписанному сертификату
 
-После генерации сертификата с SAN ошибка `subject name mismatch` устранена. Теперь клиент должен доверять самому центру сертификации (так как сертификат самоподписанный):
-
-#### Способ 1: Использование флага `--cacert` (рекомендуется для скриптов)
-Укажите сгенерированный файл `fullchain.pem` в качестве доверенного CA:
-```bash
-curl --cacert deploy/tls/fullchain.pem -X POST https://147.45.125.8:8443/api/chat \
-  -H "Authorization: Bearer $FREE_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "llama3", "messages": [{"role": "user", "content": "Привет!"}]}'
-```
-
-#### Способ 2: Использование флага `-k` / `--insecure` (для быстрой отладки)
-```bash
-curl -k -X POST https://147.45.125.8:8443/api/chat \
-  -H "Authorization: Bearer $FREE_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "llama3", "messages": [{"role": "user", "content": "Привет!"}]}'
-```
-
-#### Способ 3: Установка сертификата в системное хранилище ОС
-**В Linux (Ubuntu / Debian):**
-```bash
-sudo cp deploy/tls/fullchain.pem /usr/local/share/ca-certificates/foa-gateway.crt
-sudo update-ca-certificates
-```
-После этого `curl`, Python `requests` и браузеры на сервере будут доверять шлюзу напрямую без дополнительных ключей.
-
-**В Node.js (при разработке внешних ботов / бэкендов):**
-```bash
-export NODE_EXTRA_CA_CERTS="/path/to/deploy/tls/fullchain.pem"
-```
-
-**В Python (OpenAI SDK / LangChain / Requests):**
-```bash
-export REQUESTS_CA_BUNDLE="/path/to/deploy/tls/fullchain.pem"
-export SSL_CERT_FILE="/path/to/deploy/tls/fullchain.pem"
-```
+После генерации сертификата с SAN ошибка `subject name mismatch` устранена. Теперь клиент должен доверять самому центру сертификации (так как сертификат самоподписанный) — см. [способы 0/А/Б/В выше](#варианты-выполнения-запросов-и-работы-с-сертификатами).
 
 ---
 
@@ -415,631 +339,416 @@ CORS_ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000,http://127.0.0.
 - **Поддержка cookies и заголовков авторизации**: `credentials: true`.
 - **Автоматическая обработка preflight-запросов**: HTTP `OPTIONS` с кодом 204.
 - **Разрешенные методы**: `GET, POST, PUT, DELETE, OPTIONS, PATCH`.
-- **Разрешенные заголовки**: `Content-Type, Authorization, X-Requested-With, Accept, Origin, X-Gateway-Key, Cache-Control`.
+- **Разрешенные заголовки**: `Content-Type, Authorization, X-Requested-With, Accept, Origin, X-Gateway-Key, Cache-Control, baggage, sentry-trace`.
 - **Экспортируемые заголовки**: `Content-Length, Content-Range, Retry-After, X-Gateway-Node`.
 - Запросы от не-браузерных клиентов (`curl`, серверные демоны, Python/Go скрипты без заголовка `Origin`) всегда пропускаются без блокировки.
 
 ---
 
-## Пользовательский API
+## Пользовательский API (Ollama-совместимый, `/api/*`)
 
-Ollama-совместимый контракт (§9.3). Базовый путь — корень (`/api/*`); при размещении
-за общим ingress путь задаётся `server.api_prefix` (например `/v1/ollama`), §9.1.
-Все эндпоинты требуют `Authorization: Bearer <ключ>` (§9.2) — без ключа `401`, при
-валидном ключе узел подбирает балансировщик.
-
-```bash
-KEY=$(curl -s -X POST http://127.0.0.1:8080/admin/keys \
-  -H "Authorization: Bearer $FOA_ADMIN_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"label":"demo","scopes":["ollama:generate"],"tokens_per_day":20000}' | jq -r .api_key)
-
-curl -s -X POST http://127.0.0.1:8080/api/generate \
-  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"llama3.1","prompt":"Привет","stream":false}'
-```
-
-Ключ выдаётся с набором скоупов (§9.2); проверка — `require_scope` /
-`generation_slot` в `foa/api/deps.py`:
-
-| Скоуп | Даёт право |
-|---|---|
-| *(любой валидный ключ)* | `GET /api/version` — только аутентификация |
-| `ollama:read` | `tags`, `show`, `ps` |
-| `ollama:generate` | `generate`, `chat`, `embed` |
-| `ollama:embed` | `embeddings` (допускается и `ollama:generate`) |
-| `admin:read` / `admin:write` | админ-контур только для чтения / с изменением (§9.6) |
-| `node:self_service` | владельцу — его узлы (согласие, статус, отзыв) |
-
+Ollama-совместимый контракт (§9.3). Базовый путь — корень (`/api/*`).
 
 | Метод / путь | Назначение |
 |---|---|
-| `GET /api/version` | версия шлюза (`gateway-<version>`) и поддерживаемый upstream-контракт, §9.3.1 |
+| `GET /api/version` | версия upstream-контракта Ollama: `{"version":"0.1.32"}` |
+| `GET /api/endpoints` | публичный список вариантов подключения шлюза (HTTPS + запасной HTTP без SSL); аутентификации не требует |
 | `GET /api/tags` | **агрегатный** список моделей по всем маршрутизируемым узлам (§9.3.2) |
-| `POST /api/show` | метаданные модели (маршрутизируется на узел, где модель есть) |
-| `GET /api/ps` | смоделированные модели с всех маршрутизируемых узлов, дедуп по имени |
-| `POST /api/generate` | генерация, `stream: true` → NDJSON |
+| `POST /api/generate` | генерация по промпту, `stream: true` → NDJSON |
 | `POST /api/chat` | чат, `stream: true` → NDJSON |
-| `POST /api/embeddings`, `POST /api/embed` | эмбеддинги |
+| `POST /api/embed` | эмбеддинги (демо-ответ: 128-мерные случайные векторы) |
 
+**Аутентификация (§9.2).** Все эндпоинты, кроме `GET /api/endpoints`, требуют
+заголовок `Authorization: Bearer <ключ>` с действующим ключом `foa_live_…`:
+без ключа, с отозванным, просроченным или неизвестным ключом — `401`.
+Ключ выдаёт администратор:
 
-**Запрещённые операции (§9.4).** `pull`, `push`, `copy`, `delete` управляются
-владельцем/администратором, а не пользователем, поэтому возвращают явный `403`
-(`FORBIDDEN_USER_OPERATIONS` в `foa/domain/enums.py`), а не `404` — чтобы отказ
-был объясним. Остальные неизвестные пути под `/api/*` → `404 MODEL_NOT_FOUND`.
+```bash
+export FOA_ADMIN_TOKEN="foa-admin-secret"
 
-**Заголовки (§8.5).** Клиент может передать `X-FOA-Request-ID`; шлюз отвечает
-`X-FOA-Request-ID`, `X-FOA-RateLimit-Limit/Remaining/Reset`, а при `429` —
-`Retry-After`. Узлам **не** передаются оригинальный `Authorization` клиента, его IP
-(взамен — `X-FOA-Client-Hash: sha256:…`, §8.5.3) и любые `X-FOA-*`-заголовки,
-выдающие топологию.
+KEY=$(curl -s -X POST http://127.0.0.1:3000/admin/keys \
+  -H "Authorization: Bearer $FOA_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"label":"demo","scopes":["ollama:read","ollama:generate"],"rate_limit_per_minute":60}' \
+  | jq -r .api_key)
 
-**Ошибки (§9.5).** Совместимый с Ollama формат `{"error": "…"}` дополнен
-`code`, `request_id`, `retry_after`, `details`. Коды → HTTP-статусы заданы
-в `ERROR_HTTP_STATUS` (`foa/domain/enums.py`): `UNAUTHORIZED` 401, `CONSENT_REQUIRED`
-403, `RATE_LIMITED` 429, `QUOTA_EXCEEDED` 429, `MODEL_NOT_FOUND` 404,
-`NO_HEALTHY_NODES` 503, ошибки upstream → 502/504.
+curl -s -X POST http://127.0.0.1:3000/api/chat \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"llama3:8b","messages":[{"role":"user","content":"Привет"}],"stream":false}'
+```
 
-**Потоки (§8.4).** NDJSON проксируется без буферизации и со `identity`-кодированием;
-обрыв клиента отменяет запрос к узлу (`test_stream_aborted_when_client_disconnects`).
+> После рестарта шлюза реестр ключей пуст (состояние в памяти) — создайте ключ
+> заново, как показано выше.
 
-**Повторы (§7.6).** Повтор возможен только если узел **не получил** запрос
-(`kind == "connect"`). После начала обработки повтор запрещён: для генерации он
-не делается вовсе (`retry_after_upstream_started: false`), потоковые ответы
-не повторяются после первого байта — ошибка отдаётся в поток как
-`{"error":…,"code":"UPSTREAM_ERROR"}`. `X-FOA-Request-ID` сохраняется на всех
-попытках.
+**Маршрутизация.** Запрос выбирает узел с поддержкой запрошенной модели
+(гибкое сопоставление тегов: `llama3` соответствует `llama3:8b`, `llama3:latest` и
+т.п.) среди маршрутизируемых узлов с наименьшим числом активных соединений
+(least connections). Если модель не поддерживает ни один узел — `503` со списком
+доступных моделей.
+
+**Проксирование и fallback.** Шлюз пытается выполнить реальный запрос к выбранному
+узлу (`<endpoint>/api/generate|/api/chat`, таймаут 4 с). Если узел недостижим или
+превысил таймаут, шлюз отвечает заглушкой-демо, явно помечая её как ответ шлюза
+(`[Ответ шлюза FOA через узел …]`) и сохраняя NDJSON-формат стрима. Узлы,
+засеянные по умолчанию, используют тестовые диапазоны RFC 5737
+(`198.51.100.x`, `203.0.113.x`, `192.0.2.x`) — они недостижимы, поэтому ответы
+всегда демонстрационные. Чтобы получить реальные ответы, зарегистрируйте узел с
+настоящим адресом через `POST /admin/nodes` и подтвердите его.
+
+> **Скоупы ключей пока не проверяются** (§9.2): достаточно любого действующего
+> ключа — разделение прав на `ollama:read` / `ollama:generate` / `ollama:embed`
+> зафиксировано только в реестре ключей (см.
+> [Ограничения](#ограничения-и-что-не-реализовано)).
+
+**Потоки.** При `stream: true` ответ отдаётся как NDJSON без буферизации.
 
 ---
 
 ## OpenAI-совместимый API (`/v1/*`)
 
-Второй контракт поверх того же Ollama API (§18 п.1: «OpenAI-совместимый API как
-второй контракт»). Это **не** отдельная маршрутизация и не обходной путь: запрос
-конвертируется в телеграммы `/api/*`, поэтому к нему применяются те же скоупы,
-лимиты, бюджеты, повторная дисциплина и, главное, consent gate — узел без
-активного согласия не получит запрос и через `/v1/*` (проверено
-`test_openai_respects_consent_gate`).
+Второй контракт поверх того же пула узлов (§18 п.1): для клиентов, использующих
+SDK OpenAI / LangChain / Open WebUI.
 
-```bash
-curl -s https://gw.example.com/v1/chat/completions \
-  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"llama3.1","messages":[{"role":"user","content":"Привет"}],"stream":true}'
-```
-
-| Эндпоинт | Отображается на | Требует скоуп |
-|---|---|---|
-| `GET /v1/models` | `GET /api/tags` (агрегат, без адресов узлов) | `ollama:read` |
-| `GET /v1/models/{id}` | тот же агрегат | `ollama:read` |
-| `POST /v1/chat/completions` | `POST /api/chat` | `ollama:generate` |
-| `POST /v1/completions` | `POST /api/generate` | `ollama:generate` |
-| `POST /v1/embeddings` | `POST /api/embed` | `ollama:embed` или `ollama:generate` |
-
-Отключается одной строкой: `server.openai_api_enabled: false`
-(`FOA_SERVER__OPENAI_API_ENABLED=false`) — Ollama API при этом не затрагивается.
-
-**Формат ошибок** выбирается по пути запроса: `/v1/*` отвечаются конвертом
-OpenAI (`{"error": {"message","type","param","code"}}`, где `type` —
-`authentication_error`, `permission_denied`, `rate_limit_error`,
-`invalid_request_error`, `api_error`), а `/api/*` и `/admin/*` сохраняют
-совместимый с Ollama формат §9.5 (`error`, `code`, `request_id`). Оба формата
-несут один и тот же HTTP-статус, `Retry-After` и `X-FOA-Request-ID`
-(проверено `test_ollama_contract_error_format_unchanged`).
-
-**Потоки:** Ollama NDJSON → SSE `chat.completion.chunk` без буферизации:
-первый чанк с `delta.role`, дельты контента, финальный чанк с `finish_reason`,
-`data: [DONE]`. `stream_options.include_usage: true` добавляет отдельный
-финальный чанк с пустыми `choices` и `usage`. Обрыв upstream после первого
-байта (§7.6 — повтор уже невозможен) отдаётся объектом ошибки внутри потока,
-а не молча оборванным SSE.
-
-**Маппинг параметров:** `max_tokens`/`max_completion_tokens` → `options.num_predict`,
-`temperature` → `temperature`, `top_p` → `top_p`, `stop` → `stop`,
-`presence_penalty`/`frequency_penalty` → одноимённые, `seed` → `seed`,
-`role: developer` → `role: system`, `response_format: json_object` →
-`format: "json"`, `response_format: json_schema` → `format: <schema>`,
-`tools` → `tools` (Ollama-формат), мультимодальные `image_url` c `data:` URI →
-`images`. Поле `user` не пересылается: узлу не передаётся идентификатор клиента
-(§8.5.3), как и в Ollama-контракте.
-
-**Что честно не поддерживается** и отклоняется с `unsupported parameter(s)`
-(§17.7 — молчаливое игнорирование хуже отказа): `n>1`, `logprobs`, `top_logprobs`,
-`encoding_format: base64`, неизвестные `response_format.type`. Неизвестные поля
-контракта (`store`, `metadata`, `service_tier`) отбрасываются: payload для узла
-собирается явным списком, поэтому произвольный параметр на узел не уходит
-(§12.4.5). Внешние `http(s)`-ссылки в `image_url` не пересылаются — их скачивал
-бы узел, что было бы SSRF из чужого процесса (§12.5.1).
-
----
-
-## Владелец узла: согласие за 5 минут
-
-CLI `foa-owner` (§5, §9.6.2) закрывает владельческий self-service: ключи, документ
-согласия, три способа подтверждения владения, отзыв и удаление данных.
-
-```bash
-export FOA_GATEWAY_URL=https://gw.example.com
-export FOA_OWNER_TOKEN=...        # выдал администратор; скоуп node:self_service
-```
-
-### Способ 1 — `http_well_known` (файл на узле, §5.3.1)
-
-```bash
-# 1. регистрация: шлюз выдаёт node_id + одноразовый challenge
-foa-owner register --endpoint https://ollama.example.com:11434 --models llama3.1,qwen2.5
-
-# 2. отдать документ согласия. Быстрая проверка локальным сервером CLI:
-foa-owner serve-consent --node-id node_01J… --challenge … --endpoint https://ollama.example.com:11434
-# ...или сформировать файл и разместить его самому:
-foa-owner consent-file --node-id node_01J… --challenge … --endpoint https://ollama.example.com:11434 \
-  --output consent.json
-# путь публикации: /.well-known/free-ollama/v1/consent.json
-
-# 3. подтвердить владение
-foa-owner verify --node-id node_01J…
-```
-
-Все три шага одним прогоном: `foa-owner publish --endpoint … --models … --serve`.
-
-### Способ 2 — `dns_txt` (§5.3.2)
-
-```bash
-foa-owner dns-record --node-id node_01J… --challenge … --endpoint ollama.example.com
-# → значение TXT для _free-ollama-challenge.example.com
-foa-owner dns-record … --zone-file        # строка для zone file
-foa-owner verify --node-id node_01J…      # шлюз читает TXT через dnspython
-```
-
-IP-адрес вместо домена отклоняется: TXT-подтверждение для него бессмысленно.
-
-### Способ 3 — `signed_token` (Ed25519, §5.3.3)
-
-```bash
-foa-owner keygen                                   # приватный ключ — 0600, в stdout не печатается
-foa-owner public-key                               # этот ключ передаёт администратору
-foa-owner token --node-id node_01J… --owner-id acme --models llama3.1 --output consent.jwt
-foa-owner verify --node-id node_01J… --method signed_token --token-file consent.jwt
-```
-
-Администратор один раз публикует публичный ключ владельца:
-`PUT /admin/owners/{owner_ref}/public-key`.
-
-### Остальные команды
-
-`status` (`/admin/status` или узел), `revoke` (§5.5), `delete --yes` (§12.7.7 —
-удаление узла и его данных), `render-page` (HTML-страница с `consent.json`, содержимое
-экранируется). Секреты — только из `FOA_OWNER_TOKEN`/`FOA_ADMIN_TOKEN` или флагов
-`--owner-token`/`--admin-token`; публичный ключ (`--admin-token`) доступен read-командам,
-чужие узлы владельцу не отдаются (`403`).
-
----
-
-## Администратор: реестр, ключи, отзыв
-
-29 эндпоинтов `/admin/*` (§9.6), три отдельных токена и явный fail-closed:
-**пустой `auth.admin_token` полностью закрывает контур** — ни одна операция
-не доступна.
-
-```bash
-curl -s -H "Authorization: Bearer $FOA_ADMIN_TOKEN" http://127.0.0.1:8080/admin/status | jq
-```
-
-| Группа | Эндпоинты |
+| Эндпоинт | Назначение |
 |---|---|
-| Узлы | `GET/POST /admin/nodes`, `GET/PATCH/DELETE /admin/nodes/{id}`, `POST …/verify`, `POST …/consent-document`, `POST …/revoke`, `POST …/health-check` |
-| Блэклист | `POST/… /admin/nodes/{id}/blacklist`, `…/unblacklist`, `GET /admin/blacklist` |
-| Согласия | `GET/POST /admin/consents`, `GET /admin/consents/{id}` (история — §12.7.4) |
-| Ключи | `GET/POST /admin/keys`, `POST /admin/keys/{id}/revoke`, `…/rotate` (grace-период §12.4.1) |
-| Discovery | `GET /admin/candidates`, `DELETE /admin/candidates/{id}`, `POST …/enroll` (только с ведома владельца), `POST /admin/discovery/run` |
-| Прочее | `PUT /admin/owners/{id}/public-key`, `GET /admin/audit`, `GET /admin/config`, `POST /admin/config/reload`, `POST /admin/abuse-reports` |
+| `GET /v1/models` | список моделей маршрутизируемых узлов в формате OpenAI |
+| `POST /v1/chat/completions` | чат-комплишены; `stream: true` → SSE `chat.completion.chunk` с `data: [DONE]` |
 
-Права разведены по скоупам: `admin:read` (аудитор) / `admin:write` (администратор) /
-`node:self_service` (владелец, только свои узлы) — §2.2, §17.9. `POST /admin/config/reload`
-перезагружает нечувствительные параметры без рестарта (§11.5); секреты в ответах
-и в журнале маскируются (`_redacted`).
+```bash
+curl -s https://147.45.125.8:8443/v1/chat/completions \
+  -H "Authorization: Bearer $FREE_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"llama3:8b","messages":[{"role":"user","content":"Привет"}],"stream":true}'
+```
+
+> В текущей версии `/v1/*` отдаёт те же демо-ответы, что и `/api/*` (см. выше):
+> реальная конвертация Ollama ↔ OpenAI и проксирование на узел находятся в
+> стадии прототипа. Формат ошибок — конверт OpenAI
+> (`{"error": {"message","type"}}`), код 503 при отсутствии модели в пуле.
+
+---
+
+## Веб-панель администратора
+
+SPA в `public/index.html` (React + Recharts + Chart.js + D3 + карта Leaflet),
+раздаётся по адресам `/`, `/panel`, `/panel/*`. Вход — по токену администратора
+или аудитора (форма логина, значение по умолчанию `foa-admin-secret`, хранится в
+`sessionStorage`).
+
+Разделы панели (`data-page`):
+
+| Раздел | Назначение |
+|---|---|
+| `dashboard` | сводный статус: узлы по состояниям, маршрутизируемый пул, RPM |
+| `nodes` | реестр узлов: добавление, challenge/верификация (auto/manual), блэклист, отзыв, удаление, метки |
+| `monitor` | мониторинг: гистограмма распределения задержек по бакетам (`< 50ms` … `> 1500ms`), переключение «количество / проценты», детализация по узлам; интерактивная легенда (клик скрывает датасет, кнопка «Все/Ничего»), средняя задержка по выбранным узлам |
+| `discovery` | источники, запуск цикла discovery, список кандидатов, enroll/verify, авто-верификация |
+| `consents` | реестр согласий с историей |
+| `blacklist` | чёрный список узлов |
+| `keys` | API-ключи: создание, отзыв, ротация |
+| `audit` | журнал аудита |
+| `config` | действующая конфигурация |
+| `apidocs` | документация по эндпоинтам шлюза |
+| `help` | руководство и FAQ: подключение, заголовок `Authorization: Bearer …`, готовые примеры (cURL, Python / OpenAI SDK / LangChain) для `/api/*` и `/v1/chat/completions`, разбор ошибок 401 / 503 / 404 / 429 / 504 и CORS |
+
+> `public/panel.html` — устаревшая версия панели из предыдущей итерации проекта.
+> Сервером она не раздаётся и оставлена только для истории; актуальная панель —
+> `public/index.html`.
+
+---
+
+## Административный API (`/admin/*`)
+
+Все эндпоинты требуют `Authorization: Bearer <FOA_ADMIN_TOKEN>` (или
+`?token=…`). Токены аудитора (`FOA_AUDITOR_TOKEN`) и администратора
+(`FOA_ADMIN_TOKEN`) равнозначны — разделения прав по скоупам пока нет.
+Токен должен **точно совпадать** со значением из `.env`; при несовпадении —
+`401`. Новые значения применяются без рестарта через
+`POST /admin/config/reload` (он перечитывает `.env`).
+
+> Обязательно задайте собственные `FOA_ADMIN_TOKEN` и `FOA_AUDITOR_TOKEN` в
+> `.env` перед публикацией шлюза: значения по умолчанию
+> (`foa-admin-secret` / `foa-auditor-secret`) широко известны.
+
+### Узлы
+
+| Метод / путь | Назначение |
+|---|---|
+| `GET /admin/nodes?detailed=true` | список узлов (+ распределение задержек при `detailed`) |
+| `POST /admin/nodes` | регистрация узла (`endpoint` обязательно) → статус `pending_consent`, выдаёт `challenge` |
+| `GET /admin/nodes/:id` | карточка узла |
+| `GET /admin/nodes/:id/challenge` | данные challenge: well-known JSON + DNS TXT |
+| `POST /admin/nodes/:id/challenge` | перевыпуск challenge |
+| `POST /admin/nodes/:id/verify` | подтверждение владения (`mode: auto\|manual`): пробует прочитать `/api/tags` узла, переводит в `verified`/`routable` |
+| `POST /admin/nodes/bulk-verify` | групповая верификация (`node_ids`, `mode`) |
+| `POST /admin/nodes/:id/health-check` | проверка доступности узла |
+| `POST /admin/nodes/:id/revoke` | отзыв согласия → узел исключается из маршрутизации |
+| `POST /admin/nodes/:id/blacklist` | блокировка узла |
+| `POST /admin/nodes/:id/unblacklist` | снятие блокировки |
+| `DELETE /admin/nodes/:id` | удаление узла |
+| `POST /admin/nodes/:id/labels` | управление метками |
+| `GET /admin/nodes/:id/logs` | журнал событий узла |
+| `GET /admin/nodes/metrics` | метрики по узлам |
+| `GET /admin/nodes/latency-distribution` | распределение задержек по всем маршрутизируемым узлам |
+| `GET /admin/nodes/:id/latency-distribution` | то же по одному узлу |
+
+### Согласия, блэклист, ключи, аудит, конфигурация
+
+| Метод / путь | Назначение |
+|---|---|
+| `GET /admin/consents`, `GET /admin/consents/:id` | реестр согласий (с историей событий) |
+| `GET /admin/blacklist` | чёрный список |
+| `GET /admin/keys` | список выпущенных ключей `foa_live_…` |
+| `POST /admin/keys` | выпуск ключа (`label`, `scopes`, `rate_limit_per_minute`, `ttl_seconds`); полный ключ показывается один раз |
+| `POST /admin/keys/:id/revoke` | отзыв ключа |
+| `POST /admin/keys/:id/rotate` | ротация ключа (новый `foa_live_…`) |
+| `GET /admin/audit?event=&subject_id=&limit=` | журнал аудита с фильтрами |
+| `GET /admin/config` | действующая конфигурация (см. [Конфигурация](#конфигурация)) |
+| `POST /admin/config/reload` | перечитать `.env` и зафиксировать событие в аудите |
+| `POST /admin/config/toggle-auto-verify` | переключить авто-верификацию кандидатов |
+| `POST /admin/demo/clear` | очистить все данные (узлы, кандидаты, согласия, блэклист) |
+
+Пример:
+
+```bash
+export FOA_ADMIN_TOKEN="foa-admin-secret"
+
+# Статус шлюза
+curl -s -H "Authorization: Bearer $FOA_ADMIN_TOKEN" http://127.0.0.1:3000/admin/status | jq
+
+# Выпуск ключа
+curl -s -X POST http://127.0.0.1:3000/admin/keys \
+  -H "Authorization: Bearer $FOA_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"label":"demo","scopes":["ollama:read","ollama:generate"],"rate_limit_per_minute":60}' | jq
+```
+
+Прочие неизвестные пути под `/admin/*` → `501 {"error":"Not yet migrated in FOA Node.js gateway"}`.
 
 ---
 
 ## Discovery (§4)
 
-Единственное назначение модуля — **инвентаризация**, а не поиск бесплатных серверов.
+Модуль discovery собирает **кандидатов** — потенциальные узлы Ollama — из внешних
+платформ. Назначение модуля — инвентаризация, а не поиск бесплатных серверов:
+кандидаты никогда не получают пользовательский трафик (флаг `routable: false`,
+§4.4.4) и становятся узлами только после регистрации и подтверждения владения.
 
-```yaml
-discovery:
-  enabled: true                 # выключено по умолчанию
-  mode: inventory_only          # inventory_only | disabled
-  active_scanning: deny         # активного сканирования нет ни в одном режиме (§4.4.1)
-  auto_route_candidates: false  # отклоняется валидацией, если попытаться поставить true
-  retain_days: 90               # §4.7 — по истечении кандидат удаляется purge'ем
-  risk_manual_review_threshold: 70
-  sources:
-    censys:
-      enabled: false            # все пять источников выключены по умолчанию
-      api_id: "{env:CENSYS_API_ID}"
-      api_secret: "{env:CENSYS_API_SECRET}"
-      allowed_scopes: ["asn:AS9009", "192.0.2.0/24", "*.example.com"]
-      purpose: inventory
-      cache_ttl_seconds: 86400
-      max_requests_per_minute: 10
-```
+Поддерживаемые источники (опрашиваются только при наличии ключей в `.env`):
 
-Конвейер кандидата (`foa/services/discovery/`):
+| Источник | Переменные окружения | Запрос |
+|---|---|---|
+| Censys | `CENSYS_API_TOKEN` (или `CENSYS_API_ID` + `CENSYS_API_SECRET`) | `services.port: 11434` |
+| Shodan | `SHODAN_API_KEY` | `port:11434` |
+| GreyNoise | `GREYNOISE_API_KEY` | `11434` (GNQL) |
+| ZoomEye | `ZOOMEYE_API_KEY` | `port:11434` |
+| Criminal IP | `CRIMINAL_IP_API_KEY` | `port:11434` |
+| Natlas / Netlas | `NATLAS_API_ENDPOINT` + `NATLAS_API_KEY` (или `NETLAS_*`) | `port:11434` |
 
-1. **Источник** (Censys, GreyNoise, ZoomEye, Natlas, Criminal IP) опрашивается только
-   через публичный API платформы, с троттлингом `max_requests_per_minute` и кэшем
-   `cache_ttl_seconds`. Ключ без `allowed_scopes` не даёт включить источник — запуск
-   завершится `ConfigError` (§4.4.3, FR-D-03).
-2. **Scope-фильтр**: кандидат остаётся, только если попадает в `allowed_scopes`
-   оператора (ASN / CIDR / домен, `foa/domain` — сравнение по всем измерениям,
-   пустой список = запрет). Так исключается «случайный чужой хост из выдачи платформы».
-3. **SSRF-фильтр**: адреса loopback, приватные, link-local и метаданные отбрасываются,
-   как и хосты, которые в них резолвятся.
-4. **Дедупликация** по `(ip, port, protocol)` с сохранением большего `risk_score`
-   и обогащением от GreyNoise/Criminal IP.
-5. **Статус** `candidate` → `requires_manual_review` (при высоком риске) → `enrolled`
-   (только после регистрации владельца и подтверждения владения) / `rejected` /
-   `out_of_scope` / `expired` / `deleted`.
+Эндпоинты:
 
-**Кандидат не получает пользовательский трафик и активные проверки** — это
-инвариант (`ROUTABLE_STATES`, `NON_ROUTABLE_STATES` в `foa/domain/enums.py`), а не
-настройка. `POST /admin/candidates/{id}/enroll` заводит узел в состоянии
-`pending_consent` и отправляет владельцу приглашение с `challenge`; маршрутизируемым
-он станет только после §5.3. Все переходы — в аудите; `GET /admin/candidates` и
-`POST /admin/discovery/run` (запустить цикл вручную) доступны с `admin:read`/`admin:write`.
+| Метод / путь | Назначение |
+|---|---|
+| `GET /admin/discovery/sources` | состояние источников: настроен / не настроен |
+| `POST /admin/discovery/run` | запустить цикл: опросить настроенные источники параллельно, дедуплицировать по `(ip, port, protocol)` (§4.4.2), сложить кандидатов в память |
+| `GET /admin/candidates` | список кандидатов |
+| `GET /admin/candidates/:id/challenge` | challenge для кандидата |
+| `POST /admin/candidates/:id/enroll` | перевести кандидата в узел (`pending_consent`) |
+| `POST /admin/candidates/:id/verify` | подтверждение владения кандидатом |
+| `POST /admin/candidates/auto-verify-all` | авто-верификация всех кандидатов |
+| `DELETE /admin/candidates` | очистить список кандидатов |
+| `DELETE /admin/candidates/:id` | удалить одного кандидата |
+
+Без ключей источников `POST /admin/discovery/run` завершится без ошибок, но и без
+результатов — получите и настройте ключи в `.env`, затем перезапустите шлюз
+(или `POST /admin/config/reload`).
 
 ---
 
 ## Конфигурация
 
-Приоритет источников (§13, §14.2), от меньшего к большему:
+Шлюз читает конфигурацию из `.env` (функция `reloadEnv()` в `server.ts`) —
+YAML-файлы текущей Node.js-версией **не загружаются**; `config.example.yaml`
+используется как справочник целевых параметров §13 и копируется в образ Docker
+для документирования.
 
-1. встроенные безопасные значения по умолчанию;
-2. `config.yaml` (`--config` / `FOA_CONFIG_FILE`) — см. [`config.example.yaml`](config.example.yaml);
-3. совместимые переменные ТЗ §14.2 (`GATEWAY_DB_URL`, `GATEWAY_REDIS_URL`,
-   `GATEWAY_JWT_SECRET`, `GATEWAY_ID`, `CENSYS_API_ID`, …) — они **ниже** `FOA_*`
-   и применяются, только если непустые;
-4. переменные вида `FOA_СЕКЦИЯ__КЛЮЧ` (`FOA_SECURITY__ROUTE_CANDIDATES=true`,
-   вложенно — `FOA_DISCOVERY__SOURCES__CENSYS__ENABLED=true`) — высший приоритет.
+**Переменные, которые реально используются:**
 
-Секреты в файл не пишутся: `{env:VAR}`, `{file:/path}`, `{vault:path}`,
-`{api_key_service}` (`foa/config/secretrefs.py`). Поддерживаются Vault, AWS/GCP/Azure
-Secrets Manager и Kubernetes Secrets (§14.2).
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `PORT` | `3000` | порт HTTP-сервера шлюза |
+| `GATEWAY_ID` | `foa-gw-main-01` | идентификатор инстанса |
+| `FOA_ADMIN_TOKEN` | `foa-admin-secret` | токен администратора для `/admin/*` |
+| `FOA_AUDITOR_TOKEN` | `foa-auditor-secret` | токен аудитора |
+| `FOA_HTTP_PORT` | `8080` | публичный HTTP-порт nginx (для `/api/endpoints`) |
+| `FOA_HTTPS_PORT` | `8443` | публичный HTTPS-порт nginx (для `/api/endpoints`) |
+| `CORS_ALLOWED_ORIGINS` (или `CORS_ORIGIN`) | `*` | список разрешённых origin |
+| Ключи discovery | — | `CENSYS_*`, `SHODAN_API_KEY`, `GREYNOISE_API_KEY`, `ZOOMEYE_API_KEY`, `CRIMINAL_IP_API_KEY`, `NATLAS_*` / `NETLAS_*` |
 
-Безопасный режим по умолчанию (§13): `require_consent: true`,
-`allow_unverified_nodes: false`, `active_scanning: deny`, `route_candidates: false`,
-`store_prompt_bodies: false`, `store_response_bodies: false`, `forward_client_ip: false`,
-60 запросов/мин и 2 одновременных запроса на пользователя, `max_generation_seconds: 300`,
-балансировка `least_connections_with_latency` с запретом повторов.
+**Переменные из `.env.example`, зарезервированные под будущую реализацию**
+(сейчас ни на что не влияют): `FOA_SERVER__*`, `FOA_STORAGE__*`,
+`FOA_SECURITY__CLIENT_HASH_SALT`, `FOA_OBSERVABILITY__LOG_LEVEL`,
+`FOA_OWNER_TOKEN`, `FOA_OWNER_REF`, `GATEWAY_DB_URL`, `GATEWAY_REDIS_URL`,
+`GATEWAY_JWT_SECRET`, `POSTGRES_PASSWORD` (используется только docker-compose для
+контейнера postgres).
 
-**Небезопасный откат невозможен молча** — `Settings.validate()` (`fail-fast`,
-`ConfigError` на старте) отклоняет: `route_candidates: true`,
-`allow_unverified_nodes: true`, `require_consent: false`, `auto_route_candidates: true`,
-неизвестный алгоритм балансировки, источник discovery с включённым `enabled`, но пустым
-`allowed_scopes` (§4.4.3), а также `registry_sync_interval_seconds >
-consent_revocation_apply_seconds` (иначе §5.5 невыполним).
+Рабочие параметры `security`, `limits`, `health`, `circuit_breaker` и
+`discovery` заданы в объекте `currentConfig` в `server.ts` и отдаются через
+`GET /admin/config`. Они соответствуют значениям ТЗ §13 (см.
+[`config.example.yaml`](config.example.yaml)), но **не применяются
+принудительно**: лимиты и circuit breaker описаны конфигом, однако enforcing-логики
+для пользовательского трафика пока нет.
 
 ---
 
 ## Наблюдаемость
 
-Структурированные JSON-логи (`foa/logging`), метрики Prometheus, панель Grafana.
-
-**Ключевые метрики (§11.4):** `gateway_requests_total{route,status,error_code}`,
-`gateway_request_duration_seconds{route,stream}`, `gateway_overhead_seconds`,
-`gateway_upstream_errors_total{node_id,kind}`, `gateway_active_upstream_connections{node_id}`,
-`gateway_pool_wait_seconds`, `gateway_rate_limited_total{scope}`,
-`node_health_status{node_id,state}`, `node_consent_status{node_id,state}`,
-`node_blacklist_total`, `node_latency_ms`, `node_error_rate`, `node_effective_weight`,
-`node_circuit_breaker_state`, `consent_revocation_lag_seconds`,
-`health_checks_total{kind,result}`, `discovery_candidates_total{source,outcome}`,
-`discovery_candidate_queue_size`, `gateway_build_info`.
-
-- Конфиг Prometheus: [`deploy/prometheus.yml`](deploy/prometheus.yml).
-- Дашборд (12 панелей, в т.ч. задержка отзыва согласия с порогом 5 с):
-  импортировать [`deploy/grafana-dashboard.json`](deploy/grafana-dashboard.json).
-- Ingress с TLS, сегментацией `/admin/` и отключённой буферизацией для `/api/`:
-  [`deploy/nginx.conf`](deploy/nginx.conf).
-- `/metrics` наружу не публикуется (§11.4).
-
----
-
-## Масштабирование
-
-Шлюз проксирующий и шлюз с фоновыми циклами — **разные роли**, чтобы 2+ реплики
-не умножали нагрузку на узлы владельцев (§14.1, §6.1). Переключатель —
-`server.run_background_loops`:
-
-| Роль | `run_background_loops` | Что делает |
-|---|---|---|
-| `gateway-a`, `gateway-b` | `false` | только проксирует пользовательский трафик + `_registry_sync_loop()` — перечитывает реестр и согласия из БД каждые `server.registry_sync_interval_seconds` (по умолчанию 2 с) |
-| `health-checker` | `true` | активные liveness/readiness/consent-проверки, единственный владелец циклов |
-| `discovery-worker` | `true` | инвентаризация источников → кандидаты (профиль `discovery`) |
-
-Разделение работает за счёт того, где хранится состояние:
-
-- **в БД** — узлы, согласия и их история, ключи, блэклист, кандидаты, аудит.
-  Общий для всех реплик; именно из него реплики узнают об отзыве;
-- **в памяти процесса** — счётчики нагрузки, EWMA-задержки, sliding-window доли
-  ошибок, состояние circuit breaker, пулы httpx (`foa/services/state.py`).
-  Они локальны по замыслу: балансировка смотрит на собственную наблюдаемую
-  картину реплики, поэтому добавление реплики не требует консенсуса и не создаёт
-  горячих точек.
-
-Требования к горизонтальному масштабированию:
-
-1. **Postgres** (`GATEWAY_DB_URL=postgresql+asyncpg://…`) — при SQLite реплики
-   не могут иметь общее состояние; SQLite годится только для одиночного стенда.
-2. **Redis** (`GATEWAY_REDIS_URL`) — иначе rate-limit, конкурентность и квоты
-   (`foa/services/ratelimit.py`) действуют в масштабе одного процесса, то есть
-   фактические лимиты пользователя растут числом реплик. **Пока не подключён:**
-   redis-клиент нигде не создаётся, так что пункт работает как описание цели —
-   см. [Ограничения](#ограничения-и-что-не-реализовано).
-3. **Отзыв согласия ≤5 с (§5.5, §17.3)** обеспечивается не рестартом, а
-   перечитыванием реестра: `registry_sync_interval_seconds` обязан быть меньше
-   `health.consent_revocation_apply_seconds` — это проверяется на старте.
-   Дополнительно согласие сверяется в трёх точках: при выдаче маршрута, при
-   выборе в балансировщике и в контуре перепроверки здоровья.
-4. **Вывод узла из эксплуатации** — `PATCH /admin/nodes/{id} {"draining": true}`
-   переводит его в `draining`: новые запросы на него не идут, активные
-   завершаются (§6.4). `server.graceful_shutdown_seconds` описывает целевое окно
-   завершения стримов при рестарте реплики (uvicorn `timeout_graceful_shutdown`
-   передаётся аргументом запуска, в коде значения по умолчанию нет).
-5. **Рестарт реплики не роняет маршрутизацию** — состояние узлов перечитывается
-   из БД при старте, а схема (см. [Миграции](#миграции)) общая для всех реплик.
-
----
-
-## Миграции
-
-Схема БД описана в `foa/storage/models.py` (SQLAlchemy 2.0, `Base.metadata`),
-Alembic подключён: `alembic.ini` + `migrations/` с начальной ревизией
-`initial schema`. Способ наведения схемы выбирается параметром
-`storage.migrations`:
-
-| Значение | Поведение |
+| Средство | Где |
 |---|---|
-| `create_all` (по умолчанию) | `init_db()` вызывает `Base.metadata.create_all` — совместимо с §14.1 и локальными стендами |
-| `alembic` | при старте выполняется `alembic upgrade head`, `create_all` не вызывается |
-| `off` | шлюз схему не трогает вообще — наводит оператор отдельным шагом |
+| `GET /metrics` | выгрузка Prometheus: `foa_build_info`, `foa_nodes_routable`, `foa_nodes_blacklisted`, `foa_requests_total` |
+| `GET /admin/status` | сводка по шлюзу: узлы по состояниям, размер пула, кандидаты, security/Discovery-параметры |
+| `GET /admin/metrics/rpm` | история запросов в минуту за последний час (60 бакетов, агрегаты current/peak/avg/total) |
+| Prometheus | [`deploy/prometheus.yml`](deploy/prometheus.yml) — скрейпинг шлюза |
+| Grafana-дашборд | [`deploy/grafana-dashboard.json`](deploy/grafana-dashboard.json) |
+| Nginx ingress | [`deploy/nginx.conf`](deploy/nginx.conf) — TLS, балансировка на 2 реплики |
 
-Команды:
+Структурированный JSON-журнал из ТЗ (§12.5) в текущей версии не реализован —
+шлюз выводит в `stdout` стартовое сообщение и итоговую конфигурацию CORS.
 
-```bash
-.venv/bin/alembic upgrade head                       # через CLI (URL из GATEWAY_DB_URL)
-.venv/bin/alembic check                              # схема == модели? (для CI)
-.venv/bin/foa-gateway --config config.yaml --migrate # upgrade head из конфигурации шлюза и выход
-.venv/bin/foa-gateway --config config.yaml --stamp   # отметить существующую create_all-схему как head
-FOA_MIGRATIONS_ROOT=/app alembic upgrade head        # явный корень, если cwd ≠ корень проекта
-```
+---
 
-**Переход с `create_all` на `alembic` — отдельное явное действие.** В БД, созданной
-`create_all`, таблицы есть, а `alembic_version` нет, поэтому Alembic считает её
-«base» и попытается создать таблицы заново. Шлюз такую ситуация не угадывает:
-`apply_migrations` блокирует upgrade с сообщением, указывающим на `--stamp`
-(проверено `test_legacy_create_all_database_blocks_upgrade_until_stamped`).
-Порядок апгрейда: резервная копия → `--migrate` на копии → сверка → `--stamp`/
-`--migrate` на рабочей БД.
+## Состояние и хранение данных
 
-Новая ревизия после изменения моделей:
-
-```bash
-.venv/bin/alembic revision --autogenerate -m "что изменилось"
-```
-
-`migrations/env.py` передаёт `compare_type=True` и кастомный `render_item` для
-типа `UTCDateTime`, а для SQLite включает `render_as_batch` (полноценного
-`ALTER TABLE` у него нет — таблица пересоздаётся). URL берётся из той же цепочки
-приоритетов §13/§14.2, что и у шлюза: `ALEMBIC_DB_URL` → `GATEWAY_DB_URL` →
-`storage.database_url`.
-
-Для SQLite при подключении включаются `journal_mode=WAL`, `foreign_keys=ON`,
-`busy_timeout=30000` — без них конкурентные записи из фоновых циклов упирались
-бы в блокировки.
-
+- **Хранилище — оперативная память процесса** (`Map` для узлов, согласий,
+  блэклиста, кандидатов, ключей; массив для аудита). Перезапуск процесса
+  сбрасывает состояние к засеянным демо-данным.
+- `POST /admin/demo/clear` очищает узлы, кандидаты, согласия и блэклист
+  (аудит сохраняется).
+- В `docker-compose.yml` подняты `postgres` и `redis`, но код шлюза к ним
+  **не подключается** — сервисы зарезервированы под будущую реализацию
+  персистентного состояния (§14.1) и сейчас бездействуют.
+- Аналогично `gateway-a` и `gateway-b` — две реплики за nginx, но разделяемого
+  состояния между ними нет: каждая хранит свой пул в памяти. Балансировка трафика
+  работает, но консистентность реестра между репликами не поддерживается.
 
 ---
 
 ## Безопасность и этика
 
-Что гарантируется кодом, а не только документом (§12):
+Что есть в текущей версии:
 
-- **Согласие как условие маршрутизации.** Балансировщик физически не видит узлов
-  вне `ROUTABLE_STATES` (`verified|healthy|degraded`); `candidate`,
-  `pending_consent`, `consent_challenge_sent`, `revoked`, `blacklisted`,
-  `quarantined` исключены (§4.4.4, §5, §17.1).
-- **Узлы, отвечающие `401`/`403`, немедленно исключаются и попадают в блэклист**
-  (`upstream_auth_error`) — признак чужого закрытого сервера (§17.2).
-- **Активное сканирование запрещено** (§4.4.1): источники читают только уже
-  опубликованные данные платформ; активные health-проверки шлются исключительно
-  узлам из `ACTIVE_HEALTH_CHECK_STATES`, то есть уже согласившимся.
-- **SSRF и обход приватности**: проверка адресов узлов в `foa/net/security.py`
-  (`classify_ip`, `ip_is_blocked`, `assert_endpoint_resolvable` — резолвится и сама
-  доменная запись), запрет loopback/RFC1918/link-local и адресов облачных метаданных;
-  исключения задаёт только владелец шлюза через `allowed_scopes` включённых источников
-  (`security.allow_loopback_nodes` — для стендов), отказ от редиректов
-  (`follow_redirects=False`), `trust_env=False` для исходящих пулов — переменные
-  прокси окружения не могут перенаправить трафик к узлам.
-- **Инъекции в заголовки и пути** отсекаются на разборе endpoint и при сборке
-  заголовков; пользовательские строки в журналах экранируются.
-- **Промпты и ответы в журнал не пишутся** (§12.2, §12.5, §17.8):
-  `security.store_prompt_bodies/store_response_bodies=false`,
-  `privacy.log_metadata_only=true`, журнал ограничен `MINIMUM_LOG_FIELDS`
-  (минимальный набор §12.5.3), а `log_event()` маскирует значения, похожие на
-  секреты, даже в разрешённых полях.
-- **Ключи пользователей** хранятся как `SHA-256(pepper + key)`, показываются один
-  раз, отзываются и ротируются с grace-периодом (§12.4.1).
-- **Лимиты и бюджеты** — rps на пользователя/модель/глобально, одновременные
-  запросы и стримы, размер промпта и тела, число сообщений, длительность
-  генерации, дневной бюджет токенов, почасовой бюджет узла (§12.4.2–12.4.3, §17.5).
-- **Кандидаты хранятся ≤ `discovery.retain_days` (90)** и удаляются purge'ем;
-  `risk_score ≥ risk_manual_review_threshold` → ручная проверка (§4.7).
-- **Права владельца (§12.7):** отзыв согласия, история согласий, удаление узла и
-  его данных, обезличенный псевдоним клиента вместо IP, уведомления через
-  `POST /admin/abuse-reports` и форму жалобы, обязательная публикация политики
-  допустимого использования.
-- **Аудит** (`/admin/audit`) — все административные операции, смены согласий и
-  выдача ключей.
+- **Согласие как условие маршрутизации.** Узел попадает в пул (`routable: true`)
+  только после `POST /admin/nodes/:id/verify` (или enroll + verify кандидата);
+  кандидаты discovery принципиально `routable: false` (§4.4.4). Отзыв согласия
+  (`POST /admin/nodes/:id/revoke`) исключает узел из маршрутизации.
+- **Блэклист** — ручная блокировка узлов администратором.
+- **Аудит** — регистрации ключевых операций (регистрация/верификация узлов,
+  блокировки, выпуск/отзыв/ротация ключей, перезагрузка конфигурации, очистка
+  данных).
+- **CORS** — настраиваемый whitelist источников.
+- **Этика §19.** Обнаруженные хосты не становятся узлами автоматически; трафик
+  идёт только на явно подтверждённые узлы.
+
+Чего пока нет (критично для любого публичного использования):
+
+- **Скоупы ключей не проверяются** — любой действующий ключ даёт доступ ко всем
+  эндпоинтам `/api/*` и `/v1/*`; разделение `ollama:read` / `ollama:generate` /
+  `ollama:embed` (§9.2) не применяется.
+- **Лимиты, квоты и circuit breaker** описаны в конфиге, но не применяются к
+  трафику; rate-limit на пользовательский трафик не действует.
+- **Секреты в `.env`** — не коммитятся (см. `.gitignore`); `update.sh` использует
+  `git add .`, поэтому проверяйте `git status` перед коммитом.
 
 ---
 
-## Обновления интерфейса и мониторинга
-
-В проект добавлены следующие расширенные возможности для управления и наблюдения за узлами:
-
-1. **Гистограмма распределения задержек API (`API Latency Distribution`)**:
-   - На странице мониторинга добавлен новый гистограммный график, предоставляющий подробную статистику производительности запросов по бакетам задержек (от `< 50ms` до `> 1500ms`).
-   - Поддерживает переключение режимов отображения (абсолютное количество запросов / доля трафика в процентах) и детализацию по конкретным узлам.
-
-2. **Интерактивная легенда и управление графиком задержек**:
-   - Клик по названию любого узла в легенде графика задержек мгновенно скрывает или показывает его датасет.
-   - Кнопка **«Все / Ничего»** позволяет в один клик управлять видимостью всех узлов одновременно.
-   - Динамический бейдж **средней задержки (мс)** в заголовке графика в реальном времени рассчитывает среднее значение по всем выбранным (активным) узлам.
-
-3. **Двойной режим верификации узлов и кандидатов**:
-   - Поддержка как автоматической верификации (`auto` с соглашением домена), так и ручной верификации (`manual`).
-   - Групповая верификация (bulk actions) с обязательным окном подтверждения, суммирующим количество обрабатываемых узлов.
-
-4. **Встроенный раздел «Помощь» и FAQ**:
-   - Инструкции по подключению к единому эндпоинту шлюза.
-   - Описание формата заголовка аутентификации (`Authorization: Bearer <API-ключ>`).
-   - Готовые блоки кода для копирования (cURL, Python / OpenAI SDK / LangChain) для Ollama Native API и OpenAI-совместимых эндпоинтов (`/v1/chat/completions`).
-   - Интерактивный раздел **Часто задаваемых вопросов (FAQ)** в виде аккордеонов с решениями распространенных технических проблем (ошибки 401, 503, 404, 429, таймауты 504 при длинных генерациях, CORS).
-
----
-
-## Тесты и качество
+## Сборка и качество
 
 ```bash
-.venv/bin/pip install -e '.[dev]'          # pytest, ruff, mypy
-.venv/bin/python -m pytest tests/ -q              # 665 тестов
-.venv/bin/python -m pytest tests/ -q -m "not slow" # 659: без нагрузочных §15.2
-.venv/bin/python -m pytest tests/ -q -m security   # проверки §15.3
-.venv/bin/python -m pytest tests/ -q -m ethics     # проверки §15.4
-.venv/bin/python -m ruff check .           # All checks passed! (line-length 130)
-.venv/bin/python -m mypy foa               # опционально, настройки в pyproject.toml
-.venv/bin/python -m alembic check          # схема == models (защита от drift)
+npm install            # установка зависимостей
+npm run dev            # разработка: tsx server.ts
+npm run build          # сборка: esbuild → dist/server.cjs
+npm start              # запуск собранного бандла
+npm run lint           # проверка типов: tsc --noEmit
 ```
 
-Распределение тестов по файлам:
-
-| Файл | Тестов | Предмет |
-|---|---|---|
-| `tests/test_units_core.py` | 242 | ID, скоупы, crypto, схемы, ошибки, утилиты (§12.4.1, §4.6) |
-| `tests/test_units_runtime.py` | 131 | runtime-состояние узла, circuit breaker, алгоритмы балансировки (§6.3, §6.5, §7) |
-| `tests/test_units_config_logging.py` | 113 | слои конфигурации, `validate()`, secret refs, журнал (§13, §14.2, §12.5) |
-| `tests/test_units_storage.py` | 37 | репозитории: согласия (история, отзыв), кандидаты (upsert, purge), ключи, блэклист |
-| `tests/test_units_openai.py` | 31 | чистые конвертеры OpenAI ⇄ Ollama, маппинг ошибок, NDJSON→SSE (§18) |
-| `tests/test_balancing.py` | 23 | маршрутизация: `round_robin`, `weighted_round_robin`, `least_latency`, гибрид (здесь); `least_connections` и `consistent_hash` — в `test_units_runtime.py`; все лимиты и бюджеты, дисциплина повторов §7.6, обрыв клиента, `draining` |
-| `tests/test_owner_cli.py` | 21 | `foa-owner` против **реального uvicorn-шлюза**: ключи, consent-файл, TXT, JWT, локальный consent-сервер, publish/verify/revoke/delete |
-| `tests/test_openai_api.py` | 18 | `/v1/*` вживую: скоупы, consent gate, лимиты, SSE, оба формата ошибок |
-| `tests/test_consent.py` | 13 | три механизма подтверждения, срок действия, отзыв ≤5 с, self-service, изоляция чужих узлов, аудит |
-| `tests/test_end_to_end.py` | 13 | полный жизненный цикл: регистрация → согласие → трафик; потоки; отказ `pull/push/...`; скоупы эмбеддингов; валидность поставляемого `config.example.yaml` |
-| `tests/test_health.py` | 11 | отсутствие проверок до согласия, `401`/`403` → блэклист, деградация по пассивным ошибкам, выключенный functional-зонд |
-| `tests/test_load.py` | 6 | §15.2 (`slow`): пиковая нагрузка, очередь при занятом узле, недоступность узлов, утечки соединений/слотов, обрывы стримов под нагрузкой |
-| `tests/test_migrations.py` | 6 | Alembic: начальная ревизия == модели, `alembic check` без drift, блокировка легаси-БД до `--stamp`, старт с `migrations: alembic` |
-
-Маркеры назначаются централизованно в `tests/conftest.py` (`pytest_collection_modifyitems`
-по базовому имени теста, поэтому параметризованные случаи размечаются целиком):
-
-| Маркер | Тестов | Источник разметки |
-|---|---|---|
-| `security` | 213 | §15.3: SSRF, аутентификация/авторизация, криптография, маскирование секретов, инъекции, небезопасная конфигурация, защита обоих контрактов |
-| `ethics` | 37 | §15.4: согласие как условие маршрутизации (включая `/v1/*`), запрет активных сканов, отзыв ≤5 с, удаление данных, ограниченные модели |
-| `slow` | 6 | §15.2: нагрузочные тесты (`tests/test_load.py` проставляет сам) |
-
-Быстрый прогон CI: `pytest -m "not slow"`; отдельные срезы —
-`pytest -m security`, `pytest -m ethics`.
+Автоматизированных тестов в текущей версии нет — pytest-набор из 665 тестов
+относился к предыдущей Python-реализации и не переносился.
 
 ---
 
-## Критерии приемки (§17)
+## Структура репозитория
 
-| # | Критерий | Где проверено |
-|---|---|---|
-| 1 | Запросы не уходят на узлы без подтверждённого согласия | `ROUTABLE_STATES` + `balancer.eligible()`; `test_full_lifecycle_consent_then_traffic`, `test_no_active_checks_before_consent`, `test_consent_limited_models_are_enforced` |
-| 2 | Узлы с `401`/`403` немедленно исключаются и блокируются | `test_auth_error_blacklists_node_immediately`, `test_forbidden_from_node_blacklists`, `test_blacklisted_endpoint_cannot_register` |
-| 3 | Отзыв согласия применяется ≤5 с | `consent_revocation_apply_seconds` + `_registry_sync_loop()`; `test_revocation_stops_traffic_within_five_seconds`; метрика `consent_revocation_lag_seconds` |
-| 4 | Все пользовательские запросы аутентифицированы | `security.require_api_key`, `deps.authenticate_user` (401 без Bearer-ключа); `test_user_endpoints_require_authentication`, `test_invalid_credentials_are_rejected`, `test_openai_endpoints_require_authentication` |
-| 5 | Действуют лимиты частоты, объёма и длительности | `foa/services/ratelimit.py`, `limits.*`; `test_rate_limit_per_user`, `test_concurrency_limit_per_user`, `test_generation_budget_limits`, `test_daily_token_quota`, `test_node_hourly_request_budget` |
-| 6 | Потоки корректно проксируются и прерываются | `proxy.stream_ndjson`; `test_streaming_generate_is_proxied_ndjson`, `test_streaming_chat_and_client_abort`, `test_stream_aborted_when_client_disconnects` |
-| 7 | Ошибки в совместимом формате | `ErrorPayload.to_json()`; проверки `error`/`code`/`request_id` в e2e-тестах, `test_no_healthy_nodes_returns_503`, `test_unknown_model_returns_404` |
-| 8 | Журналы не содержат промптов, ответов и секретов | `MINIMUM_LOG_FIELDS`, маскирование; `test_log_event_never_writes_prompt_value`, `test_log_event_masks_secret_inside_allowed_field`, `test_security_defaults_are_the_safe_mode` |
-| 9 | Админ-доступ защищён отдельно от пользовательского | `authenticate_admin` + скоупы + fail-closed; `test_owner_cannot_touch_foreign_or_admin_operations` |
-| 10 | Внешние источники выключены по умолчанию и только при явной настройке | `SourceConfig.enabled=False`, `allowed_scopes` в `validate()`; `test_all_five_discovery_sources_present_and_disabled`, `test_source_without_scopes_is_allowed_outside_inventory_mode`, `test_compat_platform_keys_do_not_enable_sources` |
+```
+server.ts             вся логика шлюза (Express): пользовательский API, /v1/*, /admin/*, health/metrics
+public/index.html     веб-панель администратора (SPA)
+public/panel.html     устаревшая версия панели (не раздаётся)
+deploy/nginx.conf     ingress: TLS, балансировка на 2 реплики
+deploy/prometheus.yml скрейпинг /metrics
+deploy/grafana-dashboard.json  дашборд
+deploy/tls/           generate-cert.sh, openssl.cnf, fullchain.pem, privkey.pem
+docker-compose.yml    топология стека: 2 реплики шлюза, postgres, redis, prometheus, nginx
+docker-run.sh         запуск стека одной командой (.env + TLS + сборка)
+Dockerfile            multi-stage, node:20-alpine, non-root пользователь, HEALTHCHECK на /healthz
+config.example.yaml   справочник параметров §13 (см. примечание в разделе «Конфигурация»)
+.env.example          переменные окружения
+update.sh             скрипт отправки изменений на GitHub
+ТЗ.md                 техническое задание + статус реализации
+```
 
 ---
 
-## Структура кода
+## Статус реализации по ТЗ
 
-```
-foa/
-  app.py            FastAPI-фабрика, lifespan, /healthz|/readyz|/metrics, CLI foa-gateway
-  api/              user.py (§9.3), openai.py (/v1/*, §18), admin.py (§9.6),
-                    deps.py (аутентификация, скоупы, формат ошибок),
-                    middleware.py (request-id, access-лог §12.5.3)
-  config/           §13 + §14.2: слои значений, fail-fast validate(), secret refs
-  core/appstate.py  DI-контейнер служб, фоновые циклы (роль §14.1)
-  domain/           enums (состояния, скоупы, коды ошибок), errors (§9.5),
-                    schemas (pydantic v2), openai.py (контракт /v1 и конвертеры)
-  net/              client.py (пулы httpx на узел, маппинг ошибок), security.py (SSRF, IP)
-  services/         nodes (реестр), consent (§5), health (§6), balancer (§7),
-                    proxy (§8), ratelimit (§12.4), auth (§9.1, §12.4.1),
-                    state (рантайм-нагрузка), crypto (Ed25519, хэши), discovery/ (§4)
-  storage/          models.py, repositories.py, db.py (async engine),
-                    migrations.py (программный Alembic)
-  observability/    metrics.py (§11.4)
-  logging/          JSON-журнал с минимальным набором полей (§12.5)
-  cli/owner.py      владельческий CLI (foa-owner)
-migrations/         alembic: env.py (async + render_item + batch), versions/
-deploy/             nginx.conf, prometheus.yml, grafana-dashboard.json
-tests/              665 тестов (быстрый прогон: -m "not slow")
-```
+Подробная разбивка по разделам ТЗ — в [`ТЗ.md`](ТЗ.md), §1.6
+«Статус реализации». Кратко:
 
-Файлы проекта:
-
-| Файл | Назначение |
+| Область ТЗ | Статус |
 |---|---|
-| `ТЗ.md` | техническое задание, на которое ссылаются номера разделов в этом README и в комментариях кода |
-| `pyproject.toml` | пакет, зависимости, console-scripts, настройки pytest/ruff/mypy |
-| `requirements.txt` | runtime-зависимости (используются слоем builder в `Dockerfile`) |
-| `alembic.ini` + `migrations/` | миграции схемы (раздел «Миграции») |
-| `config.example.yaml` | пример конфигурации §13, загружается как есть — проверяется тестом |
-| `.env.example` | переменные окружения §14.2 (копировать в `.env`, не коммитить) |
-| `Dockerfile` | multi-stage, nonroot-пользователь, `HEALTHCHECK` на `/healthz`, миграции в образе |
-| `docker-compose.yml` | топология §14.1: 2 реплики шлюза, health-checker, discovery-worker (профиль), postgres, redis, prometheus, nginx |
-| `docker-start.sh` | запуск стека в Docker одной командой: `.env` с секретами, TLS-сертификат, очистка старых образов проекта, сборка без кэша, ожидание готовности; `down` — остановка |
-| `update.sh` | `git add . && git commit && git push origin main` — см. [предупреждение](#ограничения-и-что-не-реализовано) |
-
-Точки входа: `foa-gateway` (`foa.app:main`) и `foa-owner` (`foa.cli.owner:main`).
+| Пользовательский Ollama API (§9) | частично: эндпоинты и аутентификация по Bearer-ключу есть; скоупы, лимиты и `show`/`ps` — нет |
+| OpenAI-контракт (§18) | частично: демо-ответы, реальной конвертации нет |
+| Административный API (§9.6) | реализован (токен должен точно совпадать с `FOA_ADMIN_TOKEN`/`FOA_AUDITOR_TOKEN`; разделения скоупов админа/аудитора нет) |
+| Владелец узла, CLI (§5) | частично: challenge/verify через админ-API; CLI `foa-owner` отсутствует |
+| Discovery (§4) | реализован для источников с ключами (кандидаты в памяти) |
+| Health-check (§6) | частично: ручная проверка через `/admin/nodes/:id/health-check` |
+| Балансировщик (§7) | частично: least-connections по активным соединениям |
+| Согласие, хранение, журналирование (§5, §12) | частично: in-memory, без персистентности и JSON-журнала |
+| Масштабирование, БД, Redis (§14) | не реализовано (сервисы в compose зарезервированы) |
+| Тесты (§15) | не реализованы |
 
 ---
 
 ## Ограничения и что не реализовано
 
-- **У OpenAI-контракта нет части полей**: `n>1`, `logprobs`, `tools` с полным
-  протоколом tool-calls, `audio`/`images`-генерация, `assistants`, `runs`,
-  `realtime`. Неподдерживаемые параметры отклоняются явно (§17.7), а не
-  игнорируются молча — см. [OpenAI-совместимый API](#openai-совместимый-api-v1).
-- **Точность `usage` для потоков** ограничена тем, что возвращает Ollama в
-  финальном NDJSON-событии (`eval_count`); `prompt_tokens` в стриме может быть 0,
-  если узел его не сообщил.
-- **Распределённые трассировки** выключены по умолчанию (`observability.trace_enabled:
-  false`); `/admin/config` показывает действующую конфигурацию, версионирование
-  конфигурации сводится к файлу + аудит-событию `config.reloaded`.
-- **Владельческие уведомления** о жалобах реализованы как приём
-  `POST /admin/abuse-reports` и запись в аудит; канал доставки (e-mail, webhook) —
-  открытый вопрос §18.
-- **Нагрузочные тесты §15.2** покрывают поведение (пик, очередь, отказы, утечки,
-  обрывы), но не целевые абсолютные числа из §15.2 («≥ N RPS», «p95 ≤ M мс»):
-  они зависят от железа, поэтому измерять их надо на реальном контуре — набор
-  помечен `slow` и excluded из быстрого прогона.
-- **Миграция данных** (не схемы) не автоматизирована: `nodes.secret`-полей нет,
-  но при изменении формата `capability`-документа потребуется сверка вручную.
-- **Redis-бэкенд лимитов не подключён**: `RedisLimitBackend`
-  (`foa/services/ratelimit.py`) реализован, но `RateLimiter` собирается в
-  `foa/app.py` без redis-клиента, поэтому `GATEWAY_REDIS_URL` сейчас ни на что
-  не влияет и лимиты остаются попроцессными (см. пункт 2 «Масштабирования»).
-  Сервис `redis` в compose поднят на будущее и пока бездействует.
-- `update.sh` выполняет `git add .` → `git commit` → `git push origin main`. Не
-  запускайте его с заполненным `.env`: `git add .` попытается отправить секреты
-  в GitHub (`.gitignore` исключает `.env`, но проверяйте `git status` перед коммитом).
+- **Скоупы ключей** (`ollama:read` / `ollama:generate` / `ollama:embed`, §9.2)
+  не применяются: аутентификация есть, авторизация по скоупам — нет.
+- **Лимиты, квоты, circuit breaker, повторы** (§7, §12.4) присутствуют только в
+  конфиге, к трафику не применяются.
+- **Состояние в памяти**: рестарт = сброс к демо-данным; персистентности нет,
+  `GATEWAY_DB_URL` / `GATEWAY_REDIS_URL` ни на что не влияют, `postgres` и
+  `redis` из compose бездействуют.
+- **Ответ `/api/generate` и `/api/chat`** — демо-заглушка, если узел недостижим;
+  засеянные узлы используют тестовые IP из RFC 5737, поэтому реальный трафик
+  невозможен, пока не зарегистрирован настоящий узел.
+- **`/v1/*`** отдаёт симулированные ответы; полноценный конвертер Ollama ↔ OpenAI
+  (маппинг параметров, tool calls, `usage`, SSE из NDJSON) не реализован.
+- **CLI владельца узла `foa-owner`** отсутствует — все операции доступны через
+  `/admin/*` и веб-панель.
+- **`config.example.yaml`** не загружается приложением — это справочник целевых
+  параметров §13.
+- **Тестов нет**; `npm run lint` ограничивается `tsc --noEmit`.
+- **Миграции БД** отсутствуют (нечего мигрировать — схема в памяти).
+- **`public/panel.html`** — устаревшая панель, сервером не раздаётся.
+- **Redis-бэкенд лимитов**, Vault/secret-refs, трассировки (§11) — не реализованы.
 
+---
+
+## Скрипт `update.sh`
+
+Для быстрой отправки изменений на GitHub:
+
+```bash
+chmod +x update.sh
+./update.sh "Описание внесенных изменений"
+```
+
+Скрипт выполняет `git add .` → `git commit` → `git push origin main --no-thin`.
+Перед запуском проверяйте `git status`: `git add .` добавит все новые файлы, а
+`.env` исключается только благодаря `.gitignore` — случайно созданный секретный
+файл вне правил игнорирования уйдёт в репозиторий.

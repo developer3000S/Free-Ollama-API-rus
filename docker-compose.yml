@@ -19,6 +19,10 @@ x-gateway-common: &gateway-common
     CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
     FOA_ADMIN_TOKEN: ${FOA_ADMIN_TOKEN:-foa-admin-secret}
     FOA_AUDITOR_TOKEN: ${FOA_AUDITOR_TOKEN:-foa-auditor-secret}
+    # Публичные порты ingress-балансировщика (nginx): нужны гейтвею, чтобы
+    # сообщать клиентам оба варианта подключения (HTTPS + запасной plain-HTTP).
+    FOA_HTTP_PORT: ${FOA_HTTP_PORT:-8080}
+    FOA_HTTPS_PORT: ${FOA_HTTPS_PORT:-8443}
     FOA_STORAGE__DATABASE_URL: postgresql://foa:${POSTGRES_PASSWORD:-postgres_foa_password}@postgres:5432/foa
     FOA_STORAGE__REDIS_URL: redis://redis:6379/0
   depends_on:

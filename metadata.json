@@ -1,6 +1,5 @@
 {
   "name": "Free Ollama API Gateway",
-  "description": "Managed proxy gateway over an authorized Ollama node pool with consent gating, discovery, and admin dashboard",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "description": "Управляемый прокси-шлюз с Ollama-совместимым API поверх пула узлов Ollama: пользовательский и OpenAI-совместимый контракты, административный API, веб-панель, discovery-модуль. Node.js/TypeScript, Express. Статус реализации — в README.md и ТЗ.md.",
+  "requestFramePermissions": []
 }

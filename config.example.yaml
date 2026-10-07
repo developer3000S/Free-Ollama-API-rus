@@ -1,12 +1,20 @@
 # Free Ollama API Gateway — пример конфигурации (§13 ТЗ)
 #
-# Запуск:  foa-gateway --config config.example.yaml
-# Проверка: foa-gateway --config config.example.yaml --check-config
+# ВНИМАНИЕ: текущая Node.js-версия шлюза НЕ загружает YAML-файлы. Этот файл —
+# справочник целевых параметров §13: он показывает, какие настройки заложены
+# в объекте `currentConfig` файла server.ts, и какие значения считаются
+# безопасными по умолчанию. См. README.md, раздел «Конфигурация».
+#
+# Запуск шлюза:  npm start            (или npm run dev для разработки)
+# Действующие значения: GET /admin/config
 #
 # Приоритет источников значений (§13, §14.2):
-#   встроенные безопасные значения по умолчанию < этот YAML < переменные окружения
+#   встроенные безопасные значения по умолчанию < переменные окружения .env
 # Переменные окружения имеют вид FOA_СЕКЦИЯ__КЛЮЧ, например FOA_SECURITY__ROUTE_CANDIDATES=true
 # или вложенно: FOA_DISCOVERY__SOURCES__CENSYS__ENABLED=true
+# (зарезервированы под будущую реализацию; сегодня используются только PORT,
+#  GATEWAY_ID, FOA_ADMIN_TOKEN, FOA_AUDITOR_TOKEN, FOA_HTTP_PORT, FOA_HTTPS_PORT,
+#  CORS_ALLOWED_ORIGINS и ключи источников discovery)
 #
 # СЕКРЕТЫ В ЭТОТ ФАЙЛ НЕ ПИШУТ. Для них используются ссылки на хранилище (§14.2):
 #   "{env:VAR_NAME}" | "{file:/path/to/secret}" | "{vault:path/to/secret}" | "{api_key_service}"
