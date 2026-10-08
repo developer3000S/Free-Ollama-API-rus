@@ -4358,6 +4358,37 @@ async function renderApiDocs(container) {
     );
     container.appendChild(headerCard);
 
+    // Поле API-ключа для «Try It Out»: пользовательские эндпоинты (/api/*, /v1/*)
+    // аутентифицируются ключом foa_live_..., а не админ-токеном. Сырой ключ
+    // хранится только в localStorage этого браузера.
+    const keyCard = h('div', {class: 'card', style: {marginBottom: '20px'}},
+      h('div', {style: {display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap'}},
+        h('label', {style: {fontSize: '13px', fontWeight: '600', whiteSpace: 'nowrap'}}, '🔑 API-ключ для пользовательских эндпоинтов:'),
+        h('input', {
+          id: 'docs-api-key',
+          class: 'form-control mono',
+          type: 'password',
+          placeholder: 'foa_live_... (создайте в разделе API Keys)',
+          style: {flex: '1', minWidth: '260px', fontSize: '13px'},
+          value: localStorage.getItem('foa_docs_api_key') || '',
+          oninput: (e) => localStorage.setItem('foa_docs_api_key', e.target.value)
+        }),
+        h('button', {
+          class: 'btn btn-sm',
+          onClick: () => {
+            const el = $('docs-api-key');
+            const v = el.value;
+            el.type = el.type === 'password' ? 'text' : 'password';
+            if (v && el.type === 'password') { navigator.clipboard && navigator.clipboard.writeText(v).catch(() => {}); }
+          }
+        }, '👁️')
+      ),
+      h('div', {style: {fontSize: '12px', color: 'var(--text2)', marginTop: '8px'}},
+        'Эндпоинты «Bearer Token» тестируются этим ключом; админ-эндпоинты «Admin Token» — токеном из входа в панель.'
+      )
+    );
+    container.appendChild(keyCard);
+
     const groups = [
       {
         title: '🤖 Ollama Compatible User API',
@@ -4366,14 +4397,14 @@ async function renderApiDocs(container) {
           { method: 'POST', path: '/api/chat', summary: 'Чат-комплишен с потоковой (SSE) или JSON выдачей', auth: 'Bearer Token', body: { model: 'llama3', messages: [{ role: 'user', content: 'Привет!' }] } },
           { method: 'POST', path: '/api/generate', summary: 'Генерация текста по промпту', auth: 'Bearer Token', body: { model: 'llama3:8b', prompt: 'Объясни квантовые вычисления в двух предложениях.' } },
           { method: 'GET', path: '/api/tags', summary: 'Получить список доступных моделей в маршрутизируемом пуле', auth: 'Bearer Token', body: null },
-          { method: 'GET', path: '/api/version', summary: 'Получить версию шлюза', auth: 'None', body: null },
+          { method: 'GET', path: '/api/version', summary: 'Получить версию шлюза', auth: 'Bearer Token', body: null },
         ]
       },
       {
         title: '⚡ OpenAI Compatible API (/v1/*)',
         desc: 'Совместимость с экосистемой OpenAI SDK, LangChain, LlamaIndex, Open WebUI и LibreChat.',
         endpoints: [
-          { method: 'POST', path: '/v1/chat/completions', summary: 'OpenAI Chat Completions эндпоинт', auth: 'Bearer Token', body: { model: 'gpt-4o', messages: [{ role: 'user', content: 'Hello!' }] } },
+          { method: 'POST', path: '/v1/chat/completions', summary: 'OpenAI Chat Completions эндпоинт', auth: 'Bearer Token', body: { model: 'llama3', messages: [{ role: 'user', content: 'Hello!' }] } },
           { method: 'GET', path: '/v1/models', summary: 'OpenAI Models list', auth: 'Bearer Token', body: null },
         ]
       },
@@ -4454,7 +4485,7 @@ async function renderApiDocs(container) {
 
         bodyHtml += `
           <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 12px;">
-            <button class="btn btn-sm btn-primary" onclick="testApiDocEndpoint('${ep.method}', '${ep.path}', ${gIdx}, ${epIdx})">🚀 Выполнить запрос (Try It Out)</button>
+            <button class="btn btn-sm btn-primary" onclick="testApiDocEndpoint('${ep.method}', '${ep.path}', ${gIdx}, ${epIdx}, ${JSON.stringify(ep.auth)})">🚀 Выполнить запрос (Try It Out)</button>
           </div>
           <div style="font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-dim); margin-bottom: 6px;">Ответ сервера:</div>
           <pre id="doc-res-${gIdx}-${epIdx}" class="mono" style="background: var(--bg); padding: 10px; border-radius: 6px; font-size: 12px; max-height: 220px; overflow-y: auto; color: var(--green);">Нажмите «Выполнить запрос», чтобы увидеть результат...</pre>
@@ -4473,7 +4504,7 @@ async function renderApiDocs(container) {
   }
 }
 
-async function testApiDocEndpoint(method, path, gIdx, epIdx) {
+async function testApiDocEndpoint(method, path, gIdx, epIdx, authType) {
   const resPre = document.getElementById(`doc-res-${gIdx}-${epIdx}`);
   if (!resPre) return;
   resPre.textContent = 'Выполнение запроса...';
@@ -4490,13 +4521,27 @@ async function testApiDocEndpoint(method, path, gIdx, epIdx) {
       }
     }
 
-    const token = localStorage.getItem('foa_auth_token') || 'foa-admin-secret';
+    // Токен выбирается по типу аутентификации эндпоинта:
+    //  - 'Bearer Token' — пользовательский API-ключ foa_live_... из поля выше;
+    //  - 'Admin Token'  — админ/аудитор-токен, которым вошли в панель;
+    //  - иначе (без авторизации) — заголовок Authorization не отправляем.
+    let token = '';
+    if (authType === 'Bearer Token') {
+      token = (document.getElementById('docs-api-key') || {}).value || localStorage.getItem('foa_docs_api_key') || '';
+      if (!token) {
+        resPre.textContent = 'Введите API-ключ (foa_live_...) в поле выше, затем попробуйте снова.';
+        resPre.style.color = 'var(--red)';
+        return;
+      }
+    } else if (authType === 'Admin Token') {
+      token = (typeof API !== 'undefined' && API.token) || sessionStorage.getItem('foa_token') || '';
+    }
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
     const opts = {
       method,
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      }
+      headers
     };
     if (bodyData && method !== 'GET') {
       opts.body = JSON.stringify(bodyData);

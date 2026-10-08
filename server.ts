@@ -1173,9 +1173,13 @@ const applyLimits = (opts: { perModel?: boolean; body?: 'prompt' | 'chat' | 'ope
           `Промпт превышает max_prompt_bytes (${limits.max_prompt_bytes} байт)`
         );
       }
+      // num_predict выше max_num_predict не отбрасываем — ограничиваем до
+      // лимита. Клиенты (OpenAI SDK, чат-клиенты) часто присылают «дефолтные»
+      // 4096+, и жёсткий 400 ломал бы любой такой запрос; безопасность
+      // (сам лимит генерации) при этом сохраняется.
       const numPredict = body.options?.num_predict;
       if (typeof numPredict === 'number' && numPredict > limits.max_num_predict) {
-        return sendApiError(req, res, 400, `num_predict превышает max_num_predict (${limits.max_num_predict})`);
+        body.options.num_predict = limits.max_num_predict;
       }
     } else if (opts.body === 'chat' || opts.body === 'openai') {
       const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
@@ -1193,10 +1197,18 @@ const applyLimits = (opts: { perModel?: boolean; body?: 'prompt' | 'chat' | 'ope
           );
         }
       }
-      const cap =
-        opts.body === 'openai' ? body.max_tokens ?? body.max_completion_tokens : body.options?.num_predict;
-      if (typeof cap === 'number' && cap > limits.max_num_predict) {
-        return sendApiError(req, res, 400, `Лимит генерации превышает max_num_predict (${limits.max_num_predict})`);
+      // Лимит генерации ограничиваем, а не отбрасываем: OpenAI SDK и чат-клиенты
+      // шлют max_tokens/max_completion_tokens по умолчанию (4096+), жёсткий 400
+      // ломал бы любой такой запрос. Значение ниже лимита не трогаем.
+      if (opts.body === 'openai') {
+        if (typeof body.max_tokens === 'number' && body.max_tokens > limits.max_num_predict) {
+          body.max_tokens = limits.max_num_predict;
+        }
+        if (typeof body.max_completion_tokens === 'number' && body.max_completion_tokens > limits.max_num_predict) {
+          body.max_completion_tokens = limits.max_num_predict;
+        }
+      } else if (typeof body.options?.num_predict === 'number' && body.options.num_predict > limits.max_num_predict) {
+        body.options.num_predict = limits.max_num_predict;
       }
     }
 
