@@ -890,15 +890,15 @@ async function showNodeDetail(nodeId) {
           h('dd', {class: typeof v === 'string' ? 'mono' : ''}, typeof v === 'object' ? JSON.stringify(v) : String(v ?? '—'))
         ])
       ),
-      h('div', {class: 'modal-footer'},
-        h('button', {class: 'btn btn-primary', onClick: () => { closeModal(); showNodeChatModal(nodeId); }}, '💬 Чат'),
-        h('button', {class: 'btn btn-primary', onClick: () => { closeModal(); showNodeLabelsModal(nodeId); }}, '🏷️ Метки'),
-        h('button', {class: 'btn btn-primary', onClick: () => { closeModal(); showNodeLogsModal(nodeId); }}, '📄 Логи'),
-        h('button', {class: 'btn btn-success', onClick: () => { closeModal(); showVerificationModal(nodeId, false); }}, '✓ Верификация'),
-        h('button', {class: 'btn', onClick: () => { closeModal(); nodeAction('health-check', nodeId); }}, '🩺 Health Check'),
-        h('button', {class: 'btn btn-danger', onClick: () => { closeModal(); nodeAction('revoke', nodeId); }}, '⛔ Revoke'),
-        h('button', {class: 'btn btn-danger', onClick: () => { closeModal(); nodeBlacklist(nodeId); }}, '🚫 Blacklist'),
-        h('button', {class: 'btn', onClick: closeModal}, 'Закрыть'),
+      h('div', {class: 'modal-footer modal-footer-icons'},
+        h('button', {class: 'btn btn-xs btn-icon btn-primary', title: 'Чат с узлом', onClick: () => { closeModal(); showNodeChatModal(nodeId); }}, '💬'),
+        h('button', {class: 'btn btn-xs btn-icon btn-primary', title: 'Метки', onClick: () => { closeModal(); showNodeLabelsModal(nodeId); }}, '🏷️'),
+        h('button', {class: 'btn btn-xs btn-icon btn-primary', title: 'Логи', onClick: () => { closeModal(); showNodeLogsModal(nodeId); }}, '📄'),
+        h('button', {class: 'btn btn-xs btn-icon btn-success', title: 'Верификация', onClick: () => { closeModal(); showVerificationModal(nodeId, false); }}, '✓'),
+        h('button', {class: 'btn btn-xs btn-icon', title: 'Health Check', onClick: () => { closeModal(); nodeAction('health-check', nodeId); }}, '🩺'),
+        h('button', {class: 'btn btn-xs btn-icon btn-danger', title: 'Revoke (отозвать авторизацию)', onClick: () => { closeModal(); nodeAction('revoke', nodeId); }}, '⛔'),
+        h('button', {class: 'btn btn-xs btn-icon btn-danger', title: 'Blacklist (в чёрный список)', onClick: () => { closeModal(); nodeBlacklist(nodeId); }}, '🚫'),
+        h('button', {class: 'btn btn-xs btn-icon', title: 'Закрыть', onClick: closeModal}, '✕'),
       )
     );
     showModal(`Узел ${shortId(nodeId)}`, el);
