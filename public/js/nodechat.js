@@ -1,9 +1,14 @@
 /* ===== FOA Gateway Admin Panel :: nodechat.js ===== */
 /*  Чат с конкретным узлом: модалка с историей сообщений, отправка через
- *  POST /api/chat c явным указанием target_node_id (маршрутизация на узел). */
+ *  POST /admin/nodes/:id/chat — прямой прокси на узел под adminAuth.
+ *  Раньше чат ходил на /api/chat (userAuth) с токеном панели, из-за чего
+ *  получал «Ошибка: Недействительный API-ключ». Список моделей узла
+ *  подтягивается через GET /admin/nodes/:id/models в выпадающий выбор. */
 
 const nodeChatState = {
   nodeId: null,
+  model: null,    // выбранная модель узла (null → первая доступная)
+  models: [],     // список моделей узла для <select>
   messages: [],   // { role: 'user' | 'assistant', content, time }
   sending: false,
 };
@@ -19,13 +24,24 @@ function showNodeChatModal(nodeId) {
     nodeChatState.nodeId = nodeId;
     nodeChatState.messages = nodeChatHistories[nodeId] || [];
     nodeChatState.sending = false;
+    nodeChatState.models = (node && Array.isArray(node.models)) ? node.models.slice() : [];
+    nodeChatState.model = nodeChatState.models[0] || null;
   }
+
+  const modelSelect = h('select', {
+    class: 'form-control node-chat-model-select', id: 'node-chat-model-select',
+    title: 'Модель узла для чата',
+  }, h('option', { value: '' }, 'Загрузка моделей…'));
 
   const el = h('div', {class: 'node-chat'},
     h('div', {class: 'node-chat-meta'},
       node
-        ? `Endpoint: ${node.endpoint || '—'} · Статус: ${node.status || '—'} · Модели: ${(node.models || []).join(', ') || '—'}`
+        ? `Endpoint: ${node.endpoint || '—'} · Статус: ${node.status || '—'}`
         : `Узел: ${esc(nodeId)}`
+    ),
+    h('div', {class: 'node-chat-model-row'},
+      h('label', {class: 'node-chat-model-label', for: 'node-chat-model-select'}, 'Модель:'),
+      modelSelect
     ),
     h('div', {class: 'node-chat-messages', id: 'node-chat-messages'}),
     h('form', {class: 'node-chat-input-row', id: 'node-chat-form'},
@@ -41,6 +57,12 @@ function showNodeChatModal(nodeId) {
   overlay.classList.add('modal-overlay-wide');
 
   renderNodeChatMessages();
+  renderNodeChatModelSelect();
+  loadNodeChatModels(nodeId); // GET /admin/nodes/:id/models — актуальный список с узла
+
+  modelSelect.addEventListener('change', () => {
+    nodeChatState.model = modelSelect.value || null;
+  });
 
   const form = el.querySelector('#node-chat-form');
   form.addEventListener('submit', async (e) => {
@@ -55,6 +77,52 @@ function showNodeChatModal(nodeId) {
   setTimeout(() => { const i = el.querySelector('#node-chat-input'); if (i) i.focus(); }, 50);
 }
 
+// Загрузка списка моделей узла: GET /admin/nodes/:id/models. Сервер сначала
+// отдаёт кэш node.models, при пустоте опрашивает узел (GET <endpoint>/api/tags).
+async function loadNodeChatModels(nodeId) {
+  try {
+    const res = await API.get(`/admin/nodes/${encodeURIComponent(nodeId)}/models`);
+    if (nodeChatState.nodeId !== nodeId) return; // окно уже закрыто/переключено
+    const list = Array.isArray(res && res.models) ? res.models : [];
+    nodeChatState.models = list;
+    if (list.length && !list.includes(nodeChatState.model)) {
+      nodeChatState.model = list[0];
+    }
+    if (!list.length && !nodeChatState.model) nodeChatState.model = null;
+    renderNodeChatModelSelect();
+  } catch (err) {
+    if (nodeChatState.nodeId !== nodeId) return;
+    renderNodeChatModelSelect(String(err && err.message || 'не удалось загрузить'));
+  }
+}
+
+function renderNodeChatModelSelect(errorText) {
+  const sel = document.querySelector('#node-chat-model-select');
+  if (!sel) return;
+  sel.innerHTML = '';
+  const models = nodeChatState.models || [];
+  if (errorText && !models.length) {
+    sel.appendChild(h('option', { value: '' }, `⚠️ ${errorText}`));
+    sel.disabled = true;
+    return;
+  }
+  if (!models.length) {
+    sel.appendChild(h('option', { value: '' }, 'Модели недоступны'));
+    sel.disabled = true;
+    return;
+  }
+  sel.disabled = false;
+  for (const m of models) {
+    const opt = h('option', { value: m }, m);
+    if (m === nodeChatState.model) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  if (!nodeChatState.model || !models.includes(nodeChatState.model)) {
+    nodeChatState.model = models[0];
+    sel.value = models[0];
+  }
+}
+
 async function sendNodeChatMessage(nodeId, text) {
   nodeChatState.messages.push({ role: 'user', content: text, time: new Date() });
   nodeChatHistories[nodeId] = nodeChatState.messages;
@@ -63,18 +131,18 @@ async function sendNodeChatMessage(nodeId, text) {
   setNodeChatBusy(true);
 
   try {
-    const node = (currentNodesList || []).find(n => n.node_id === nodeId);
-    const model = (node && node.models && node.models[0]) || undefined;
     const body = {
       messages: nodeChatState.messages.map(m => ({ role: m.role, content: m.content })),
-      stream: false,
     };
-    if (model) body.model = model;
-    // Явная маршрутизация запроса на выбранный узел
-    body.target_node_id = nodeId;
+    if (nodeChatState.model) body.model = nodeChatState.model;
 
-    const res = await API.post('/api/chat', body);
+    // Прямой прокси на узел под adminAuth — без пользовательского API-ключа
+    const res = await API.post(
+      `/admin/nodes/${encodeURIComponent(nodeId)}/chat`,
+      body
+    );
     const reply =
+      (res && typeof res.reply === 'string') ? res.reply :
       (res && res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content) ||
       (res && res.content) ||
       (res && res.response) ||

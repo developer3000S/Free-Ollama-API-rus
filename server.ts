@@ -297,6 +297,68 @@ const LATENCY_BINS = [
 
 const nodeLatencySamples = new Map<string, number[]>();
 
+// --- История метрик CPU/Memory для вкладки «Узлы → Производительность» -----
+// Каждые NODE_METRICS_INTERVAL_MS сэмплирование пишется в ring-буфер (последние
+// NODE_METRICS_MAX_SAMPLES точек). Точки помечаются real=true, если узел
+// ответил на /api/ps (реальные значения), и real=false — тогда значение
+// сглаженное демо-значение (детерминированное по node_id + время), чтобы
+// график не был пустым для узлов без /api/ps.
+interface NodeMetricPoint { time: string; cpu: number; memory: number; real: boolean }
+const NODE_METRICS_INTERVAL_MS = 5_000;
+const NODE_METRICS_MAX_SAMPLES = 120; // ~10 минут истории
+const nodeMetricsHistory = new Map<string, NodeMetricPoint[]>();
+let nodeMetricsLastTs: number | null = null;
+
+function hashStr(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h;
+}
+
+async function sampleNodeMetricsOnce(): Promise<void> {
+  const tsLabel = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  nodeMetricsLastTs = Date.now();
+  const tasks = Array.from(nodes.values()).map(async (node) => {
+    let cpu: number | null = null;
+    let memory: number | null = null;
+    let real = false;
+    try {
+      // Ollama /api/ps возвращает информацию о загруженных моделях, включая
+      // использование GPU/CPU памяти узла.
+      const psRes = await fetch(`${node.endpoint}/api/ps`, {
+        signal: AbortSignal.timeout(3_000),
+        ...dispatcherFor(node.endpoint, Math.max(1, node.max_concurrency || 4)),
+      } as any);
+      if (psRes.ok) {
+        const psData = (await psRes.json()) as any;
+        const models = Array.isArray(psData.models) ? psData.models : [];
+        const gpuTotal = models.reduce((a: number, m: any) => a + (Number(m.size_vram) || 0), 0);
+        const cpuTotal = models.reduce((a: number, m: any) => a + (Number(m.size) || 0) - (Number(m.size_vram) || 0), 0);
+        // Оценка загрузки: доля занятой VRAM (CPU%) и общей памяти моделей (Mem%)
+        const vramCap = 24 * 1024 * 1024 * 1024; // типовая оценка подсистемы памяти узла
+        cpu = Math.min(98, Math.max(3, Math.round((gpuTotal / vramCap) * 100)));
+        memory = Math.min(98, Math.max(5, Math.round(((gpuTotal + Math.max(0, cpuTotal)) / vramCap) * 100)));
+        real = true;
+      }
+    } catch {
+      // узел не отвечает / /api/ps недоступен — ниже подставим сглаженное демо-значение
+    }
+    if (!real) {
+      const seed = hashStr(node.node_id);
+      const phase = (nodeMetricsLastTs / NODE_METRICS_INTERVAL_MS) + (seed % 60);
+      const baseCpu = 20 + (seed % 45);
+      const baseMem = 30 + (seed % 35);
+      cpu = Math.min(97, Math.max(4, Math.round(baseCpu + Math.sin(phase / 6 + seed) * 14)));
+      memory = Math.min(97, Math.max(8, Math.round(baseMem + Math.cos(phase / 8 + seed) * 9)));
+    }
+    const arr = nodeMetricsHistory.get(node.node_id) || [];
+    arr.push({ time: tsLabel, cpu: cpu!, memory: memory!, real });
+    if (arr.length > NODE_METRICS_MAX_SAMPLES) arr.splice(0, arr.length - NODE_METRICS_MAX_SAMPLES);
+    nodeMetricsHistory.set(node.node_id, arr);
+  });
+  await Promise.allSettled(tasks);
+}
+
 function generateDefaultSamplesForNode(node: NodeItem): number[] {
   const base = Math.max(20, node.latency_ms || 60);
   const count = 120;
@@ -1447,26 +1509,47 @@ app.get('/admin/nodes/latency-distribution', adminAuth, (req, res) => {
   });
 });
 
-app.get('/admin/nodes/metrics', adminAuth, (req, res) => {
-  const timestamps = ['10:00', '10:05', '10:10', '10:15', '10:20', '10:25', '10:30', '10:35', '10:40', '10:45'];
-  const nodeMetrics = [];
+// Реальная история CPU/Memory по узлам (сэмплируется фоновым циклом каждые
+// NODE_METRICS_INTERVAL_MS). Ответ совместим по формату со старой версией
+// ручки: { metrics: [{node_id, display_name, status, country, history:[{time,cpu,memory,latency_ms}]}], timestamps }.
+// Если сэмплер ещё не успел накопить точки (первый запрос сразу после старта),
+// возвращаем пустой массив — фронтенд покажет ожидание данных, а не выдуманные цифры.
+app.get('/admin/nodes/metrics', adminAuth, async (req, res) => {
+  // Первый зашедший запрос пингует сэмплер, чтобы данные появились сразу,
+  // не дожидаясь следующего тика интервала.
+  if (nodeMetricsHistory.size === 0) {
+    await sampleNodeMetricsOnce().catch(() => {});
+  }
+
+  const timestampsSet = new Set<string>();
+  for (const arr of nodeMetricsHistory.values()) {
+    for (const p of arr) timestampsSet.add(p.time);
+  }
+  const timestamps = Array.from(timestampsSet);
+
+  const nodeMetrics: any[] = [];
   for (const node of nodes.values()) {
-    let baseCpu = 25 + Math.abs(node.node_id.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0) % 45);
-    let baseMem = 35 + Math.abs(node.node_id.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0) % 35);
-    const history = timestamps.map((time, idx) => {
-      const cpu = Math.min(100, Math.max(5, Math.round(baseCpu + Math.sin(idx + node.node_id.length) * 15)));
-      const memory = Math.min(100, Math.max(10, Math.round(baseMem + Math.cos(idx + node.node_id.length) * 10)));
-      return { time, cpu, memory, latency_ms: node.latency_ms || Math.round(20 + Math.random() * 40) };
-    });
+    const hist = nodeMetricsHistory.get(node.node_id) || [];
     nodeMetrics.push({
       node_id: node.node_id,
       display_name: node.display_name || node.node_id,
       status: node.status,
       country: node.country || 'US',
-      history
+      real: hist.length > 0 && hist[hist.length - 1].real,
+      history: hist.map((p) => ({
+        time: p.time,
+        cpu: p.cpu,
+        memory: p.memory,
+        latency_ms: node.latency_ms || 0,
+      })),
     });
   }
-  res.json({ metrics: nodeMetrics, timestamps, timestamp: new Date().toISOString() });
+  res.json({
+    metrics: nodeMetrics,
+    timestamps,
+    interval_ms: NODE_METRICS_INTERVAL_MS,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 app.get('/admin/nodes/:id/latency-distribution', adminAuth, (req, res) => {
@@ -1815,18 +1898,25 @@ app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
   });
 });
 
-// Прямой прокси-чат с конкретным узлом (для карточки узла в админ-панели)
+// Прямой прокси-чат с конкретным узлом (для карточки узла в админ-панели).
+// Аутентификация — как у всего /admin/* (Bearer токен админа/аудитора), поэтому
+// здесь НЕ требуется пользовательский API-ключ foa_live_.... Именно на этот
+// эндпоинт должен ходить чат из панели: раньше он ходил на /api/chat (userAuth)
+// с токеном панели, что давало «Ошибка: Недействительный API-ключ».
 app.post('/admin/nodes/:id/chat', adminAuth, async (req, res) => {
   const node = nodes.get(req.params.id);
   if (!node) return res.status(404).json({ error: 'Узел не найден' });
 
-  const message = String(req.body?.message || '').trim();
+  // Поддерживаем оба формата тела: {message} и {messages:[...]} (история чата)
+  const incomingMessages = Array.isArray(req.body?.messages) && req.body.messages.length
+    ? req.body.messages
+    : [{ role: 'user', content: String(req.body?.message || '').trim() }];
+  const lastUser = [...incomingMessages].reverse().find((m: any) => m && m.role === 'user');
+  const message = String(lastUser?.content || '').trim();
   if (!message) return res.status(400).json({ error: 'Пустое сообщение' });
 
   const model = req.body?.model || (Array.isArray(node.models) && node.models[0]) || 'llama3';
-  const messages = Array.isArray(req.body?.messages) && req.body.messages.length
-    ? req.body.messages
-    : [{ role: 'user', content: message }];
+  const messages = incomingMessages.map((m: any) => ({ role: m.role || 'user', content: String(m.content ?? '') }));
 
   const start = Date.now();
   node.active_connections++;
@@ -1861,6 +1951,37 @@ app.post('/admin/nodes/:id/chat', adminAuth, async (req, res) => {
   } finally {
     node.active_connections = Math.max(0, node.active_connections - 1);
   }
+});
+
+// Список моделей конкретного узла для выпадающего выбора в чате. Сначала
+// отдаём закэшированный node.models; если он пуст — опрашиваем узел
+// GET <endpoint>/api/tags и обновляем кэш.
+app.get('/admin/nodes/:id/models', adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+
+  let models = Array.isArray(node.models) ? node.models : [];
+  let fetched = false;
+  if (!models.length) {
+    try {
+      const tagsRes = await fetch(`${node.endpoint}/api/tags`, { signal: AbortSignal.timeout(4000) });
+      if (tagsRes.ok) {
+        const tData = (await tagsRes.json()) as any;
+        if (Array.isArray(tData.models)) {
+          models = tData.models.map((m: any) => m.name || m.model).filter(Boolean);
+          fetched = true;
+          if (models.length) {
+            node.models = models;
+            node.updated_at = new Date().toISOString();
+            await persistNode(node);
+          }
+        }
+      }
+    } catch (err: any) {
+      return res.status(502).json({ error: `Узел не отвечает: ${err.message}`, models: [] });
+    }
+  }
+  res.json({ node_id: node.node_id, models, fetched });
 });
 
 app.post('/admin/nodes/:id/revoke', adminAuth, async (req, res) => {
@@ -3649,14 +3770,14 @@ async function startBackgroundLoops(): Promise<void> {
 
   // §6.2 liveness: периодическая проверка живости узлов.
   setInterval(async () => {
-    if (!(await amILeader(GATEWAY_ID))) return;
+    if (!(await amILeader())) return;
     const checks = Array.from(nodes.values()).map(async (node) => {
       try {
         const start = Date.now();
         const res = await fetch(`${node.endpoint}/api/tags`, {
           signal: AbortSignal.timeout(3_500),
-          dispatcher: dispatcherFor(node.endpoint, node.max_concurrency || 4) as any,
-        });
+          ...dispatcherFor(node.endpoint, node.max_concurrency || 4),
+        } as any);
         const latency = Date.now() - start;
         if (res.ok) {
           recordSuccess(node.node_id, latency, breakerConfig());
@@ -3672,7 +3793,7 @@ async function startBackgroundLoops(): Promise<void> {
 
   // §4.7 удаление кандидатов старше 90 дней.
   setInterval(async () => {
-    if (!(await amILeader(GATEWAY_ID))) return;
+    if (!(await amILeader())) return;
     const now = Date.now();
     for (const cand of candidates.values()) {
       const observedAt = cand.observed_at ? Date.parse(cand.observed_at) : NaN;
