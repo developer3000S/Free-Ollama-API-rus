@@ -55,6 +55,17 @@ export function dbConnected(): boolean {
 
 const NOTIFY_CHANNEL = 'foa_changes';
 
+// Выделенные (non-JSONB) колонки таблиц — запросы вроде lookup ключа по
+// key_hash и NOT NULL-ограничение consents.node_id требуют их явной записи.
+// Ключи — реальные имена таблиц (значения TABLES), а не имена свойств.
+const EXTRA_COLUMNS: Record<TableName, Record<string, (item: any) => unknown>> = {
+  nodes: {},
+  api_keys: { key_hash: (i) => i.key_hash ?? null },
+  consents: { node_id: (i) => i.node_id },
+  blacklist: {},
+  candidates: { observed_at: (i) => i.observed_at },
+};
+
 // Таблицы: name -> колонка первичного ключа. Все таблицы имеют одинаковую
 // структуру (id + JSONB data), что позволяет использовать generic-репозиторий.
 export const TABLES = {
@@ -114,9 +125,16 @@ export async function initDb(): Promise<boolean> {
   try {
     pool = new Pool({ connectionString: url, max: 10, idleTimeoutMillis: 30_000 });
     await pool.query('SELECT 1');
-    for (const stmt of SCHEMA_STATEMENTS) {
-      await pool.query(stmt);
-    }
+
+    // DDL двух реплик, стартующих одновременно, гоняется за pg_type
+    // (duplicate key value violates pg_type_typname_nsp_index)._advisory
+    // lock сериализует миграции: кто взял lock — тот и создаёт схему.
+    await tx(async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock(8135701)');
+      for (const stmt of SCHEMA_STATEMENTS) {
+        await client.query(stmt);
+      }
+    });
 
     listener = new Client({ connectionString: url });
     await listener.connect();
@@ -275,12 +293,20 @@ export class Store<T extends Record<string, any>> {
     this.cache.set(id, item);
     if (!enabled) return;
     const row = this.serialize(item);
-    const q = `INSERT INTO ${this.table} (id, data) VALUES ($1, $2)
-               ON CONFLICT (id) DO UPDATE SET data = $2, updated_at = now()`;
+    // Колонка updated_at есть только у nodes; универсальный UPSERT для
+    // остальных таблиц на неё ссылаться не должен.
+    const hasUpdatedAt = this.table === TABLES.nodes;
+    const extra = EXTRA_COLUMNS[this.table];
+    const colNames = ['id', 'data', ...Object.keys(extra)];
+    const placeholders = ['$1', '$2', ...Object.keys(extra).map((_, i) => `$${i + 3}`)];
+    const onConflict = hasUpdatedAt ? 'DO UPDATE SET data = $2, updated_at = now()' : 'DO UPDATE SET data = $2';
+    const q = `INSERT INTO ${this.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})
+               ON CONFLICT (id) ${onConflict}`;
+    const params: unknown[] = [id, row, ...Object.values(extra).map((getter) => getter(item))];
     if (client) {
-      await client.query(q, [id, row]);
+      await client.query(q, params);
     } else if (pool) {
-      await pool.query(q, [id, row]);
+      await pool.query(q, params);
     }
   }
 

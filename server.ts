@@ -705,8 +705,6 @@ async function seedInitialData() {
     },
   ];
 
-  sampleCandidates.forEach((cand) => candidates.set(cand));
-
   // Audit initial gateway boot
   addAudit('gateway_boot', 'system', 'gateway', GATEWAY_ID, {
     version: VERSION,
@@ -744,8 +742,10 @@ const consentsSeed: ConsentItem[] = [];
 // блокировать локальную разработку.
 
 async function bootstrap() {
-  const pgOk = true;
-  const redisOk = true;
+  // initDb создаёт схему и поднимает LISTEN/NOTIFY-слушатель; без него
+  // dbEnabled() остаётся false и хранилище молчит в in-memory режиме.
+  const pgOk = await initDb();
+  const redisOk = await initRedis();
 
   // Регистрируем перезагрузку кэшей каждой таблицы при приходе NOTIFY.
   nodes.registerReloadHandler(() => nodes.reload());
@@ -3634,6 +3634,18 @@ function breakerConfig() {
 }
 
 async function main(): Promise<void> {
+  // Необработанный reject в async-хендлере Express по умолчанию убивает
+  // процесс — один сбой записи в БД ронял бы реплику целиком. Логируем и
+  // продолжаем обслуживать трафик.
+  process.on('unhandledRejection', (reason) => {
+    logger.error('Необработанный reject — шлюз продолжает работу', {
+      error: reason instanceof Error ? reason.message : String(reason),
+    });
+  });
+  process.on('uncaughtException', (err) => {
+    logger.error('Необработанное исключение — шлюз продолжает работу', { error: err.message });
+  });
+
   try {
     await bootstrap();
     await startBackgroundLoops();

@@ -145,6 +145,13 @@ function dbConnected() {
   return connected;
 }
 var NOTIFY_CHANNEL = "foa_changes";
+var EXTRA_COLUMNS = {
+  nodes: {},
+  api_keys: { key_hash: (i) => i.key_hash ?? null },
+  consents: { node_id: (i) => i.node_id },
+  blacklist: {},
+  candidates: { observed_at: (i) => i.observed_at }
+};
 var TABLES = {
   nodes: "nodes",
   apiKeys: "api_keys",
@@ -197,9 +204,12 @@ async function initDb() {
   try {
     pool = new import_pg.Pool({ connectionString: url, max: 10, idleTimeoutMillis: 3e4 });
     await pool.query("SELECT 1");
-    for (const stmt of SCHEMA_STATEMENTS) {
-      await pool.query(stmt);
-    }
+    await tx(async (client2) => {
+      await client2.query("SELECT pg_advisory_xact_lock(8135701)");
+      for (const stmt of SCHEMA_STATEMENTS) {
+        await client2.query(stmt);
+      }
+    });
     listener = new import_pg.Client({ connectionString: url });
     await listener.connect();
     await listener.query(`LISTEN ${NOTIFY_CHANNEL}`);
@@ -323,12 +333,18 @@ var Store = class {
     this.cache.set(id, item);
     if (!enabled) return;
     const row = this.serialize(item);
-    const q = `INSERT INTO ${this.table} (id, data) VALUES ($1, $2)
-               ON CONFLICT (id) DO UPDATE SET data = $2, updated_at = now()`;
+    const hasUpdatedAt = this.table === TABLES.nodes;
+    const extra = EXTRA_COLUMNS[this.table];
+    const colNames = ["id", "data", ...Object.keys(extra)];
+    const placeholders = ["$1", "$2", ...Object.keys(extra).map((_, i) => `$${i + 3}`)];
+    const onConflict = hasUpdatedAt ? "DO UPDATE SET data = $2, updated_at = now()" : "DO UPDATE SET data = $2";
+    const q = `INSERT INTO ${this.table} (${colNames.join(", ")}) VALUES (${placeholders.join(", ")})
+               ON CONFLICT (id) ${onConflict}`;
+    const params = [id, row, ...Object.values(extra).map((getter) => getter(item))];
     if (client2) {
-      await client2.query(q, [id, row]);
+      await client2.query(q, params);
     } else if (pool) {
-      await pool.query(q, [id, row]);
+      await pool.query(q, params);
     }
   }
   async delete(id, client2) {
@@ -1313,7 +1329,6 @@ async function seedInitialData() {
       observed_at: now
     }
   ];
-  sampleCandidates.forEach((cand) => candidates.set(cand));
   addAudit("gateway_boot", "system", "gateway", GATEWAY_ID, {
     version: VERSION,
     pool_size: sampleNodes.length,
@@ -3617,6 +3632,14 @@ function breakerConfig() {
   };
 }
 async function main() {
+  process.on("unhandledRejection", (reason) => {
+    logger.error("\u041D\u0435\u043E\u0431\u0440\u0430\u0431\u043E\u0442\u0430\u043D\u043D\u044B\u0439 reject \u2014 \u0448\u043B\u044E\u0437 \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0430\u0435\u0442 \u0440\u0430\u0431\u043E\u0442\u0443", {
+      error: reason instanceof Error ? reason.message : String(reason)
+    });
+  });
+  process.on("uncaughtException", (err) => {
+    logger.error("\u041D\u0435\u043E\u0431\u0440\u0430\u0431\u043E\u0442\u0430\u043D\u043D\u043E\u0435 \u0438\u0441\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \u2014 \u0448\u043B\u044E\u0437 \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0430\u0435\u0442 \u0440\u0430\u0431\u043E\u0442\u0443", { error: err.message });
+  });
   try {
     await bootstrap();
     await startBackgroundLoops();
