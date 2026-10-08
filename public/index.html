@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <title>Free Ollama API Gateway</title>
 <meta name="description" content="Managed proxy gateway over an authorized Ollama node pool with consent gating, discovery, and admin dashboard">
 <meta property="og:title" content="Free Ollama API Gateway">
@@ -3145,7 +3146,7 @@ async function showVerificationModal(itemOrId, isCandidate = false) {
         <div style="font-weight: 600; margin-bottom: 4px;">Разместите файл согласия по адресу:</div>
         <div class="mono" style="word-break: break-all; color: var(--accent2); margin-bottom: 6px;">${esc(wellKnownUrl)}</div>
         <pre style="background: var(--bg); padding: 8px; border-radius: 4px; font-size: 11px; overflow-x: auto;">${esc(jsonBody)}</pre>
-        <button class="btn btn-sm" style="margin-top: 6px;" onclick="navigator.clipboard.writeText('${esc(jsonBody.replace(/'/g, "\\'"))}'); toast('JSON скопирован', 'success');">📋 Копировать JSON</button>
+        <button class="btn btn-sm" style="margin-top: 6px;" onclick="navigator.clipboard.writeText(${escAttr(JSON.stringify(jsonBody))}); toast('JSON скопирован', 'success');">📋 Копировать JSON</button>
       `;
     } else if (method === 'dns_txt') {
       const record = challengeData?.dns_txt_record || `_free-ollama-challenge.${endpoint.replace(/^https?:\/\//, '').split(':')[0]}`;
@@ -3154,7 +3155,7 @@ async function showVerificationModal(itemOrId, isCandidate = false) {
         <div style="font-weight: 600; margin-bottom: 4px;">Добавьте DNS TXT запись:</div>
         <div style="margin-bottom: 4px;">Имя: <span class="mono" style="color: var(--accent2);">${esc(record)}</span></div>
         <div style="margin-bottom: 6px;">Значение: <span class="mono" style="color: var(--text);">${esc(val)}</span></div>
-        <button class="btn btn-sm" onclick="navigator.clipboard.writeText('${esc(val.replace(/'/g, "\\'"))}'); toast('TXT запись скопирована', 'success');">📋 Копировать TXT</button>
+        <button class="btn btn-sm" onclick="navigator.clipboard.writeText(${escAttr(JSON.stringify(val))}); toast('TXT запись скопирована', 'success');">📋 Копировать TXT</button>
       `;
     } else {
       box.innerHTML = `
@@ -4485,7 +4486,7 @@ async function renderApiDocs(container) {
 
         bodyHtml += `
           <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 12px;">
-            <button class="btn btn-sm btn-primary" onclick="testApiDocEndpoint('${ep.method}', '${ep.path}', ${gIdx}, ${epIdx}, ${JSON.stringify(ep.auth)})">🚀 Выполнить запрос (Try It Out)</button>
+            <button class="btn btn-sm btn-primary" onclick="testApiDocEndpoint('${escAttr(ep.method)}', '${escAttr(ep.path)}', ${gIdx}, ${epIdx}, '${escAttr(ep.auth)}')">🚀 Выполнить запрос (Try It Out)</button>
           </div>
           <div style="font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-dim); margin-bottom: 6px;">Ответ сервера:</div>
           <pre id="doc-res-${gIdx}-${epIdx}" class="mono" style="background: var(--bg); padding: 10px; border-radius: 6px; font-size: 12px; max-height: 220px; overflow-y: auto; color: var(--green);">Нажмите «Выполнить запрос», чтобы увидеть результат...</pre>

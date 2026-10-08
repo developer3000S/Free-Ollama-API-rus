@@ -4,6 +4,19 @@ set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$DIR"
 
+# Публичные домены (SAN DNS). Задаются вторым аргументом (можно несколько
+# через запятую/пробел) или переменной окружения PUBLIC_DOMAINS.
+# Пример: ./generate-cert.sh 147.45.125.8 "opensclaw.ai,www.opensclaw.ai"
+PUBLIC_DOMAINS="${2:-${PUBLIC_DOMAINS:-}}"
+
+if [ -n "$PUBLIC_DOMAINS" ]; then
+  # Нормализуем разделители: запятые -> пробелы
+  DOMAIN_LIST=$(printf '%s' "$PUBLIC_DOMAINS" | tr ',' ' ')
+else
+  echo "Внимание: домен(ы) не заданы. Передайте второй аргумент (или PUBLIC_DOMAINS), иначе SAN не будет содержать DNS-имя для браузера."
+  DOMAIN_LIST=""
+fi
+
 # Определение всех IP адресов хоста
 DETECTED_IPS=()
 DETECTED_IPS+=("127.0.0.1")
@@ -42,9 +55,17 @@ for ip in "${UNIQUE_IPS[@]}"; do
   fi
 done
 
+# Если заданы домены, используем первый домен как CN (для читаемости);
+# иначе — основной IP. Браузеры проверяют только SAN, CN для совместимости.
+PRIMARY_CN="$PRIMARY_IP"
+if [ -n "$DOMAIN_LIST" ]; then
+  PRIMARY_CN=$(printf '%s\n' $DOMAIN_LIST | head -n1)
+fi
+
 echo "=== Генерация TLS-сертификата ==="
-echo "Primary CN: $PRIMARY_IP"
-echo "SAN IPs: ${UNIQUE_IPS[*]}"
+echo "Primary CN: $PRIMARY_CN"
+echo "SAN IPs:  ${UNIQUE_IPS[*]}"
+echo "SAN DNS:  $DOMAIN_LIST"
 
 cat << EOF > "$DIR/openssl.cnf"
 [req]
@@ -64,10 +85,17 @@ subjectAltName = @alt_names
 DNS.1 = localhost
 EOF
 
-IDX=1
+DNS_IDX=2
+for d in $DOMAIN_LIST; do
+  [ -z "$d" ] && continue
+  echo "DNS.$DNS_IDX = $d" >> "$DIR/openssl.cnf"
+  DNS_IDX=$((DNS_IDX + 1))
+done
+
+IP_IDX=1
 for ip in "${UNIQUE_IPS[@]}"; do
-  echo "IP.$IDX = $ip" >> "$DIR/openssl.cnf"
-  IDX=$((IDX + 1))
+  echo "IP.$IP_IDX = $ip" >> "$DIR/openssl.cnf"
+  IP_IDX=$((IP_IDX + 1))
 done
 
 openssl req -x509 -nodes -days 365 -newkey rsa:2048 \

@@ -29,12 +29,15 @@ if [ ! -f deploy/tls/fullchain.pem ] || [ ! -f deploy/tls/privkey.pem ]; then
 elif ! openssl x509 -in deploy/tls/fullchain.pem -text -noout 2>/dev/null | grep -q "147.45.125.8"; then
   echo "Текущий сертификат не содержит IP 147.45.125.8 в SAN. Перевыпускаю..."
   REGEN_CERT=true
+elif ! openssl x509 -in deploy/tls/fullchain.pem -text -noout 2>/dev/null | grep -q "opensclaw.ai"; then
+  echo "Текущий сертификат не содержит домен opensclaw.ai в SAN. Перевыпускаю..."
+  REGEN_CERT=true
 fi
 
 if [ "$REGEN_CERT" = "true" ]; then
-  echo "Запуск генерации TLS-сертификата с SAN для 147.45.125.8..."
+  echo "Запуск генерации TLS-сертификата с SAN для 147.45.125.8 и opensclaw.ai..."
   chmod +x deploy/tls/generate-cert.sh 2>/dev/null || true
-  ./deploy/tls/generate-cert.sh "147.45.125.8"
+  ./deploy/tls/generate-cert.sh "147.45.125.8" "${PUBLIC_DOMAIN:-opensclaw.ai}"
 fi
 
 # 3. Удаление старых зависших образов

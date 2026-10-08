@@ -4,7 +4,7 @@ x509_extensions = v3_req
 prompt = no
 
 [req_distinguished_name]
-CN = 147.45.125.8
+CN = 10.244.244.212
 
 [v3_req]
 keyUsage = keyEncipherment, dataEncipherment, digitalSignature
@@ -13,9 +13,12 @@ subjectAltName = @alt_names
 
 [alt_names]
 DNS.1 = localhost
-IP.1 = 127.0.0.1
-IP.2 = 147.45.125.8
-IP.3 = 169.254.169.1
-IP.4 = 169.254.8.1
-IP.5 = 169.254.9.1
-IP.6 = 34.34.253.193
+DNS.2 = opensclaw.ai
+DNS.3 = www.opensclaw.ai
+IP.1 = 10.244.244.212
+IP.2 = 127.0.0.1
+IP.3 = 147.45.125.8
+IP.4 = 172.17.0.1
+IP.5 = 172.18.0.1
+IP.6 = 172.19.0.1
+IP.7 = 172.20.0.1
