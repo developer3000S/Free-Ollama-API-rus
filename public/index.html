@@ -1190,6 +1190,12 @@ let monitorHistogramSelectedNode = 'all'; // 'all' or nodeId
 let monitorHistogramMode = 'count'; // 'count' | 'percentage'
 let cachedLatencyDistribution = null;
 
+// Параметры автообновления страницы Monitor: interval задаётся в секундах.
+const pollingSettings = {
+  enabled: true,
+  interval: 20,
+};
+
 // ======================================================================
 //  Monitor Client-Side Data Buffering & Request Aggregation
 // ======================================================================
