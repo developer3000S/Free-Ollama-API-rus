@@ -25,7 +25,6 @@ import {
   releaseInflight,
   recordRpm,
   getRpmBuckets,
-  seedRpmDemoData,
   registerGateway,
   listGateways,
   tryAcquireLeader,
@@ -395,22 +394,11 @@ function recordNodeLatencySample(nodeId: string, latencyMs: number) {
 //
 // Бакеты живут в Redis (см. src/redis.ts recordRpm/getRpmBuckets), поэтому
 // обе реплики шлюза накапливают общую историю. При отсутствии Redis счётчики
-// остаются локальными (демо-синусоида при старте не даёт дашборду быть пустым).
+// остаются локальными; демо-синусоида при старте убрана — график показывает
+// реальный трафик (пустой, пока запросов не было).
 const RPM_BUCKETS_COUNT = 60;
 const localRpmFallback: number[] = new Array(RPM_BUCKETS_COUNT).fill(0);
 let localRpmLastMinute = Math.floor(Date.now() / 60000);
-let rpmSeededLocally = false;
-
-function seedLocalRpm() {
-  if (rpmSeededLocally) return;
-  rpmSeededLocally = true;
-  for (let i = 0; i < RPM_BUCKETS_COUNT; i++) {
-    const wave = Math.sin((i / 60) * Math.PI * 4) * 22;
-    const wave2 = Math.cos((i / 60) * Math.PI * 2) * 12;
-    const jitter = Math.floor(Math.random() * 14) - 7;
-    localRpmFallback[i] = Math.max(15, Math.round(72 + wave + wave2 + jitter));
-  }
-}
 
 function shiftLocalRpm(currentMin: number) {
   const diff = currentMin - localRpmLastMinute;
@@ -429,7 +417,6 @@ function recordRequestForRpm(count = 1) {
     recordRpm(count).catch(() => shiftLocalRpm(Math.floor(Date.now() / 60000)));
     return;
   }
-  seedLocalRpm();
   shiftLocalRpm(Math.floor(Date.now() / 60000));
   localRpmFallback[localRpmFallback.length - 1] += count;
 }
@@ -443,7 +430,6 @@ async function getRpm60mData() {
       values = new Array(RPM_BUCKETS_COUNT).fill(0).map((_, i) => values[i] || 0);
     }
   } else {
-    seedLocalRpm();
     shiftLocalRpm(Math.floor(Date.now() / 60000));
     values = [...localRpmFallback];
   }
@@ -540,262 +526,21 @@ function addAudit(event: string, actor: string, subject_type: string, subject_id
   );
 }
 
-// Clean Initialization for FOA Gateway with multi-region nodes
+// Инициализация чистого старта для FOA Gateway.
+//
+// Демо-узлы (RFC 5737 TEST-NET: 198.51.100.x / 203.0.113.x / 192.0.2.x),
+// демо-кандидаты discovery и их согласия из пула удалены — они были
+// физически недостижимы и вызывали в чате «fetch failed». Шлюз стартует с
+// пустым пулом; настоящие узлы регистрируются через POST /admin/nodes или
+// раздел «Обнаружение».
 async function seedInitialData() {
-  const freshNodes = await nodes.list();
-  const freshKeys = await apiKeys.list();
-  // Сидим только если БД действительно пуста — иначе перезаписали бы
-  // реальные данные, сохранённые прошлыми запусками.
-  if (freshNodes.length > 0) {
-    return false;
-  }
-
-  const now = new Date().toISOString();
-  const sampleNodes: NodeItem[] = [];
-  const pushNode = (node: NodeItem) => {
-    sampleNodes.push(node);
-    nodeLatencySamples.set(node.node_id, generateDefaultSamplesForNode(node));
-    consentsSeed.push({
-      consent_id: `cst_${node.node_id}`,
-      node_id: node.node_id,
-      owner_id: node.owner_id,
-      status: node.consent_status === 'verified' ? 'active' : 'pending',
-      method: 'http_well_known',
-      allowed_models: node.models,
-      max_concurrency: node.max_concurrency,
-      issued_at: now,
-      expires_at: new Date(Date.now() + 90 * 86400000).toISOString(),
-      version: 1,
-      history: [{ event: 'seed_init', actor: 'system', created_at: now }],
-    });
-  };
-  pushNode({
-      node_id: 'node_us_east1',
-      endpoint: 'http://198.51.100.22:11434',
-      display_name: 'US-East FastCluster',
-      owner_id: 'ops@cloudscale.net',
-      models: ['llama3', 'llama3:8b', 'llama3:70b', 'mistral', 'mistral:7b'],
-      max_concurrency: 4,
-      active_connections: 1,
-      latency_ms: 45,
-      error_rate: 0.002,
-      weight: 10,
-      status: 'healthy',
-      consent_status: 'verified',
-      routable: true,
-      created_at: now,
-      updated_at: now,
-      state: 'healthy',
-      active: 1,
-      ewma_latency_ms: 45,
-      effective_weight: 10,
-      country: 'US',
-      ip: '198.51.100.22',
-    });
-  pushNode({
-      node_id: 'node_us_west2',
-      endpoint: 'http://198.51.100.58:11434',
-      display_name: 'US-West Inference Hub',
-      owner_id: 'ops@cloudscale.net',
-      models: ['llama3', 'llama3:8b', 'qwen2', 'qwen2:7b'],
-      max_concurrency: 2,
-      active_connections: 0,
-      latency_ms: 62,
-      error_rate: 0,
-      weight: 8,
-      status: 'healthy',
-      consent_status: 'verified',
-      routable: true,
-      created_at: now,
-      updated_at: now,
-      state: 'healthy',
-      active: 0,
-      ewma_latency_ms: 62,
-      effective_weight: 8,
-      country: 'US',
-      ip: '198.51.100.58',
-    });
-  pushNode({
-      node_id: 'node_de_fra1',
-      endpoint: 'http://203.0.113.14:11434',
-      display_name: 'DE-Frankfurt Dedicated',
-      owner_id: 'berlin-lab@research.de',
-      models: ['llama3', 'llama3:8b', 'mixtral:8x7b', 'phi3:mini'],
-      max_concurrency: 4,
-      active_connections: 2,
-      latency_ms: 88,
-      error_rate: 0.005,
-      weight: 12,
-      status: 'healthy',
-      consent_status: 'verified',
-      routable: true,
-      created_at: now,
-      updated_at: now,
-      state: 'healthy',
-      active: 2,
-      ewma_latency_ms: 88,
-      effective_weight: 12,
-      country: 'DE',
-      ip: '203.0.113.14',
-    });
-  pushNode({
-      node_id: 'node_de_mun2',
-      endpoint: 'http://203.0.113.88:11434',
-      display_name: 'DE-Munich GPU Rig',
-      owner_id: 'berlin-lab@research.de',
-      models: ['codellama:13b', 'llama3:8b'],
-      max_concurrency: 2,
-      active_connections: 0,
-      latency_ms: 145,
-      error_rate: 0.02,
-      weight: 5,
-      status: 'degraded',
-      consent_status: 'verified',
-      routable: true,
-      created_at: now,
-      updated_at: now,
-      state: 'degraded',
-      active: 0,
-      ewma_latency_ms: 145,
-      effective_weight: 5,
-      country: 'DE',
-      ip: '203.0.113.88',
-    });
-  pushNode({
-      node_id: 'node_jp_tyo1',
-      endpoint: 'http://192.0.2.77:11434',
-      display_name: 'JP-Tokyo Edge Node',
-      owner_id: 'tokyo-edge@ai-pacific.jp',
-      models: ['llama3:8b', 'qwen2:72b', 'gemma2:9b'],
-      max_concurrency: 4,
-      active_connections: 1,
-      latency_ms: 120,
-      error_rate: 0.001,
-      weight: 10,
-      status: 'healthy',
-      consent_status: 'verified',
-      routable: true,
-      created_at: now,
-      updated_at: now,
-      state: 'healthy',
-      active: 1,
-      ewma_latency_ms: 120,
-      effective_weight: 10,
-      country: 'JP',
-      ip: '192.0.2.77',
-    });
-  pushNode({
-      node_id: 'node_nl_ams1',
-      endpoint: 'http://192.0.2.140:11434',
-      display_name: 'NL-Amsterdam Relay',
-      owner_id: 'community@foa-relay.eu',
-      models: ['llama3:8b', 'mistral:7b'],
-      max_concurrency: 2,
-      active_connections: 0,
-      latency_ms: 76,
-      error_rate: 0,
-      weight: 6,
-      status: 'healthy',
-      consent_status: 'verified',
-      routable: true,
-      created_at: now,
-      updated_at: now,
-      state: 'healthy',
-      active: 0,
-      ewma_latency_ms: 76,
-      effective_weight: 6,
-      country: 'NL',
-      ip: '192.0.2.140',
-    });
-  pushNode({
-      node_id: 'node_fr_par1',
-      endpoint: 'http://192.0.2.215:11434',
-      display_name: 'FR-Paris Micro Compute',
-      owner_id: 'community@foa-relay.eu',
-      models: ['phi3:mini', 'llama3:8b'],
-      max_concurrency: 2,
-      active_connections: 0,
-      latency_ms: 82,
-      error_rate: 0,
-      weight: 4,
-      status: 'healthy',
-      consent_status: 'challenge_sent',
-      routable: false,
-      created_at: now,
-      updated_at: now,
-      state: 'pending_consent',
-      active: 0,
-      ewma_latency_ms: 82,
-      effective_weight: 0,
-      country: 'FR',
-      ip: '192.0.2.215',
-    },
-  );
-
-  const sampleCandidates: CandidateItem[] = [
-    {
-      candidate_id: 'cand_discovery_us1',
-      source: 'censys',
-      sources: ['censys'],
-      ip: '198.51.100.99',
-      port: 11434,
-      protocol: 'http',
-      dns_names: ['ai-edge-pool.us.cloud'],
-      country: 'US',
-      asn: 'AS15169 Google LLC',
-      service_hint: 'Ollama API v0.1.32',
-      risk_score: 12,
-      requires_manual_review: false,
-      status: 'candidate',
-      observed_at: now,
-    },
-    {
-      candidate_id: 'cand_discovery_de1',
-      source: 'shodan',
-      sources: ['shodan'],
-      ip: '203.0.113.190',
-      port: 11434,
-      protocol: 'http',
-      dns_names: ['gpu-cluster-fra.de'],
-      country: 'DE',
-      asn: 'AS24940 Hetzner Online GmbH',
-      service_hint: 'Ollama API (Llama3, Mixtral)',
-      risk_score: 8,
-      requires_manual_review: false,
-      status: 'candidate',
-      observed_at: now,
-    },
-  ];
-
-  // Audit initial gateway boot
+  // Аудит первой загрузки шлюза (без сидинга данных).
   addAudit('gateway_boot', 'system', 'gateway', GATEWAY_ID, {
     version: VERSION,
-    pool_size: sampleNodes.length,
+    pool_size: nodes.size,
     status: 'clean_initialized',
   });
-
-  // Фиксируем сиды в PG. Узлы и согласия пишутся в одной транзакции, чтобы
-  // при сбое не осталось узлов без согласий.
-  await tx(async (client) => {
-    for (const node of sampleNodes) {
-      await nodes.set(node, client);
-    }
-    for (const consent of consentsSeed) {
-      await consents.set(consent, client);
-    }
-    for (const cand of sampleCandidates) {
-      await candidates.set(cand, client);
-    }
-  }).catch((err) => {
-    logger.warn('Сидирование в PG не удалось — данные останутся в памяти', { error: err.message });
-  });
-
-  return true;
 }
-
-// Согласия для сид-узлов собираются отдельно, чтобы записать их в общей
-// транзакции с узлами.
-const consentsSeed: ConsentItem[] = [];
 
 // --- Инициализация хранилищ -------------------------------------------------
 //
@@ -823,12 +568,11 @@ async function bootstrap() {
     startFullReloadLoop(() => [TABLES.nodes, TABLES.consents, TABLES.blacklist, TABLES.candidates, TABLES.apiKeys]);
   }
 
-  // Демо-данные только при пустой БД (см. seedInitialData).
+  // Сидинг демо-узлов/кандидатов удалён: шлюз стартует с чистым пулом.
   await seedInitialData();
   rebuildKeyHashIndex();
 
   if (redisOk) {
-    await seedRpmDemoData();
     await registerGateway(GATEWAY_ID, {
       version: VERSION,
       started_at: new Date().toISOString(),
@@ -1515,11 +1259,10 @@ app.get('/admin/nodes/latency-distribution', adminAuth, (req, res) => {
 // Если сэмплер ещё не успел накопить точки (первый запрос сразу после старта),
 // возвращаем пустой массив — фронтенд покажет ожидание данных, а не выдуманные цифры.
 app.get('/admin/nodes/metrics', adminAuth, async (req, res) => {
-  // Первый зашедший запрос пингует сэмплер, чтобы данные появились сразу,
-  // не дожидаясь следующего тика интервала.
-  if (nodeMetricsHistory.size === 0) {
-    await sampleNodeMetricsOnce().catch(() => {});
-  }
+  // Каждое обращение панели (стартовая загрузка + автообновление каждые ~5 с)
+  // снимает свежий сэмпл — так график растёт в реальном времени. Фоновый
+  // лидер-цикл дублирует сэмплирование для реплик без открытой панели.
+  await sampleNodeMetricsOnce().catch(() => {});
 
   const timestampsSet = new Set<string>();
   for (const arr of nodeMetricsHistory.values()) {
@@ -1627,12 +1370,20 @@ app.post('/admin/nodes', adminAuth, async (req, res) => {
     ],
   };
 
-  // Узел и согласие пишутся атомарно: не должно возникать узла без согласия.
+  // Узел и согласие пишутся атомарно (через транзакцию PG), когда БД
+  // подключена; в in-memory режиме tx() бросает «БД не инициализирована»,
+  // поэтому используем обычные записи Store — они уже обновляют кэш и
+  // пишут в PG при его наличии. Не должно возникать узла без согласия.
   try {
-    await tx(async (client) => {
-      await nodes.set(newNode, client);
-      await consents.set(newConsent, client);
-    });
+    if (dbEnabled()) {
+      await tx(async (client) => {
+        await nodes.set(newNode, client);
+        await consents.set(newConsent, client);
+      });
+    } else {
+      await nodes.set(newNode);
+      await consents.set(newConsent);
+    }
   } catch (err: any) {
     logger.error('node registration failed', { error: err.message, node_id: nodeId });
     return res.status(500).json({ error: 'Не удалось зарегистрировать узел', detail: err.message });
@@ -1898,6 +1649,41 @@ app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
   });
 });
 
+// Разбор сетевых ошибок undici/node-fetch («fetch failed») в человеческое
+// сообщение: причина обычно в err.cause (ENOTFOUND/ECONNREFUSED/ETIMEDOUT...).
+function describeFetchError(err: any): string {
+  const cause = err?.cause;
+  const code = cause?.code || err?.code || '';
+  const reason = cause?.message || cause || '';
+  switch (code) {
+    case 'ENOTFOUND':
+      return `не удалось разрешить адрес узла (DNS${reason ? `: ${reason}` : ''})`;
+    case 'ECONNREFUSED':
+      return `узел отверг соединение (порт закрыт или Ollama не запущен${reason ? `: ${reason}` : ''})`;
+    case 'EHOSTUNREACH':
+    case 'ENETUNREACH':
+    case 'ENETDOWN':
+    case 'ECONNRESET':
+      return `сеть недоступна или соединение сброшено (${code})`;
+    case 'UND_ERR_CONNECT_TIMEOUT':
+    case 'UND_ERR_HEADERS_TIMEOUT':
+    case 'UND_ERR_BODY_TIMEOUT':
+      return `превышен таймаут соединения с узлом (${code})`;
+    case 'TimeoutError':
+    case 'AbortError':
+      return 'таймаут запроса к узлу';
+    case 'CERT_HAS_EXPIRED':
+    case 'DEPTH_ZERO_SELF_SIGNED_CERT':
+    case 'SELF_SIGNED_CERT':
+    case 'UNABLE_TO_VERIFY_LEAF_SIGNATURE':
+    case 'ERR_TLS_CERT_ALTNAME_INVALID':
+    case 'HR_BAD_VERIFY':
+      return `ошибка TLS-сертификата узла (${code || reason})`;
+    default:
+      return [code, String(reason || err?.message || 'неизвестная сетевая ошибка')].filter(Boolean).join(': ');
+  }
+}
+
 // Прямой прокси-чат с конкретным узлом (для карточки узла в админ-панели).
 // Аутентификация — как у всего /admin/* (Bearer токен админа/аудитора), поэтому
 // здесь НЕ требуется пользовательский API-ключ foa_live_.... Именно на этот
@@ -1915,22 +1701,31 @@ app.post('/admin/nodes/:id/chat', adminAuth, async (req, res) => {
   const message = String(lastUser?.content || '').trim();
   if (!message) return res.status(400).json({ error: 'Пустое сообщение' });
 
+  if (!node.endpoint || !/^https?:\/\//i.test(node.endpoint)) {
+    return res.status(400).json({
+      error: `Некорректный endpoint узла: ${node.endpoint || '(пусто)'}. Отредактируйте узел — адрес должен начинаться с http:// или https://`,
+    });
+  }
+
   const model = req.body?.model || (Array.isArray(node.models) && node.models[0]) || 'llama3';
   const messages = incomingMessages.map((m: any) => ({ role: m.role || 'user', content: String(m.content ?? '') }));
 
   const start = Date.now();
   node.active_connections++;
   try {
-    const upstreamRes = await fetch(`${node.endpoint}/api/chat`, {
+    const upstreamRes = await fetch(`${node.endpoint.replace(/\/+$/, '')}/api/chat`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: upstreamHeaders(req),
       body: JSON.stringify({ model, messages, stream: false }),
-      signal: AbortSignal.timeout(15000),
-    });
+      signal: AbortSignal.timeout(120_000),
+      ...dispatcherFor(node.endpoint, Math.max(1, node.max_concurrency || 4)),
+    } as any);
 
     if (!upstreamRes.ok) {
       const text = await upstreamRes.text().catch(() => '');
-      throw new Error(`Узел ответил HTTP ${upstreamRes.status}${text ? `: ${text.slice(0, 200)}` : ''}`);
+      let detail = text.slice(0, 300);
+      try { detail = String(JSON.parse(text)?.error || detail); } catch { /* не JSON */ }
+      throw new Error(`Узел ответил HTTP ${upstreamRes.status}${detail ? `: ${detail}` : ''}`);
     }
 
     const data = (await upstreamRes.json()) as any;
@@ -1938,16 +1733,27 @@ app.post('/admin/nodes/:id/chat', adminAuth, async (req, res) => {
       ? data.message.content
       : (typeof data.response === 'string' ? data.response : '');
 
+    // Успешный ответ — обновляем статистику здоровья узла (как в callUpstream)
+    const latency = Date.now() - start;
+    node.latency_ms = latency;
+    node.ewma_latency_ms = node.ewma_latency_ms
+      ? Math.round(node.ewma_latency_ms * 0.7 + latency * 0.3)
+      : latency;
+    node.updated_at = new Date().toISOString();
+
     res.json({
       reply,
       model: data.model || model,
       node_id: node.node_id,
-      latency_ms: Date.now() - start,
+      latency_ms: latency,
       done: data.done !== false,
     });
   } catch (err: any) {
-    addAudit('node_chat_error', 'admin', 'node', node.node_id, { error: err.message });
-    res.status(502).json({ error: `Чат с узлом недоступен: ${err.message}` });
+    addAudit('node_chat_error', 'admin', 'node', node.node_id, { error: err?.message, cause: err?.cause?.code });
+    const friendly = String(err?.message || '') === 'fetch failed'
+      ? `Чат с узлом недоступен: узел не отвечает по адресу ${node.endpoint} (${describeFetchError(err)})`
+      : `Чат с узлом недоступен: ${err?.message || 'неизвестная ошибка'}`;
+    res.status(502).json({ error: friendly });
   } finally {
     node.active_connections = Math.max(0, node.active_connections - 1);
   }
@@ -2595,14 +2401,24 @@ app.post('/admin/demo/clear', adminAuth, async (req, res) => {
   const kCnt = apiKeys.size;
 
   try {
-    await tx(async (client) => {
+    if (dbEnabled()) {
+      await tx(async (client) => {
+        await nodes.clear();
+        await candidates.clear();
+        await blacklist.clear();
+        await consents.clear();
+        await apiKeys.clear();
+        await clearAudit();
+      });
+    } else {
+      // In-memory: Store.clear() уже чистит кэш, PG-ветка внутри no-op.
       await nodes.clear();
       await candidates.clear();
       await blacklist.clear();
       await consents.clear();
       await apiKeys.clear();
       await clearAudit();
-    });
+    }
     auditLogs.length = 0;
     rebuildKeyHashIndex();
   } catch (err: any) {
@@ -3790,6 +3606,15 @@ async function startBackgroundLoops(): Promise<void> {
     });
     await Promise.allSettled(checks);
   }, 15_000).unref();
+
+  // Сэмплирование CPU/Memory для вкладки «Производительность»: каждые
+  // NODE_METRICS_INTERVAL_MS точка пишется в ring-буфер (когда панель
+  // открыта, GET /admin/nodes/metrics снимает сэмпл сам; этот цикл —
+  // страховка для реплик без активного просмотра).
+  setInterval(async () => {
+    if (!(await amILeader())) return;
+    await sampleNodeMetricsOnce().catch(() => {});
+  }, NODE_METRICS_INTERVAL_MS).unref();
 
   // §4.7 удаление кандидатов старше 90 дней.
   setInterval(async () => {

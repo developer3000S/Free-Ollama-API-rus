@@ -556,6 +556,8 @@ select.form-control { appearance: auto; }
 .node-chat-model-row { display: flex; align-items: center; gap: 8px; }
 .node-chat-model-label { font-size: 12px; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; }
 .node-chat-model-select { max-width: 320px; font-size: 13px; }
+.node-chat-retry { margin-top: 6px; font-size: 12px; padding: 3px 10px; background: var(--bg2); color: var(--red); border: 1px solid var(--red); border-radius: 6px; cursor: pointer; }
+.node-chat-retry:hover { background: rgba(239,68,68,.18); }
 .node-chat-input-row { display: flex; gap: 8px; }
 .node-chat-input { flex: 1; }
 .node-chat-send { flex-shrink: 0; }

@@ -303,29 +303,6 @@ class RpmLocalFallback {
 
 const rpmLocalFallback = new RpmLocalFallback();
 
-// Демо-синусоида при первом старте, чтобы дашборд не был пустым (поведение
-// предыдущей in-memory версии).
-export async function seedRpmDemoData(): Promise<void> {
-  if (!enabled || !client) return;
-  try {
-    const seeded = await client.setnx('foa:rpm:seeded', '1');
-    if (!seeded) return;
-    const currentMin = Math.floor(Date.now() / 60000);
-    const pipeline = client.multi();
-    for (let i = RPM_BUCKETS - 1; i >= 0; i--) {
-      const wave = Math.sin((i / RPM_BUCKETS) * Math.PI * 4) * 22;
-      const wave2 = Math.cos((i / RPM_BUCKETS) * Math.PI * 2) * 12;
-      const jitter = Math.floor(Math.random() * 14) - 7;
-      const value = Math.max(15, Math.round(72 + wave + wave2 + jitter));
-      const key = `foa:rpm:${currentMin - i}`;
-      pipeline.set(key, value, 'EX', RPM_BUCKETS * 70);
-    }
-    await pipeline.exec();
-  } catch (err: any) {
-    logger.warn('Не удалось посеять демо RPM в Redis', { error: err.message });
-  }
-}
-
 // --- Реестр живых реплик шлюза ----------------------------------------------
 //
 // Каждая реплика продлевает свой ключ с TTL — /admin/status показывает,
