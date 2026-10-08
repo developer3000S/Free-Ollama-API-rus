@@ -153,9 +153,19 @@ async function sendNodeChatMessage(nodeId, text) {
       time: new Date(),
     });
   } catch (err) {
+    const msg = String(err && err.message || 'неизвестная ошибка');
+    // Сетевая недоступность узла (502 «fetch failed» / таймауты): даём
+    // понятную подсказку и кнопку повтора вместо голой технической ошибки.
+    const unreachable = /недоступен|fetch failed|таймаут|не отвечает|ECONNREFUSED|ENOTFOUND|ETIMEDOUT/i.test(msg);
+    let hint = '';
+    if (unreachable) {
+      const node = (currentNodesList || []).find(n => n.node_id === nodeId);
+      hint = `\nПодсказка: проверьте, что Ollama запущена на адресе ${node && node.endpoint ? node.endpoint : 'узла'} `
+        + 'и доступен из сети шлюза (кнопка «Проверить здоровье» на карточке узла).';
+    }
     nodeChatState.messages.push({
-      role: 'assistant', error: true,
-      content: `⚠️ Ошибка: ${err.message}`, time: new Date(),
+      role: 'assistant', error: true, retryText: unreachable ? text : null,
+      content: `⚠️ Ошибка: ${msg}${hint}`, time: new Date(),
     });
   } finally {
     nodeChatState.sending = false;
@@ -181,14 +191,29 @@ function renderNodeChatMessages() {
     box.innerHTML = '<div class="node-chat-empty">Начните диалог — сообщения будут отправляться напрямую на выбранный узел.</div>';
     return;
   }
-  box.innerHTML = nodeChatState.messages.map(m => {
+  box.innerHTML = nodeChatState.messages.map((m, idx) => {
     const cls = m.role === 'user' ? 'msg-user' : (m.error ? 'msg-error' : 'msg-assistant');
     const author = m.role === 'user' ? 'Вы' : 'Узел';
     const t = m.time ? m.time.toLocaleTimeString('ru-RU', {hour: '2-digit', minute: '2-digit'}) : '';
+    const retryBtn = m.error && m.retryText
+      ? `<button type="button" class="btn btn-sm node-chat-retry" data-idx="${idx}">🔁 Повторить</button>`
+      : '';
     return `<div class="node-chat-msg ${cls}">
       <div class="node-chat-msg-head">${author}<span class="node-chat-msg-time">${t}</span></div>
-      <div class="node-chat-msg-body">${esc(m.content)}</div>
+      <div class="node-chat-msg-body">${esc(m.content).replace(/\n/g, '<br>')}</div>
+      ${retryBtn}
     </div>`;
   }).join('');
+  box.querySelectorAll('.node-chat-retry').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const i = Number(btn.getAttribute('data-idx'));
+      const failed = nodeChatState.messages[i];
+      if (!failed || !failed.retryText || nodeChatState.sending) return;
+      // Убираем сообщение-ошибку и отправляем текст заново
+      nodeChatState.messages.splice(i, 1);
+      nodeChatHistories[nodeChatState.nodeId] = nodeChatState.messages;
+      sendNodeChatMessage(nodeChatState.nodeId, failed.retryText);
+    });
+  });
   box.scrollTop = box.scrollHeight;
 }
