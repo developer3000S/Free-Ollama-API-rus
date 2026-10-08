@@ -20,7 +20,6 @@ const pollingSettings = {
 // ======================================================================
 //  Monitor Client-Side Data Buffering & Request Aggregation
 // ======================================================================
-let monitorActiveSubTab = 'overview'; // 'overview' | 'performance'
 let monitorFetchInProgress = null;
 let monitorLastFetchTime = 0;
 const MONITOR_DEBOUNCE_MS = 600;
@@ -253,30 +252,16 @@ function updateMonitorView(container, preserveInputFocus = false) {
     return;
   }
 
-  // Под-вкладки страницы: Обзор — временные ряды, Производительность — распределение
-  const subTabs = h('div', {class: 'sub-tabs'});
-  subTabs.appendChild(h('button', {
-    class: monitorActiveSubTab === 'overview' ? 'active' : '',
-    onClick: () => { monitorActiveSubTab = 'overview'; updateMonitorView(container); }
-  }, '📊 Обзор'));
-  subTabs.appendChild(h('button', {
-    class: monitorActiveSubTab === 'performance' ? 'active' : '',
-    onClick: () => { monitorActiveSubTab = 'performance'; updateMonitorView(container); }
-  }, '🚀 Производительность'));
-  container.appendChild(subTabs);
+  // Вкладка «Обзор» удалена — на странице Monitor всегда показывается
+  // единственная вкладка «Производительность».
 
   const flow = h('div', {class: 'page-flow'});
   container.appendChild(flow);
 
-  // Summary cards based on filtered nodes
+  // Средняя задержка по отфильтрованным узлам (по накопленному буферу)
   const avgLatency = filteredNodes.length ? filteredNodes.reduce((acc, n) => acc + getBufferedLatency(n.node_id, n.latency_ms || 0), 0) / filteredNodes.length : 0;
-  const avgError = filteredNodes.length ? filteredNodes.reduce((acc, n) => acc + (n.error_rate || 0), 0) / filteredNodes.length : 0;
 
-  if (monitorActiveSubTab === 'performance') {
-    renderMonitorPerformance(flow, filteredNodes, avgLatency);
-  } else {
-    renderMonitorOverview(flow, filteredNodes, avgLatency, avgError);
-  }
+  renderMonitorPerformance(flow, filteredNodes, avgLatency);
 
   if (preserveInputFocus) {
     const input = document.getElementById('monitor-search-input');
@@ -287,172 +272,7 @@ function updateMonitorView(container, preserveInputFocus = false) {
   }
 }
 
-/* ----- Под-вкладка «Обзор»: сводные карточки + временные ряды Latency / Error ----- */
-function renderMonitorOverview(flow, filteredNodes, avgLatency, avgError) {
-  if (!filteredNodes.length) {
-    flow.appendChild(h('div', {class: 'empty-state'}, h('span', {class: 'icon'}, '🔍'), h('p', null, 'Нет узлов, соответствующих поисковому запросу')));
-    return;
-  }
-
-  const statsGrid = h('div', {class: 'grid grid-3'});
-  statsGrid.appendChild(h('div', {class: 'card'},
-    h('div', {class: 'card-header'}, h('span', {class: 'card-title'}, 'Найдено узлов'), h('span', {class: 'card-icon'}, '🖥️')),
-    h('div', {class: 'card-value', style: {color: 'var(--accent)'}}, `${filteredNodes.length} / ${cachedRoutableNodes.length}`),
-    h('div', {class: 'card-sub'}, 'отфильтровано / всего routable')
-  ));
-  statsGrid.appendChild(h('div', {class: 'card'},
-    h('div', {class: 'card-header'}, h('span', {class: 'card-title'}, 'Средняя задержка'), h('span', {class: 'card-icon'}, '⚡')),
-    h('div', {class: 'card-value', style: {color: 'var(--blue)'}}, `${avgLatency.toFixed(0)} мс`),
-    h('div', {class: 'card-sub'}, 'по накопленному буферу опросов')
-  ));
-  statsGrid.appendChild(h('div', {class: 'card'},
-    h('div', {class: 'card-header'}, h('span', {class: 'card-title'}, 'Средний процент ошибок'), h('span', {class: 'card-icon'}, '⚠️')),
-    h('div', {class: 'card-value', style: {color: avgError > 0.05 ? 'var(--red)' : 'var(--green)'}}, `${(avgError * 100).toFixed(2)}%`),
-    h('div', {class: 'card-sub'}, 'среднее по последнему опросу')
-  ));
-  flow.appendChild(statsGrid);
-
-  const chartsGrid = h('div', {class: 'grid grid-2'});
-
-  const latCard = h('div', {class: 'card'},
-    h('div', {class: 'chart-card-head'},
-      h('div', null,
-        h('div', {class: 'chart-title'},
-          h('span', {class: 'card-title', style: {marginBottom: '0'}}, 'Задержка узлов (Latency)'),
-          h('span', {id: 'latency-avg-badge', class: 'badge badge-blue', style: {fontSize: '11px', display: 'none'}}, '')
-        ),
-        h('div', {class: 'chart-note'},
-          `История по опросам каждые ${pollingSettings.interval || 20} с (до ${BUFFER_MAX_POINTS} точек)`
-        )
-      ),
-      h('div', {class: 'chart-actions'},
-        h('button', {
-          class: 'btn btn-xs',
-          onclick: () => toggleAllMonitorDatasets()
-        }, 'Все / Ничего'),
-        h('div', {id: 'latency-legend-overlay', class: 'legend-pills'})
-      )
-    ),
-    h('div', {style: {position: 'relative', height: '300px'}},
-      h('canvas', {id: 'latency-chart'})
-    )
-  );
-  chartsGrid.appendChild(latCard);
-
-  const errCard = h('div', {class: 'card'},
-    h('div', {class: 'card-card-head'},
-      h('div', {class: 'chart-title'},
-        h('span', {class: 'card-title', style: {marginBottom: '0'}}, 'Процент ошибок (Error Rate)'),
-        h('span', {class: 'badge badge-gray', style: {fontSize: '11px'}}, 'та же легенда, что у Latency')
-      ),
-      h('div', {class: 'chart-note'}, 'Легенда управляется с карточки Latency')
-    ),
-    h('div', {style: {position: 'relative', height: '320px'}},
-      h('canvas', {id: 'error-chart'})
-    )
-  );
-  chartsGrid.appendChild(errCard);
-  flow.appendChild(chartsGrid);
-
-  setTimeout(() => renderMonitorTimeSeries(filteredNodes), 50);
-}
-
-// Переключение видимости всех датасетов на обоих графиках (Latency + Error).
-function toggleAllMonitorDatasets() {
-  if (!monitorLatencyChartInstance) return;
-  const allHidden = monitorLatencyChartInstance.data.datasets.every((_, idx) =>
-    monitorLatencyChartInstance.getDatasetMeta(idx).hidden);
-  const targetHidden = !allHidden;
-  monitorLatencyChartInstance.data.datasets.forEach((_, idx) => {
-    monitorLatencyChartInstance.getDatasetMeta(idx).hidden = targetHidden;
-    if (monitorErrorChartInstance && monitorErrorChartInstance.data.datasets[idx]) {
-      monitorErrorChartInstance.getDatasetMeta(idx).hidden = targetHidden;
-    }
-  });
-  monitorLatencyChartInstance.update();
-  if (monitorErrorChartInstance) monitorErrorChartInstance.update();
-  refreshLatencyLegendOverlay();
-}
-
-// Построение рядов Latency / Error Rate из клиентского буфера истории опросов.
-function renderMonitorTimeSeries(filteredNodes) {
-  const latCanvas = document.getElementById('latency-chart');
-  const errCanvas = document.getElementById('error-chart');
-  if (!latCanvas || !errCanvas) return;
-  const latCtx = latCanvas.getContext('2d');
-  const errCtx = errCanvas.getContext('2d');
-  if (!latCtx || !errCtx) return;
-
-  if (monitorLatencyChartInstance) { monitorLatencyChartInstance.destroy(); monitorLatencyChartInstance = null; }
-  if (monitorErrorChartInstance) { monitorErrorChartInstance.destroy(); monitorErrorChartInstance = null; }
-
-  const palette = ['#6366f1', '#3b82f6', '#22c55e', '#f59e0b', '#ec4899', '#06b6d4', '#8b5cf6'];
-
-  // Метки оси X берём из самого длинного ряда буфера.
-  let timeLabels = [];
-  filteredNodes.forEach(n => {
-    const series = getBufferedSeries(n.node_id);
-    if (series.labels.length > timeLabels.length) timeLabels = series.labels;
-  });
-
-  const latencyDatasets = filteredNodes.map((n, idx) => {
-    const series = getBufferedSeries(n.node_id);
-    return {
-      label: n.display_name || shortId(n.node_id),
-      data: series.latency,
-      borderColor: palette[idx % palette.length],
-      backgroundColor: palette[idx % palette.length],
-      borderWidth: 2,
-      tension: 0.3,
-      pointRadius: 2,
-      spanGaps: false,
-    };
-  });
-
-  const errorDatasets = filteredNodes.map((n, idx) => {
-    const series = getBufferedSeries(n.node_id);
-    return {
-      label: n.display_name || shortId(n.node_id),
-      data: series.errors,
-      borderColor: palette[idx % palette.length],
-      backgroundColor: palette[idx % palette.length],
-      borderWidth: 2,
-      tension: 0.3,
-      pointRadius: 2,
-      spanGaps: false,
-    };
-  });
-
-  // Своя легенда Chart.js отключена — управляется кастомным оверлеем.
-  const commonOptions = {
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: {
-      legend: { display: false },
-      tooltip: { mode: 'index', intersect: false }
-    },
-    scales: {
-      x: { grid: { color: '#2e3140' }, ticks: { color: '#94a3b8', maxTicksLimit: 12 } },
-      y: { grid: { color: '#2e3140' }, ticks: { color: '#94a3b8' }, beginAtZero: true }
-    }
-  };
-
-  monitorLatencyChartInstance = new Chart(latCtx, {
-    type: 'line',
-    data: { labels: timeLabels, datasets: latencyDatasets },
-    options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, title: { display: true, text: 'Latency (ms)', color: '#94a3b8' } } } }
-  });
-
-  refreshLatencyLegendOverlay();
-
-  monitorErrorChartInstance = new Chart(errCtx, {
-    type: 'line',
-    data: { labels: timeLabels, datasets: errorDatasets },
-    options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, title: { display: true, text: 'Error Rate (%)', color: '#94a3b8' } } } }
-  });
-}
-
-/* ----- Под-вкладка «Производительность»: гистограмма + перцентили ----- */
+/* ----- Вкладка «Производительность»: гистограмма + перцентили ----- */
 function renderMonitorPerformance(flow, filteredNodes, avgLatency) {
   if (!filteredNodes.length) {
     flow.appendChild(h('div', {class: 'empty-state'}, h('span', {class: 'icon'}, '🔍'), h('p', null, 'Нет узлов, соответствующих поисковому запросу')));
@@ -460,7 +280,8 @@ function renderMonitorPerformance(flow, filteredNodes, avgLatency) {
   }
 
   const agg = cachedLatencyDistribution?.aggregate;
-  const statsGrid = h('div', {class: 'grid grid-4'});
+  // Карточки перцентилей — с динамической шириной (flex), как на Dashboard.
+  const statsGrid = h('div', {class: 'grid-auto'});
   const kpiCards = [
     { label: 'P50 (медиана)', value: agg ? `${agg.p50} мс` : '—', icon: '🎯', color: '#10b981' },
     { label: 'P95', value: agg ? `${agg.p95} мс` : '—', icon: '📏', color: '#3b82f6' },
