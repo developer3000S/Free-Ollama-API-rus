@@ -166,6 +166,7 @@ tr:hover td { background: rgba(99,102,241,.04); }
 .btn-xs { padding: 2px 8px; font-size: 11px; border-radius: 12px; }
 .btn-outline { background: transparent; }
 .btn-icon { padding: 6px; width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center; }
+.btn-xs.btn-icon { width: 28px; height: 28px; padding: 4px; border-radius: 8px; font-size: 14px; }
 .btn-group { display: flex; gap: 4px; }
 
 /* ===== Page layout helpers ===== */
@@ -247,6 +248,7 @@ select.form-control { appearance: auto; }
 }
 .modal h3 { font-size: 17px; margin-bottom: 16px; }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+.modal-footer-icons { flex-wrap: wrap; justify-content: center; gap: 6px; }
 
 /* ===== Toast ===== */
 .toast-container { position: fixed; top: 16px; right: 16px; z-index: 2000; display: flex; flex-direction: column; gap: 8px; }
