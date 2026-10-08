@@ -43,6 +43,13 @@ function showNodeChatModal(nodeId) {
       h('label', {class: 'node-chat-model-label', for: 'node-chat-model-select'}, 'Модель:'),
       modelSelect
     ),
+    h('div', {class: 'node-chat-toolbar'},
+      h('span', {class: 'node-chat-count', id: 'node-chat-count'}),
+      h('button', {
+        type: 'button', class: 'btn btn-sm btn-outline node-chat-clear', id: 'node-chat-clear',
+        title: 'Очистить историю сообщений этого узла',
+      }, '🗑 Очистить чат')
+    ),
     h('div', {class: 'node-chat-messages', id: 'node-chat-messages'}),
     h('form', {class: 'node-chat-input-row', id: 'node-chat-form'},
       h('input', {
@@ -62,6 +69,12 @@ function showNodeChatModal(nodeId) {
 
   modelSelect.addEventListener('change', () => {
     nodeChatState.model = modelSelect.value || null;
+  });
+
+  // Кнопка очистки чата: чистит историю текущего узла (и в памяти сессии).
+  // Работает через делегирование на контейнер — переживает перерисовки.
+  el.querySelector('#node-chat-clear').addEventListener('click', () => {
+    clearNodeChat(nodeId);
   });
 
   const form = el.querySelector('#node-chat-form');
@@ -168,10 +181,15 @@ async function sendNodeChatMessage(nodeId, text) {
       content: `⚠️ Ошибка: ${msg}${hint}`, time: new Date(),
     });
   } finally {
+    // Если чат был очищен (или окно переключено на другой узел) пока запрос
+    // был в полёте — не дописываем ответ в новую историю.
+    const stillCurrent = nodeChatState.nodeId === nodeId && nodeChatState.sending;
+    if (stillCurrent) {
+      nodeChatHistories[nodeId] = nodeChatState.messages;
+      renderNodeChatMessages();
+    }
     nodeChatState.sending = false;
-    nodeChatHistories[nodeId] = nodeChatState.messages;
     setNodeChatBusy(false);
-    renderNodeChatMessages();
     const i = document.querySelector('#node-chat-input');
     if (i) i.focus();
   }
@@ -184,9 +202,31 @@ function setNodeChatBusy(busy) {
   if (inp) inp.disabled = busy;
 }
 
+// Очистка чата узла: сбрасывает историю сообщений (в state и в кэше сессии),
+// отменяет незавершённую отправку, чтобы запоздалый ответ не дописался в
+// уже очищенный чат. Модель выбора остаётся — её трогать не нужно.
+function clearNodeChat(nodeId) {
+  if (nodeChatState.nodeId !== nodeId) return;
+  if (!nodeChatState.messages.length && !nodeChatHistories[nodeId]) return;
+  if (nodeChatState.sending) {
+    if (!confirm('Ответ узла ещё ожидается. Всё равно очистить чат?')) return;
+    nodeChatState.sending = false; // «отвязываем» текущий запрос от истории
+    setNodeChatBusy(false);
+  }
+  nodeChatState.messages = [];
+  delete nodeChatHistories[nodeId];
+  renderNodeChatMessages();
+}
+
 function renderNodeChatMessages() {
   const box = document.querySelector('#node-chat-messages');
   if (!box) return;
+  // Счётчик сообщений и доступность кнопки «Очистить чат» в тулбаре
+  const cnt = document.querySelector('#node-chat-count');
+  const clearBtn = document.querySelector('#node-chat-clear');
+  const n = nodeChatState.messages.length;
+  if (cnt) cnt.textContent = n ? `Сообщений: ${n}` : '';
+  if (clearBtn) clearBtn.disabled = !n;
   if (!nodeChatState.messages.length) {
     box.innerHTML = '<div class="node-chat-empty">Начните диалог — сообщения будут отправляться напрямую на выбранный узел.</div>';
     return;

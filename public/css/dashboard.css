@@ -554,6 +554,9 @@ select.form-control { appearance: auto; }
 .node-chat-msg-head { font-size: 10px; opacity: .75; margin-bottom: 3px; display: flex; gap: 8px; text-transform: uppercase; letter-spacing: .5px; }
 .node-chat-msg-body { white-space: pre-wrap; word-break: break-word; }
 .node-chat-model-row { display: flex; align-items: center; gap: 8px; }
+.node-chat-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 2px 0; }
+.node-chat-count { color: #8b93a7; font-size: 12px; }
+.node-chat-clear[disabled] { opacity: .45; cursor: default; }
 .node-chat-model-label { font-size: 12px; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; }
 .node-chat-model-select { max-width: 320px; font-size: 13px; }
 .node-chat-retry { margin-top: 6px; font-size: 12px; padding: 3px 10px; background: var(--bg2); color: var(--red); border: 1px solid var(--red); border-radius: 6px; cursor: pointer; }

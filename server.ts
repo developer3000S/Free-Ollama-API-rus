@@ -43,6 +43,8 @@ import {
   closeAgentForEndpoint,
   closeAllAgents,
   dispatcherFor,
+  nodeFetch,
+  insecureTlsEnabled,
 } from './src/pool.js';
 import {
   toOllamaChatRequest,
@@ -324,10 +326,10 @@ async function sampleNodeMetricsOnce(): Promise<void> {
     try {
       // Ollama /api/ps возвращает информацию о загруженных моделях, включая
       // использование GPU/CPU памяти узла.
-      const psRes = await fetch(`${node.endpoint}/api/ps`, {
+      const psRes = await fetch(`${node.endpoint}/api/ps`, nodeFetchOpts({
         signal: AbortSignal.timeout(3_000),
         ...dispatcherFor(node.endpoint, Math.max(1, node.max_concurrency || 4)),
-      } as any);
+      }));
       if (psRes.ok) {
         const psData = (await psRes.json()) as any;
         const models = Array.isArray(psData.models) ? psData.models : [];
@@ -1470,7 +1472,7 @@ app.post('/admin/nodes/:id/verify', adminAuth, async (req, res) => {
 
   // Probe endpoint to refresh actual model list if node is up
   try {
-    const probeRes = await fetch(`${node.endpoint}/api/tags`, { signal: AbortSignal.timeout(3000) });
+    const probeRes = await fetch(`${node.endpoint}/api/tags`, nodeFetchOpts({ signal: AbortSignal.timeout(3000) }));
     if (probeRes.ok) {
       const data = (await probeRes.json()) as any;
       if (Array.isArray(data.models) && data.models.length) {
@@ -1594,17 +1596,17 @@ app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
   let errorMsg: string | undefined;
 
   try {
-    const probeRes = await fetch(`${node.endpoint}/api/version`, {
+    const probeRes = await fetch(`${node.endpoint}/api/version`, nodeFetchOpts({
       signal: AbortSignal.timeout(4000),
-    });
+    }));
     latency = Date.now() - start;
     if (probeRes.ok) {
       status = latency > 600 ? 'degraded' : 'healthy';
 
       try {
-        const tagsRes = await fetch(`${node.endpoint}/api/tags`, {
+        const tagsRes = await fetch(`${node.endpoint}/api/tags`, nodeFetchOpts({
           signal: AbortSignal.timeout(3000),
-        });
+        }));
         if (tagsRes.ok) {
           const tData = (await tagsRes.json()) as any;
           if (Array.isArray(tData.models) && tData.models.length) {
@@ -1713,13 +1715,18 @@ app.post('/admin/nodes/:id/chat', adminAuth, async (req, res) => {
   const start = Date.now();
   node.active_connections++;
   try {
-    const upstreamRes = await fetch(`${node.endpoint.replace(/\/+$/, '')}/api/chat`, {
-      method: 'POST',
-      headers: upstreamHeaders(req),
-      body: JSON.stringify({ model, messages, stream: false }),
-      signal: AbortSignal.timeout(120_000),
-      ...dispatcherFor(node.endpoint, Math.max(1, node.max_concurrency || 4)),
-    } as any);
+    // nodeFetch: при TLS-ошибке сертификата узла (самоподписанный TLS у
+    // публичных Ollama) делает один повтор без проверки CA вместо 502.
+    const { res: upstreamRes, tlsInsecureUsed } = await nodeFetch(
+      `${node.endpoint.replace(/\/+$/, '')}/api/chat`,
+      {
+        method: 'POST',
+        headers: upstreamHeaders(req),
+        body: JSON.stringify({ model, messages, stream: false }),
+        timeoutMs: 120_000,
+      },
+      { maxConcurrency: Math.max(1, node.max_concurrency || 4) }
+    );
 
     if (!upstreamRes.ok) {
       const text = await upstreamRes.text().catch(() => '');
@@ -1747,10 +1754,17 @@ app.post('/admin/nodes/:id/chat', adminAuth, async (req, res) => {
       node_id: node.node_id,
       latency_ms: latency,
       done: data.done !== false,
+      ...(tlsInsecureUsed ? { warning: 'использовано непроверяемое TLS-соединение с узлом (самоподписанный сертификат)' } : {}),
     });
+    if (tlsInsecureUsed) {
+      addAudit('node_chat_tls_fallback', 'admin', 'node', node.node_id, { endpoint: node.endpoint });
+    }
   } catch (err: any) {
     addAudit('node_chat_error', 'admin', 'node', node.node_id, { error: err?.message, cause: err?.cause?.code });
-    const friendly = String(err?.message || '') === 'fetch failed'
+    const isTimeout = err?.name === 'TimeoutError' || err?.cause?.name === 'TimeoutError';
+    const friendly = isTimeout
+      ? `Узел не ответил за 120 с по адресу ${node.endpoint}. Модель могла ещё не быть загружена в память (первый запрос к крупной модели качает её минуты). Повторите отправку — второй запрос обычно быстрее.`
+      : String(err?.message || '') === 'fetch failed'
       ? `Чат с узлом недоступен: узел не отвечает по адресу ${node.endpoint} (${describeFetchError(err)})`
       : `Чат с узлом недоступен: ${err?.message || 'неизвестная ошибка'}`;
     res.status(502).json({ error: friendly });
@@ -1770,7 +1784,10 @@ app.get('/admin/nodes/:id/models', adminAuth, async (req, res) => {
   let fetched = false;
   if (!models.length) {
     try {
-      const tagsRes = await fetch(`${node.endpoint}/api/tags`, { signal: AbortSignal.timeout(4000) });
+      const { res: tagsRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, '')}/api/tags`, {
+        method: 'GET',
+        timeoutMs: 15_000,
+      }, { maxConcurrency: Math.max(1, node.max_concurrency || 4) });
       if (tagsRes.ok) {
         const tData = (await tagsRes.json()) as any;
         if (Array.isArray(tData.models)) {
@@ -2673,7 +2690,7 @@ async function verifyAndEnrollCandidate(
   let latency = 45;
   try {
     const start = Date.now();
-    const probeRes = await fetch(`${endpoint}/api/tags`, { signal: AbortSignal.timeout(3500) });
+    const probeRes = await fetch(`${endpoint}/api/tags`, nodeFetchOpts({ signal: AbortSignal.timeout(3500) }));
     latency = Math.max(1, Date.now() - start);
     if (probeRes.ok) {
       const pData = (await probeRes.json()) as any;
@@ -3098,6 +3115,11 @@ interface ProxyResult {
 // Express-тип, а нам нужен глобальный fetch Response.
 type FetchResponse = globalThis.Response;
 
+// Хелпер: fetch к узлу с учётом флага FOA_INSECURE_TLS (самоподписанные
+// сертификаты узлов не ломают health-check / discovery / metrics).
+const nodeFetchOpts = (extra: Record<string, any> = {}): any =>
+  insecureTlsEnabled() ? { ...extra, rejectUnauthorized: false } : extra;
+
 // Вызов upstream на выбранном узле. Возвращает null, если узел недоступен —
 // тогда вызывающая сторона делает retry на другой узел.
 async function callUpstream(
@@ -3109,13 +3131,13 @@ async function callUpstream(
   const url = `${node.endpoint.replace(/\/+$/, '')}${path}`;
   try {
     const start = Date.now();
-    const res = await fetch(url, {
+    const res = await fetch(url, nodeFetchOpts({
       method: 'POST',
       headers: upstreamHeaders(req),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(120_000),
       dispatcher: dispatcherFor(node.endpoint, Math.max(1, node.max_concurrency || 4)),
-    } as any);
+    }));
     const latency = Date.now() - start;
 
     if (res.ok) {
@@ -3274,12 +3296,13 @@ app.post('/api/generate', userAuth, requireScopes('ollama:generate'), applyLimit
 
   // Try real upstream proxy to the Ollama node
   try {
-    const upstreamRes = await fetch(`${selectedNode.endpoint}/api/generate`, {
+    const upstreamRes = await fetch(`${selectedNode.endpoint}/api/generate`, nodeFetchOpts({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body),
-      signal: AbortSignal.timeout(4000),
-    });
+      signal: AbortSignal.timeout(120_000),
+      ...dispatcherFor(selectedNode.endpoint, Math.max(1, selectedNode.max_concurrency || 4)),
+    }));
 
     if (upstreamRes.ok) {
       res.status(upstreamRes.status);
@@ -3375,12 +3398,13 @@ app.post('/api/chat', userAuth, requireScopes('ollama:generate'), applyLimits({ 
 
   // Try real upstream proxy to the Ollama node
   try {
-    const upstreamRes = await fetch(`${selectedNode.endpoint}/api/chat`, {
+    const upstreamRes = await fetch(`${selectedNode.endpoint}/api/chat`, nodeFetchOpts({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body),
-      signal: AbortSignal.timeout(4000),
-    });
+      signal: AbortSignal.timeout(120_000),
+      ...dispatcherFor(selectedNode.endpoint, Math.max(1, selectedNode.max_concurrency || 4)),
+    }));
 
     if (upstreamRes.ok) {
       res.status(upstreamRes.status);
@@ -3590,10 +3614,10 @@ async function startBackgroundLoops(): Promise<void> {
     const checks = Array.from(nodes.values()).map(async (node) => {
       try {
         const start = Date.now();
-        const res = await fetch(`${node.endpoint}/api/tags`, {
+        const res = await fetch(`${node.endpoint}/api/tags`, nodeFetchOpts({
           signal: AbortSignal.timeout(3_500),
           ...dispatcherFor(node.endpoint, node.max_concurrency || 4),
-        } as any);
+        }));
         const latency = Date.now() - start;
         if (res.ok) {
           recordSuccess(node.node_id, latency, breakerConfig());
