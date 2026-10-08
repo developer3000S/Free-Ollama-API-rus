@@ -1666,7 +1666,7 @@ var applyLimits = (opts = {}) => {
       }
       const numPredict = body.options?.num_predict;
       if (typeof numPredict === "number" && numPredict > limits.max_num_predict) {
-        return sendApiError(req, res, 400, `num_predict \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_num_predict (${limits.max_num_predict})`);
+        body.options.num_predict = limits.max_num_predict;
       }
     } else if (opts.body === "chat" || opts.body === "openai") {
       const messages = Array.isArray(body.messages) ? body.messages : [];
@@ -1684,9 +1684,15 @@ var applyLimits = (opts = {}) => {
           );
         }
       }
-      const cap = opts.body === "openai" ? body.max_tokens ?? body.max_completion_tokens : body.options?.num_predict;
-      if (typeof cap === "number" && cap > limits.max_num_predict) {
-        return sendApiError(req, res, 400, `\u041B\u0438\u043C\u0438\u0442 \u0433\u0435\u043D\u0435\u0440\u0430\u0446\u0438\u0438 \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_num_predict (${limits.max_num_predict})`);
+      if (opts.body === "openai") {
+        if (typeof body.max_tokens === "number" && body.max_tokens > limits.max_num_predict) {
+          body.max_tokens = limits.max_num_predict;
+        }
+        if (typeof body.max_completion_tokens === "number" && body.max_completion_tokens > limits.max_num_predict) {
+          body.max_completion_tokens = limits.max_num_predict;
+        }
+      } else if (typeof body.options?.num_predict === "number" && body.options.num_predict > limits.max_num_predict) {
+        body.options.num_predict = limits.max_num_predict;
       }
     }
     const userLimit = key.rate_limit_per_minute ?? limits.requests_per_minute_per_user;
