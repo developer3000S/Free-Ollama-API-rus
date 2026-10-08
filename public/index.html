@@ -14,7 +14,10 @@
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.min.js"></script>
+<!-- Recharts UMD: unpkg@2.12.7 отдавал 404 (нет UMD-сборки по этому пути) → window.Recharts был undefined.
+     Основной CDN — jsdelivr; при сбое грузим cdnjs синхронно через document.write (fallback). -->
+<script src="https://cdn.jsdelivr.net/npm/recharts@2.12.7/umd/Recharts.min.js"></script>
+<script>window.Recharts || document.write('<script src="https:\/\/cdnjs.cloudflare.com\/ajax\/libs\/recharts\/2.15.0\/Recharts.min.js"><\/script>');</script>
 </head>
 <body>
 

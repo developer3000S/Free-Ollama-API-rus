@@ -516,36 +516,59 @@ async function renderNodes(container) {
     }
 
     if (nodesViewMode === 'performance') {
+      // Автообновление графика: интервал берём из ответа сервера (interval_ms),
+      // по умолчанию ~5 с. Таймер сбрасывается при выходе из режима, чтобы не
+      // гонять запросы вхолостую на других вкладках.
+      if (window._nodesPerfTimer) { clearInterval(window._nodesPerfTimer); window._nodesPerfTimer = null; }
       const perfWrap = h('div', {class: 'card', style: {padding: '24px', marginBottom: '20px'}});
       perfWrap.innerHTML = `
         <h3 style="font-size: 16px; font-weight: 600; margin-bottom: 8px;">📈 Мониторинг производительности узлов (CPU & Memory)</h3>
-        <p style="font-size: 13px; color: var(--text2); margin-bottom: 20px;">Динамика использования ресурсов CPU и памяти по всем активным узлам в реальном времени.</p>
+        <p style="font-size: 13px; color: var(--text2); margin-bottom: 4px;">Динамика использования ресурсов CPU и памяти по всем активным узлам в реальном времени.</p>
+        <p id="nodes-perf-status" style="font-size: 12px; color: var(--text2); margin-bottom: 20px;">Загрузка метрик…</p>
         <div id="nodes-performance-react-root" style="width: 100%; min-height: 450px;"></div>
       `;
       container.appendChild(perfWrap);
 
-      try {
-        const metricsRes = await API.get('/admin/nodes/metrics');
-        const metricsData = metricsRes.metrics || [];
-        const timestamps = metricsRes.timestamps || [];
+      let refreshMs = 5000;
+      const loadPerfOnce = async () => {
+        if (nodesViewMode !== 'performance' || !document.getElementById('nodes-performance-react-root')) {
+          if (window._nodesPerfTimer) { clearInterval(window._nodesPerfTimer); window._nodesPerfTimer = null; }
+          return;
+        }
+        try {
+          const metricsRes = await API.get('/admin/nodes/metrics');
+          const metricsData = metricsRes.metrics || [];
+          const timestamps = metricsRes.timestamps || [];
+          if (Number(metricsRes.interval_ms) > 0) refreshMs = Number(metricsRes.interval_ms);
 
-        const chartData = timestamps.map((time, idx) => {
-          const item = { time };
-          metricsData.forEach(n => {
-            const hist = n.history[idx] || { cpu: 0, memory: 0 };
-            item[`${n.display_name} (CPU %)`] = hist.cpu;
-            item[`${n.display_name} (Mem %)`] = hist.memory;
+          const chartData = timestamps.map((time, idx) => {
+            const item = { time };
+            metricsData.forEach(n => {
+              const hist = n.history[idx] || { cpu: 0, memory: 0 };
+              item[`${n.display_name} (CPU %)`] = hist.cpu;
+              item[`${n.display_name} (Mem %)`] = hist.memory;
+            });
+            return item;
           });
-          return item;
-        });
 
-        setTimeout(() => {
+          const statusEl = document.getElementById('nodes-perf-status');
+          const anyReal = metricsData.some(n => n.real);
+          if (statusEl) {
+            statusEl.innerHTML = timestamps.length
+              ? `Точек: ${timestamps.length} · Обновление каждые ${Math.round(refreshMs / 1000)} с · Данные: ${anyReal ? '🟢 реальные (Ollama /api/ps)' : '⚪ оценка (узлы не отдают метрики)'}`
+              : 'Ожидание первых данных сэмплера…';
+          }
+
           const rootEl = document.getElementById('nodes-performance-react-root');
           if (!rootEl) return;
 
           const { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend } = window.Recharts || {};
           if (!ResponsiveContainer) {
-            rootEl.innerHTML = '<div class="empty-state">Recharts не загружен</div>';
+            rootEl.innerHTML = '<div class="empty-state">Библиотека графиков не загрузилась (проверьте доступ к cdn.jsdelivr.net / cdnjs.cloudflare.com) и обновите страницу</div>';
+            return;
+          }
+          if (!timestamps.length) {
+            rootEl.innerHTML = '<div class="empty-state">Недостаточно данных — первые точки появятся в течение минуты</div>';
             return;
           }
 
@@ -577,10 +600,14 @@ async function renderNodes(container) {
             window._nodesPerfRoot = ReactDOM.createRoot(rootEl);
           }
           window._nodesPerfRoot.render(chartElement);
-        }, 50);
-      } catch (err) {
-        container.innerHTML += `<div class="empty-state" style="color: var(--red);">Ошибка загрузки метрик: ${esc(err.message)}</div>`;
-      }
+        } catch (err) {
+          const st = document.getElementById('nodes-perf-status');
+          if (st) st.innerHTML = `<span style="color: var(--red);">Ошибка загрузки метрик: ${esc(err.message)}</span>`;
+        }
+      };
+
+      await loadPerfOnce();
+      window._nodesPerfTimer = setInterval(loadPerfOnce, refreshMs);
       return;
     }
 
