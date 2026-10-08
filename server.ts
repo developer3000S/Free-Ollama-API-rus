@@ -4,6 +4,54 @@ import path from 'path';
 import crypto from 'crypto';
 import fs from 'fs';
 
+import { logger, maskSecrets } from './src/logger.js';
+import {
+  initDb,
+  dbEnabled,
+  dbConnected,
+  Store,
+  TABLES,
+  insertAuditRow,
+  queryAudit,
+  clearAudit,
+  tx,
+  startFullReloadLoop,
+} from './src/db.js';
+import {
+  initRedis,
+  redisEnabled,
+  checkRateLimit,
+  acquireInflight,
+  releaseInflight,
+  recordRpm,
+  getRpmBuckets,
+  seedRpmDemoData,
+  registerGateway,
+  listGateways,
+  tryAcquireLeader,
+  amILeader,
+} from './src/redis.js';
+import {
+  recordSuccess,
+  recordFailure,
+  resetBreaker,
+  selectNode,
+  isBreakerOpen,
+  tryAcquireProbe,
+} from './src/balancer.js';
+import {
+  getAgentForEndpoint,
+  closeAgentForEndpoint,
+  closeAllAgents,
+  dispatcherFor,
+} from './src/pool.js';
+import {
+  toOllamaChatRequest,
+  ollamaChunkToOpenAiChunk,
+  aggregateOllamaChat,
+  ollamaGenerateToOpenAiCompletion,
+} from './src/openai.js';
+
 // Load .env dynamically
 export function reloadEnv() {
   try {
@@ -203,6 +251,9 @@ interface ApiKeyItem {
   revoked: boolean;
   last_used_at: string | null;
   rate_limit_per_minute: number | null;
+  // sha256(raw_key). В PG хранится только хэш; сырой ключ живёт в памяти
+  // реплики создания и показывается пользователю один раз.
+  key_hash?: string;
   raw_key?: string;
 }
 
@@ -217,11 +268,20 @@ interface AuditItem {
 }
 
 // In-Memory Data Stores
-const nodes = new Map<string, NodeItem>();
-const consents = new Map<string, ConsentItem>();
-const blacklist = new Map<string, BlacklistItem>();
-const candidates = new Map<string, CandidateItem>();
-const apiKeys = new Map<string, ApiKeyItem>();
+//
+// Хранилища стали write-through обёртками над PostgreSQL (src/db.ts): запись
+// сразу фиксируется в БД, а между репликами кэши синхронизируются через PG
+// LISTEN/NOTIFY. При отсутствии PG всё работает чисто в памяти.
+const nodes = new Store<NodeItem>(TABLES.nodes, (n) => n.node_id);
+const consents = new Store<ConsentItem>(TABLES.consents, (c) => c.consent_id);
+const blacklist = new Store<BlacklistItem>(TABLES.blacklist, (b) => b.node_id);
+const candidates = new Store<CandidateItem>(TABLES.candidates, (c) => c.candidate_id);
+// Ключи — отдельный путь: в PG хранится key_hash, сырой ключ не покидает
+// память реплины, на которой был создан (и показывается один раз).
+const apiKeys = new Store<ApiKeyItem>(TABLES.apiKeys, (k) => k.key_id);
+// Индекс key_hash -> key_id для O(1) аутентификации.
+const apiKeyByHash = new Map<string, ApiKeyItem>();
+// Аудит пишется в PG параллельно с память; чтение идёт из PG.
 const auditLogs: AuditItem[] = [];
 
 // Latency Distribution Bins & History Store
@@ -269,46 +329,61 @@ function recordNodeLatencySample(nodeId: string, latencyMs: number) {
   if (list.length > 300) list.shift();
 }
 
-// 60-minute rolling Requests Per Minute (RPM) tracker
+// 60-minute rolling Requests Per Minute (RPM) tracker.
+//
+// Бакеты живут в Redis (см. src/redis.ts recordRpm/getRpmBuckets), поэтому
+// обе реплики шлюза накапливают общую историю. При отсутствии Redis счётчики
+// остаются локальными (демо-синусоида при старте не даёт дашборду быть пустым).
 const RPM_BUCKETS_COUNT = 60;
-const rpmHistory: number[] = new Array(RPM_BUCKETS_COUNT).fill(0);
-let lastRpmMinute = Math.floor(Date.now() / 60000);
+const localRpmFallback: number[] = new Array(RPM_BUCKETS_COUNT).fill(0);
+let localRpmLastMinute = Math.floor(Date.now() / 60000);
+let rpmSeededLocally = false;
 
-function initRpmHistory() {
+function seedLocalRpm() {
+  if (rpmSeededLocally) return;
+  rpmSeededLocally = true;
   for (let i = 0; i < RPM_BUCKETS_COUNT; i++) {
     const wave = Math.sin((i / 60) * Math.PI * 4) * 22;
     const wave2 = Math.cos((i / 60) * Math.PI * 2) * 12;
     const jitter = Math.floor(Math.random() * 14) - 7;
-    rpmHistory[i] = Math.max(15, Math.round(72 + wave + wave2 + jitter));
+    localRpmFallback[i] = Math.max(15, Math.round(72 + wave + wave2 + jitter));
   }
 }
-initRpmHistory();
+
+function shiftLocalRpm(currentMin: number) {
+  const diff = currentMin - localRpmLastMinute;
+  if (diff > 0) {
+    const shift = Math.min(diff, RPM_BUCKETS_COUNT);
+    for (let s = 0; s < shift; s++) {
+      localRpmFallback.shift();
+      localRpmFallback.push(0);
+    }
+    localRpmLastMinute = currentMin;
+  }
+}
 
 function recordRequestForRpm(count = 1) {
-  const currentMin = Math.floor(Date.now() / 60000);
-  const diff = currentMin - lastRpmMinute;
-  if (diff > 0) {
-    const shift = Math.min(diff, RPM_BUCKETS_COUNT);
-    for (let s = 0; s < shift; s++) {
-      rpmHistory.shift();
-      rpmHistory.push(0);
-    }
-    lastRpmMinute = currentMin;
+  if (redisEnabled()) {
+    recordRpm(count).catch(() => shiftLocalRpm(Math.floor(Date.now() / 60000)));
+    return;
   }
-  rpmHistory[rpmHistory.length - 1] = (rpmHistory[rpmHistory.length - 1] || 0) + count;
+  seedLocalRpm();
+  shiftLocalRpm(Math.floor(Date.now() / 60000));
+  localRpmFallback[localRpmFallback.length - 1] += count;
 }
 
-function getRpm60mData() {
+async function getRpm60mData() {
   const now = new Date();
-  const currentMin = Math.floor(Date.now() / 60000);
-  const diff = currentMin - lastRpmMinute;
-  if (diff > 0) {
-    const shift = Math.min(diff, RPM_BUCKETS_COUNT);
-    for (let s = 0; s < shift; s++) {
-      rpmHistory.shift();
-      rpmHistory.push(0);
+  let values: number[];
+  if (redisEnabled()) {
+    values = await getRpmBuckets();
+    if (values.length !== RPM_BUCKETS_COUNT) {
+      values = new Array(RPM_BUCKETS_COUNT).fill(0).map((_, i) => values[i] || 0);
     }
-    lastRpmMinute = currentMin;
+  } else {
+    seedLocalRpm();
+    shiftLocalRpm(Math.floor(Date.now() / 60000));
+    values = [...localRpmFallback];
   }
 
   const points = [];
@@ -321,11 +396,10 @@ function getRpm60mData() {
       label: minAgo === 0 ? 'Сейчас' : `-${minAgo}м`,
       time: timeLabel,
       timestamp: pointTime.toISOString(),
-      rpm: rpmHistory[i] || 0,
+      rpm: values[i] || 0,
     });
   }
 
-  const values = points.map((p) => p.rpm);
   const currentRpm = values[values.length - 1] || 0;
   const peakRpm = Math.max(...values, 0);
   const avgRpm = Math.round(values.reduce((a, b) => a + b, 0) / (values.length || 1));
@@ -386,7 +460,7 @@ function computeLatencyStats(samples: number[]) {
 }
 
 function addAudit(event: string, actor: string, subject_type: string, subject_id: string, detail: Record<string, unknown> = {}) {
-  auditLogs.unshift({
+  const item: AuditItem = {
     id: `aud_${crypto.randomBytes(6).toString('hex')}`,
     created_at: new Date().toISOString(),
     event,
@@ -394,21 +468,46 @@ function addAudit(event: string, actor: string, subject_type: string, subject_id
     subject_type,
     subject_id,
     detail,
-  });
+  };
+  auditLogs.unshift(item);
   if (auditLogs.length > 500) auditLogs.pop();
+  // Параллельная запись в PG: аудит важен, но его потеря не должна ронять
+  // бизнес-операцию, поэтому write-and-forget с журналированием сбоя.
+  insertAuditRow(item.id, item, item.created_at).catch((err) =>
+    logger.warn('audit write failed', { error: err.message, event })
+  );
 }
 
 // Clean Initialization for FOA Gateway with multi-region nodes
-function seedInitialData() {
-  nodes.clear();
-  consents.clear();
-  blacklist.clear();
-  candidates.clear();
-  apiKeys.clear();
+async function seedInitialData() {
+  const freshNodes = await nodes.list();
+  const freshKeys = await apiKeys.list();
+  // Сидим только если БД действительно пуста — иначе перезаписали бы
+  // реальные данные, сохранённые прошлыми запусками.
+  if (freshNodes.length > 0) {
+    return false;
+  }
 
   const now = new Date().toISOString();
-  const sampleNodes: NodeItem[] = [
-    {
+  const sampleNodes: NodeItem[] = [];
+  const pushNode = (node: NodeItem) => {
+    sampleNodes.push(node);
+    nodeLatencySamples.set(node.node_id, generateDefaultSamplesForNode(node));
+    consentsSeed.push({
+      consent_id: `cst_${node.node_id}`,
+      node_id: node.node_id,
+      owner_id: node.owner_id,
+      status: node.consent_status === 'verified' ? 'active' : 'pending',
+      method: 'http_well_known',
+      allowed_models: node.models,
+      max_concurrency: node.max_concurrency,
+      issued_at: now,
+      expires_at: new Date(Date.now() + 90 * 86400000).toISOString(),
+      version: 1,
+      history: [{ event: 'seed_init', actor: 'system', created_at: now }],
+    });
+  };
+  pushNode({
       node_id: 'node_us_east1',
       endpoint: 'http://198.51.100.22:11434',
       display_name: 'US-East FastCluster',
@@ -430,8 +529,8 @@ function seedInitialData() {
       effective_weight: 10,
       country: 'US',
       ip: '198.51.100.22',
-    },
-    {
+    });
+  pushNode({
       node_id: 'node_us_west2',
       endpoint: 'http://198.51.100.58:11434',
       display_name: 'US-West Inference Hub',
@@ -453,8 +552,8 @@ function seedInitialData() {
       effective_weight: 8,
       country: 'US',
       ip: '198.51.100.58',
-    },
-    {
+    });
+  pushNode({
       node_id: 'node_de_fra1',
       endpoint: 'http://203.0.113.14:11434',
       display_name: 'DE-Frankfurt Dedicated',
@@ -476,8 +575,8 @@ function seedInitialData() {
       effective_weight: 12,
       country: 'DE',
       ip: '203.0.113.14',
-    },
-    {
+    });
+  pushNode({
       node_id: 'node_de_mun2',
       endpoint: 'http://203.0.113.88:11434',
       display_name: 'DE-Munich GPU Rig',
@@ -499,8 +598,8 @@ function seedInitialData() {
       effective_weight: 5,
       country: 'DE',
       ip: '203.0.113.88',
-    },
-    {
+    });
+  pushNode({
       node_id: 'node_jp_tyo1',
       endpoint: 'http://192.0.2.77:11434',
       display_name: 'JP-Tokyo Edge Node',
@@ -522,8 +621,8 @@ function seedInitialData() {
       effective_weight: 10,
       country: 'JP',
       ip: '192.0.2.77',
-    },
-    {
+    });
+  pushNode({
       node_id: 'node_nl_ams1',
       endpoint: 'http://192.0.2.140:11434',
       display_name: 'NL-Amsterdam Relay',
@@ -545,8 +644,8 @@ function seedInitialData() {
       effective_weight: 6,
       country: 'NL',
       ip: '192.0.2.140',
-    },
-    {
+    });
+  pushNode({
       node_id: 'node_fr_par1',
       endpoint: 'http://192.0.2.215:11434',
       display_name: 'FR-Paris Micro Compute',
@@ -569,25 +668,7 @@ function seedInitialData() {
       country: 'FR',
       ip: '192.0.2.215',
     },
-  ];
-
-  sampleNodes.forEach((node) => {
-    nodes.set(node.node_id, node);
-    nodeLatencySamples.set(node.node_id, generateDefaultSamplesForNode(node));
-    consents.set(`cst_${node.node_id}`, {
-      consent_id: `cst_${node.node_id}`,
-      node_id: node.node_id,
-      owner_id: node.owner_id,
-      status: node.consent_status === 'verified' ? 'active' : 'pending',
-      method: 'http_well_known',
-      allowed_models: node.models,
-      max_concurrency: node.max_concurrency,
-      issued_at: now,
-      expires_at: new Date(Date.now() + 90 * 86400000).toISOString(),
-      version: 1,
-      history: [{ event: 'seed_init', actor: 'system', created_at: now }],
-    });
-  });
+  );
 
   const sampleCandidates: CandidateItem[] = [
     {
@@ -624,7 +705,7 @@ function seedInitialData() {
     },
   ];
 
-  sampleCandidates.forEach((cand) => candidates.set(cand.candidate_id, cand));
+  sampleCandidates.forEach((cand) => candidates.set(cand));
 
   // Audit initial gateway boot
   addAudit('gateway_boot', 'system', 'gateway', GATEWAY_ID, {
@@ -632,9 +713,88 @@ function seedInitialData() {
     pool_size: sampleNodes.length,
     status: 'clean_initialized',
   });
+
+  // Фиксируем сиды в PG. Узлы и согласия пишутся в одной транзакции, чтобы
+  // при сбое не осталось узлов без согласий.
+  await tx(async (client) => {
+    for (const node of sampleNodes) {
+      await nodes.set(node, client);
+    }
+    for (const consent of consentsSeed) {
+      await consents.set(consent, client);
+    }
+    for (const cand of sampleCandidates) {
+      await candidates.set(cand, client);
+    }
+  }).catch((err) => {
+    logger.warn('Сидирование в PG не удалось — данные останутся в памяти', { error: err.message });
+  });
+
+  return true;
 }
 
-seedInitialData();
+// Согласия для сид-узлов собираются отдельно, чтобы записать их в общей
+// транзакции с узлами.
+const consentsSeed: ConsentItem[] = [];
+
+// --- Инициализация хранилищ -------------------------------------------------
+//
+// PG и Redis подключаются до отдачи трафика. Если БД недоступна, шлюз
+// деградирует до in-memory режима (с предупреждением в логе), чтобы не
+// блокировать локальную разработку.
+
+async function bootstrap() {
+  const pgOk = await initDb();
+  const redisOk = await initRedis();
+
+  // Регистрируем перезагрузку кэшей каждой таблицы при приходе NOTIFY.
+  nodes.registerReloadHandler(() => nodes.reload());
+  consents.registerReloadHandler(() => consents.reload());
+  blacklist.registerReloadHandler(() => blacklist.reload());
+  candidates.registerReloadHandler(() => candidates.reload());
+  apiKeys.registerReloadHandler(async () => {
+    await apiKeys.reload();
+    rebuildKeyHashIndex();
+  });
+
+  if (pgOk) {
+    startFullReloadLoop(() => [TABLES.nodes, TABLES.consents, TABLES.blacklist, TABLES.candidates, TABLES.apiKeys]);
+  }
+
+  // Демо-данные только при пустой БД (см. seedInitialData).
+  await seedInitialData();
+  rebuildKeyHashIndex();
+
+  if (redisOk) {
+    await seedRpmDemoData();
+    await registerGateway(GATEWAY_ID, {
+      version: VERSION,
+      started_at: new Date().toISOString(),
+      storage: pgOk ? 'postgres' : 'in-memory',
+    });
+  }
+
+  logger.info('Gateway initialized', {
+    gateway_id: GATEWAY_ID,
+    postgres: pgOk ? 'connected' : 'in-memory',
+    redis: redisOk ? 'connected' : 'in-memory',
+    nodes: nodes.size,
+    keys: apiKeys.size,
+  });
+}
+
+// Индекс аутентификации ключей: key_hash -> запись. Сырой ключ в PG не
+// хранится — только его sha256, поэтому сравнение идёт по хэшу.
+function rebuildKeyHashIndex(): void {
+  apiKeyByHash.clear();
+  for (const key of apiKeys.values()) {
+    if (key.key_hash && !key.revoked) apiKeyByHash.set(key.key_hash, key);
+  }
+}
+
+function hashApiKey(rawKey: string): string {
+  return crypto.createHash('sha256').update(rawKey).digest('hex');
+}
 
 // Configuration Object matching original config.yaml
 const currentConfig = {
@@ -663,6 +823,10 @@ const currentConfig = {
     max_messages: 200,
     max_message_bytes: 262144,
     concurrent_stream_requests_per_user: 2,
+  },
+  routing: {
+    // §7.6: число попыток проксирования на разные узлы при отказе.
+    retry_attempts: 2,
   },
   health: {
     liveness_interval_seconds: 15,
@@ -699,6 +863,158 @@ const currentConfig = {
   },
 };
 
+// --- Идентификатор запроса (§7.6, §8.5) ---------------------------------------
+//
+// Каждый запрос получает уникальный id; он возвращается в заголовке
+// X-FOA-Request-ID и входит в конверт ошибки — это позволяет связать
+// сообщение клиента с записями шлюза и узла.
+
+function generateRequestId(): string {
+  return `req_${crypto.randomBytes(8).toString('hex')}`;
+}
+
+const requestIdMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  const incoming = req.headers['x-foa-request-id'] as string | undefined;
+  const id = incoming && /^[A-Za-z0-9_.:-]{1,64}$/.test(incoming) ? incoming : generateRequestId();
+  (req as any).requestId = id;
+  res.setHeader('X-FOA-Request-ID', id);
+  next();
+};
+
+// --- Счётчик запростов для /metrics ------------------------------------------
+// Раньше foa_requests_total был захардкожен (4289). Теперь считаем реально.
+const requestCounters = {
+  total: 0,
+  by_status: new Map<number, number>(),
+  errors: 0,
+};
+
+function recordRequest(statusCode: number): void {
+  requestCounters.total++;
+  if (statusCode >= 500) requestCounters.errors++;
+  requestCounters.by_status.set(statusCode, (requestCounters.by_status.get(statusCode) || 0) + 1);
+}
+
+// --- X-FOA-Client-Hash (§8.5.3) ----------------------------------------------
+//
+// Обезличенный хэш клиента на основе соли из конфигурации: реальный IP
+// узлам не передаётся, а владелец узла видит стабильный идентификатор
+// для настройки собственных лимитов.
+function clientHashFor(req: Request): string {
+  const salt = process.env.FOA_SECURITY__CLIENT_HASH_SALT || currentConfig.security.client_hash_salt || '';
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.ip || '';
+  return crypto.createHash('sha256').update(`${salt}:${ip}`).digest('hex').slice(0, 16);
+}
+
+const clientHashMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  (req as any).clientHash = clientHashFor(req);
+  res.setHeader('X-FOA-Client-Hash', (req as any).clientHash);
+  next();
+};
+
+// --- Конверт ошибки (§8.6) ----------------------------------------------------
+//
+// Единый формат ошибок пользовательского API: сообщение остаётся строкой
+// (обратная совместимость с клиентами), добавляются code, request_id и
+// retry_after для лимитов.
+function sendApiError(
+  req: Request,
+  res: Response,
+  statusCode: number,
+  message: string,
+  opts: { code?: string; retryAfter?: number } = {}
+): Response {
+  const payload: Record<string, any> = {
+    error: message,
+    code: opts.code || defaultCodeFor(statusCode),
+    request_id: (req as any).requestId || generateRequestId(),
+  };
+  if (opts.retryAfter && opts.retryAfter > 0) {
+    payload.retry_after = opts.retryAfter;
+    res.setHeader('Retry-After', String(opts.retryAfter));
+  }
+  return res.status(statusCode).json(payload);
+}
+
+function defaultCodeFor(statusCode: number): string {
+  switch (statusCode) {
+    case 400:
+      return 'bad_request';
+    case 401:
+      return 'unauthorized';
+    case 403:
+      return 'forbidden';
+    case 404:
+      return 'not_found';
+    case 409:
+      return 'conflict';
+    case 413:
+      return 'payload_too_large';
+    case 429:
+      return 'rate_limited';
+    case 500:
+      return 'internal_error';
+    case 502:
+      return 'bad_gateway';
+    case 503:
+      return 'service_unavailable';
+    case 504:
+      return 'gateway_timeout';
+    default:
+      return 'error';
+  }
+}
+
+// --- Throttled flush last_used_at ключей --------------------------------------
+//
+// last_used_at обновляется при каждой аутентификации — писать его в PG на
+// каждый запрос нерационально. Грязные ключи сбрасываются раз в 15 секунд.
+const dirtyKeys = new Set<string>();
+let keyFlushTimer: NodeJS.Timeout | null = null;
+
+function markKeyUsed(keyId: string): void {
+  dirtyKeys.add(keyId);
+  if (keyFlushTimer) return;
+  keyFlushTimer = setInterval(() => {
+    const ids = Array.from(dirtyKeys);
+    dirtyKeys.clear();
+    for (const id of ids) {
+      const key = apiKeys.get(id);
+      if (!key || !dbEnabled()) continue;
+      const update = { ...key };
+      delete update.raw_key;
+      apiKeys.set(update).catch((err) => logger.warn('last_used_at flush failed', { error: err.message }));
+    }
+  }, 15_000);
+}
+
+// --- Хелпер персистентности узлов --------------------------------------------
+//
+// Маршруты мутируют поля узла напрямую (node.status = ...). После мутации
+// нужно зафиксировать состояние в PG — этот хелпер делает write-through и
+// логирует сбой, не роняя запрос.
+async function persistNode(node: NodeItem | undefined): Promise<void> {
+  if (!node) return;
+  try {
+    await nodes.set(node);
+  } catch (err: any) {
+    logger.warn('node persist failed', { node_id: node.node_id, error: err.message });
+  }
+}
+
+async function persistConsent(consent: ConsentItem | undefined): Promise<void> {
+  if (!consent) return;
+  try {
+    await consents.set(consent);
+  } catch (err: any) {
+    logger.warn('consent persist failed', { consent_id: consent.consent_id, error: err.message });
+  }
+}
+
+function notFound(res: Response, message: string): Response {
+  return res.status(404).json({ error: message });
+}
+
 // Authentication Middleware for /admin/*
 const adminAuth = (req: Request, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization || '';
@@ -729,29 +1045,51 @@ const adminAuth = (req: Request, res: Response, next: NextFunction) => {
 // Authentication Middleware для пользовательского API (§9.2):
 // Authorization: Bearer <foa_live_...> — действующий, не отозванный
 // и не просроченный ключ из реестра apiKeys.
-const userAuth = (req: Request, res: Response, next: NextFunction) => {
+//
+// Поиск идёт по key_hash (sha256 ключа): PG хранит только хэш, поэтому
+// сравнивать сырые строки не нужно. Кэш ключей реплики синхронизируется
+// через PG LISTEN/NOTIFY; при промахе кэша (ключ только что создан на
+// другой реплике) делается прямой запрос в PG.
+const userAuth = async (req: Request, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
 
   if (!token) {
-    return res
-      .status(401)
-      .json({ error: 'Требуется API-ключ: заголовок Authorization: Bearer <foa_live_...>' });
+    return sendApiError(req, res, 401, 'Требуется API-ключ: заголовок Authorization: Bearer <foa_live_...>');
+  }
+
+  if (!token.startsWith('foa_live_')) {
+    return sendApiError(req, res, 401, 'Недействительный API-ключ');
   }
 
   const now = new Date();
-  for (const key of apiKeys.values()) {
-    if (key.raw_key !== token || key.revoked) continue;
-    if (key.expires_at && new Date(key.expires_at) < now) {
-      return res.status(401).json({ error: 'Срок действия API-ключа истёк' });
+  const tokenHash = hashApiKey(token);
+
+  let key: ApiKeyItem | undefined = apiKeyByHash.get(tokenHash);
+  if (!key && dbEnabled()) {
+    // Промах кэша: возможно, ключ создан на другой реплике и уведомление
+    // ещё не дошло. Перечитываем напрямую из БД.
+    const fresh = await apiKeys.findByField('key_hash', tokenHash);
+    if (fresh) {
+      apiKeys.cacheUpsert(fresh);
+      key = fresh;
+      apiKeyByHash.set(tokenHash, fresh);
     }
-    key.last_used_at = now.toISOString();
-    // Ключ нужен middleware requireScopes / applyLimits, идущим следом в цепочке.
-    (req as any).apiKey = key;
-    return next();
   }
 
-  return res.status(401).json({ error: 'Недействительный API-ключ' });
+  if (!key || key.revoked) {
+    return sendApiError(req, res, 401, 'Недействительный API-ключ');
+  }
+
+  if (key.expires_at && new Date(key.expires_at) < now) {
+    return sendApiError(req, res, 401, 'Срок действия API-ключа истёк');
+  }
+
+  key.last_used_at = now.toISOString();
+  markKeyUsed(key.key_id);
+  // Ключ нужен middleware requireScopes / applyLimits, идущим следом в цепочке.
+  (req as any).apiKey = key;
+  return next();
 };
 
 // Authorization по скоупам (§9.2): пропускает запрос, если у ключа есть
@@ -763,62 +1101,64 @@ const requireScopes = (...scopes: string[]) => {
     if (scopes.some((s) => granted.includes(s))) {
       return next();
     }
-    return res.status(403).json({
-      error: `Недостаточно прав: требуется один из скоупов [${scopes.join(', ')}], у ключа — [${granted.join(', ')}]`,
-    });
+    return sendApiError(
+      req,
+      res,
+      403,
+      `Недостаточно прав: требуется один из скоупов [${scopes.join(', ')}], у ключа — [${granted.join(', ')}]`
+    );
   };
 };
 
 // --- Лимиты, квоты и проверка размера запроса (§7.5, §12.4.2–12.4.3) ---
-// In-memory sliding window за 60 секунд. Состояние локально для процесса
-// (см. README, «Состояние и хранение данных»).
+//
+// Окно 60 секунд. Состояние живёт в Redis (src/redis.ts), поэтому лимит
+// единый для всех реплик за nginx: пользователь не сможет обойти его,
+// раскидывая запросы между репликами. При отсутствии Redis счётчики
+// остаются в памяти процесса.
 const LIMIT_WINDOW_MS = 60_000;
 
-function pruneWindow(hits: number[], now: number): number[] {
-  const cutoff = now - LIMIT_WINDOW_MS;
-  let i = 0;
-  while (i < hits.length && hits[i] <= cutoff) i++;
-  return i > 0 ? hits.slice(i) : hits;
-}
-
-// 0 — лимит не превышен, иначе число секунд до освобождения окна.
-function windowRetryAfter(hits: number[], limit: number, now: number): number {
-  if (hits.length >= limit) {
-    return Math.max(1, Math.ceil((hits[0] + LIMIT_WINDOW_MS - now) / 1000));
-  }
-  return 0;
-}
-
-const userRpm = new Map<string, number[]>(); // key_id -> временные метки
-const modelRpm = new Map<string, number[]>(); // `${key_id}|${model}` -> метки
-let globalRpm: number[] = []; // глобальный поток
-const inflight = new Map<string, number>(); // key_id -> активные запросы
-const inflightStreams = new Map<string, number>(); // key_id -> активные стримы
-
-function rateLimited(res: Response, scope: string, limit: number, retryAfter: number) {
-  res.setHeader('Retry-After', String(retryAfter));
-  return res.status(429).json({
-    error: `Превышен лимит запросов (${scope} ≤ ${limit}/мин). Повторите через ${retryAfter} с.`,
-    retry_after: retryAfter,
+function sendRateLimited(
+  req: Request,
+  res: Response,
+  scope: string,
+  limit: number,
+  retryAfter: number
+): Response {
+  return sendApiError(req, res, 429, `Превышен лимит запросов (${scope} ≤ ${limit}/мин). Повторите через ${retryAfter} с.`, {
+    code: 'rate_limited',
+    retryAfter,
   });
+}
+
+function sendInflightLimited(req: Request, res: Response, limit: number, isStream: boolean): Response {
+  return sendApiError(
+    req,
+    res,
+    429,
+    `Превышен лимит одновременных ${isStream ? 'стримов' : 'запросов'} (${limit} на пользователя)`,
+    { code: 'concurrent_limit' }
+  );
 }
 
 // applyLimits проверяет размер тела, квоты payload, RPM (пользователь /
 // глобально / на модель) и параллельные запросы. Счётчики инкрементируются
 // только если все проверки прошли — иначе отвергнутый запрос не съедает квоту.
 const applyLimits = (opts: { perModel?: boolean; body?: 'prompt' | 'chat' | 'openai' } = {}) => {
-  return (req: Request, res: Response, next: NextFunction) => {
+  return async (req: Request, res: Response, next: NextFunction) => {
     const key: ApiKeyItem = (req as any).apiKey;
     const limits = currentConfig.limits;
-    const now = Date.now();
     const keyId = key.key_id;
 
     // 1. Размер запроса (§12.4.2)
     const contentLength = Number(req.headers['content-length'] || 0);
     if (contentLength > limits.max_request_bytes) {
-      return res
-        .status(413)
-        .json({ error: `Тело запроса превышает max_request_bytes (${limits.max_request_bytes} байт)` });
+      return sendApiError(
+        req,
+        res,
+        413,
+        `Тело запроса превышает max_request_bytes (${limits.max_request_bytes} байт)`
+      );
     }
 
     // 2. Квоты payload (§12.4.2)
@@ -826,92 +1166,92 @@ const applyLimits = (opts: { perModel?: boolean; body?: 'prompt' | 'chat' | 'ope
     if (opts.body === 'prompt') {
       const prompt: string = typeof body.prompt === 'string' ? body.prompt : '';
       if (Buffer.byteLength(prompt, 'utf8') > limits.max_prompt_bytes) {
-        return res
-          .status(400)
-          .json({ error: `Промпт превышает max_prompt_bytes (${limits.max_prompt_bytes} байт)` });
+        return sendApiError(
+          req,
+          res,
+          400,
+          `Промпт превышает max_prompt_bytes (${limits.max_prompt_bytes} байт)`
+        );
       }
       const numPredict = body.options?.num_predict;
       if (typeof numPredict === 'number' && numPredict > limits.max_num_predict) {
-        return res.status(400).json({ error: `num_predict превышает max_num_predict (${limits.max_num_predict})` });
+        return sendApiError(req, res, 400, `num_predict превышает max_num_predict (${limits.max_num_predict})`);
       }
     } else if (opts.body === 'chat' || opts.body === 'openai') {
       const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
       if (messages.length > limits.max_messages) {
-        return res.status(400).json({ error: `Число сообщений превышает max_messages (${limits.max_messages})` });
+        return sendApiError(req, res, 400, `Число сообщений превышает max_messages (${limits.max_messages})`);
       }
       for (const m of messages) {
         const content: string = typeof m?.content === 'string' ? m.content : '';
         if (Buffer.byteLength(content, 'utf8') > limits.max_message_bytes) {
-          return res
-            .status(400)
-            .json({ error: `Сообщение превышает max_message_bytes (${limits.max_message_bytes} байт)` });
+          return sendApiError(
+            req,
+            res,
+            400,
+            `Сообщение превышает max_message_bytes (${limits.max_message_bytes} байт)`
+          );
         }
       }
       const cap =
         opts.body === 'openai' ? body.max_tokens ?? body.max_completion_tokens : body.options?.num_predict;
       if (typeof cap === 'number' && cap > limits.max_num_predict) {
-        return res.status(400).json({ error: `Лимит генерации превышает max_num_predict (${limits.max_num_predict})` });
+        return sendApiError(req, res, 400, `Лимит генерации превышает max_num_predict (${limits.max_num_predict})`);
       }
     }
 
     // 3. RPM на пользователя (явный лимит ключа приоритетнее общего)
     const userLimit = key.rate_limit_per_minute ?? limits.requests_per_minute_per_user;
-    const userHits = pruneWindow(userRpm.get(keyId) || [], now);
-    let retryAfter = windowRetryAfter(userHits, userLimit, now);
-    if (retryAfter) {
-      userRpm.set(keyId, userHits);
-      return rateLimited(res, 'на пользователя', userLimit, retryAfter);
+    const userResult = await checkRateLimit('user', keyId, userLimit, LIMIT_WINDOW_MS);
+    if (!userResult.allowed) {
+      setRateLimitHeaders(res, userLimit, userResult);
+      return sendRateLimited(req, res, 'на пользователя', userLimit, userResult.retryAfter);
     }
 
     // 4. Глобальный RPM
-    const globalHits = pruneWindow(globalRpm, now);
-    retryAfter = windowRetryAfter(globalHits, limits.requests_per_minute_global, now);
-    if (retryAfter) {
-      userRpm.set(keyId, userHits);
-      globalRpm = globalHits;
-      return rateLimited(res, 'глобальный', limits.requests_per_minute_global, retryAfter);
+    const globalResult = await checkRateLimit('global', 'all', limits.requests_per_minute_global, LIMIT_WINDOW_MS);
+    if (!globalResult.allowed) {
+      setRateLimitHeaders(res, limits.requests_per_minute_global, globalResult);
+      return sendRateLimited(req, res, 'глобальный', limits.requests_per_minute_global, globalResult.retryAfter);
     }
 
     // 5. RPM на модель
-    let modelId = '';
     if (opts.perModel && body.model) {
-      modelId = `${keyId}|${String(body.model).toLowerCase()}`;
-      const modelHits = pruneWindow(modelRpm.get(modelId) || [], now);
-      retryAfter = windowRetryAfter(modelHits, limits.requests_per_minute_per_model, now);
-      if (retryAfter) {
-        userRpm.set(keyId, userHits);
-        globalRpm = globalHits;
-        modelRpm.set(modelId, modelHits);
-        return rateLimited(res, `на модель ${body.model}`, limits.requests_per_minute_per_model, retryAfter);
+      const modelId = `${keyId}|${String(body.model).toLowerCase()}`;
+      const modelResult = await checkRateLimit(
+        'model',
+        modelId,
+        limits.requests_per_minute_per_model,
+        LIMIT_WINDOW_MS
+      );
+      if (!modelResult.allowed) {
+        setRateLimitHeaders(res, limits.requests_per_minute_per_model, modelResult);
+        return sendRateLimited(
+          req,
+          res,
+          `на модель ${body.model}`,
+          limits.requests_per_minute_per_model,
+          modelResult.retryAfter
+        );
       }
-      modelRpm.set(modelId, modelHits);
     }
 
     // 6. Параллельные запросы (отдельно для стримов, §12.4.2)
     const isStream = body.stream === true;
-    const inflightMap = isStream ? inflightStreams : inflight;
     const inflightLimit = isStream
       ? limits.concurrent_stream_requests_per_user
       : limits.concurrent_requests_per_user;
-    const current = inflightMap.get(keyId) || 0;
-    if (current >= inflightLimit) {
-      return res
-        .status(429)
-        .json({ error: `Превышен лимит одновременных запросов (${inflightLimit} на пользователя)` });
+    const inflightScope = isStream ? 'inflight-stream' : 'inflight';
+    const acquired = await acquireInflight(`${inflightScope}:${keyId}`, inflightLimit);
+    if (!acquired) {
+      return sendInflightLimited(req, res, inflightLimit, isStream);
     }
-    inflightMap.set(keyId, current + 1);
-
-    // Фиксируем попадания в окна только для пропущенного запроса
-    userHits.push(now);
-    userRpm.set(keyId, userHits);
-    globalHits.push(now);
-    globalRpm = globalHits;
 
     let released = false;
     const release = () => {
       if (released) return;
       released = true;
-      inflightMap.set(keyId, Math.max(0, (inflightMap.get(keyId) || 1) - 1));
+      releaseInflight(`${inflightScope}:${keyId}`).catch(() => {});
     };
     res.on('close', release);
     req.on('aborted', release);
@@ -920,40 +1260,79 @@ const applyLimits = (opts: { perModel?: boolean; body?: 'prompt' | 'chat' | 'ope
   };
 };
 
+// Заголовки X-FOA-RateLimit-* (§8.5): клиент видит лимит и сколько осталось.
+function setRateLimitHeaders(res: Response, limit: number, result: { count: number; retryAfter: number }): void {
+  res.setHeader('X-FOA-RateLimit-Limit', String(limit));
+  res.setHeader('X-FOA-RateLimit-Remaining', String(Math.max(0, limit - result.count)));
+  res.setHeader('X-FOA-RateLimit-Reset', String(Math.max(0, result.retryAfter)));
+}
+
 // --- Operational Routes ---
 app.get('/healthz', (req, res) => {
-  res.json({ status: 'ok', version: VERSION });
+  // liveness: шлюз жив, если отвечает на запросы.
+  res.json({
+    status: 'ok',
+    version: VERSION,
+    gateway_id: GATEWAY_ID,
+    storage: {
+      postgres: dbConnected() ? 'connected' : dbEnabled() ? 'error' : 'disabled',
+      redis: redisEnabled() ? 'connected' : 'disabled',
+    },
+  });
 });
 
 app.get('/readyz', (req, res) => {
   const routable = Array.from(nodes.values()).filter((n) => n.routable).length;
-  const status = routable > 0 ? 'ready' : 'degraded';
-  res.status(routable > 0 ? 200 : 503).json({
+  const ok = routable > 0;
+  const status = ok ? 'ready' : 'degraded';
+  res.status(ok ? 200 : 503).json({
     status,
     routable_nodes: routable,
+    nodes_total: nodes.size,
     version: VERSION,
+    gateway_id: GATEWAY_ID,
+    storage: {
+      postgres: dbConnected() ? 'connected' : dbEnabled() ? 'error' : 'disabled',
+      redis: redisEnabled() ? 'connected' : 'disabled',
+    },
   });
 });
 
 app.get('/metrics', (req, res) => {
   const routable = Array.from(nodes.values()).filter((n) => n.routable).length;
   const activeBl = Array.from(blacklist.values()).filter((b) => !b.lifted_at).length;
-  const payload = [
+  const lines = [
     `# HELP foa_build_info Gateway build information`,
     `# TYPE foa_build_info gauge`,
     `foa_build_info{version="${VERSION}",gateway_id="${GATEWAY_ID}"} 1`,
     `# HELP foa_nodes_routable Total routable nodes in pool`,
     `# TYPE foa_nodes_routable gauge`,
     `foa_nodes_routable ${routable}`,
+    `# HELP foa_nodes_total Total nodes known to gateway`,
+    `# TYPE foa_nodes_total gauge`,
+    `foa_nodes_total ${nodes.size}`,
     `# HELP foa_nodes_blacklisted Total blacklisted nodes`,
     `# TYPE foa_nodes_blacklisted gauge`,
     `foa_nodes_blacklisted ${activeBl}`,
+    `# HELP foa_api_keys_total Total API keys (incl. revoked)`,
+    `# TYPE foa_api_keys_total gauge`,
+    `foa_api_keys_total ${apiKeys.size}`,
     `# HELP foa_requests_total Total gateway requests served`,
     `# TYPE foa_requests_total counter`,
-    `foa_requests_total 4289`,
-  ].join('\n');
+    `foa_requests_total ${requestCounters.total}`,
+    `# HELP foa_requests_errors_total Requests that ended with 5xx`,
+    `# TYPE foa_requests_errors_total counter`,
+    `foa_requests_errors_total ${requestCounters.errors}`,
+  ];
+  for (const [code, count] of Array.from(requestCounters.by_status.entries()).sort((a, b) => a[0] - b[0])) {
+    lines.push(
+      `# HELP foa_requests_by_status Requests by HTTP status code`,
+      `# TYPE foa_requests_by_status counter`,
+      `foa_requests_by_status{status="${code}"} ${count}`
+    );
+  }
   res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
-  res.send(payload);
+  res.send(lines.join('\n'));
 });
 
 // Root and Panel routes
@@ -1100,7 +1479,7 @@ app.get('/admin/nodes/:id/latency-distribution', adminAuth, (req, res) => {
   });
 });
 
-app.post('/admin/nodes', adminAuth, (req, res) => {
+app.post('/admin/nodes', adminAuth, async (req, res) => {
   const { endpoint, display_name, owner_id, models, max_concurrency, consent_method, weight, country, labels } = req.body;
   if (!endpoint) {
     return res.status(400).json({ error: 'Endpoint обязателен' });
@@ -1134,10 +1513,9 @@ app.post('/admin/nodes', adminAuth, (req, res) => {
     labels: Array.isArray(labels) ? labels : [],
   };
 
-  nodes.set(nodeId, newNode);
   nodeLatencySamples.set(nodeId, generateDefaultSamplesForNode(newNode));
 
-  consents.set(consentId, {
+  const newConsent: ConsentItem = {
     consent_id: consentId,
     node_id: nodeId,
     owner_id: owner_id || 'unassigned@owner',
@@ -1152,7 +1530,18 @@ app.post('/admin/nodes', adminAuth, (req, res) => {
       { event: 'node_registered', actor: 'admin', created_at: now },
       { event: 'challenge_created', actor: 'system', created_at: now },
     ],
-  });
+  };
+
+  // Узел и согласие пишутся атомарно: не должно возникать узла без согласия.
+  try {
+    await tx(async (client) => {
+      await nodes.set(newNode, client);
+      await consents.set(newConsent, client);
+    });
+  } catch (err: any) {
+    logger.error('node registration failed', { error: err.message, node_id: nodeId });
+    return res.status(500).json({ error: 'Не удалось зарегистрировать узел', detail: err.message });
+  }
 
   addAudit('node_registered', 'admin', 'node', nodeId, { endpoint, consent_id: consentId });
 
@@ -1268,12 +1657,13 @@ app.post('/admin/nodes/:id/verify', adminAuth, async (req, res) => {
         detail: { method, mode, domain_owners_agreed: true },
       });
       consentFound = true;
+      persistConsent(c);
     }
   }
 
   if (!consentFound) {
     const cId = `cst_${node.node_id}`;
-    consents.set(cId, {
+    const newConsent: ConsentItem = {
       consent_id: cId,
       node_id: node.node_id,
       owner_id: node.owner_id,
@@ -1292,8 +1682,10 @@ app.post('/admin/nodes/:id/verify', adminAuth, async (req, res) => {
           detail: { method, mode, domain_owners_agreed: true },
         },
       ],
-    });
+    };
+    await persistConsent(newConsent);
   }
+  await persistNode(node);
 
   addAudit(mode === 'auto' ? 'node_auto_verified' : 'node_verified', 'admin', 'node', node.node_id, {
     routable: true,
@@ -1336,8 +1728,10 @@ app.post('/admin/nodes/bulk-verify', adminAuth, async (req, res) => {
           created_at: new Date().toISOString(),
           detail: { method, mode, domain_owners_agreed: true, bulk: true },
         });
+        persistConsent(c);
       }
     }
+    await persistNode(node);
     count++;
   }
   addAudit('nodes_bulk_verified', 'admin', 'nodes', 'bulk', { count, mode, method });
@@ -1391,6 +1785,7 @@ app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
   node.last_health_check = new Date().toISOString();
   node.updated_at = node.last_health_check;
   recordNodeLatencySample(node.node_id, latency);
+  await persistNode(node);
 
   addAudit('health_probe', 'system', 'node', node.node_id, {
     latency_ms: latency,
@@ -1408,9 +1803,9 @@ app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
   });
 });
 
-app.post('/admin/nodes/:id/revoke', adminAuth, (req, res) => {
+app.post('/admin/nodes/:id/revoke', adminAuth, async (req, res) => {
   const node = nodes.get(req.params.id);
-  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+  if (!node) return notFound(res, 'Узел не найден');
 
   node.consent_status = 'revoked';
   node.status = 'unhealthy';
@@ -1418,6 +1813,12 @@ app.post('/admin/nodes/:id/revoke', adminAuth, (req, res) => {
   node.state = 'revoked';
   node.effective_weight = 0;
   node.updated_at = new Date().toISOString();
+
+  // Отзыв должен быть мгновенным для маршрутизации (§5.5): закрываем пул
+  // соединений к узлу и сбрасываем breaker, чтобы при повторной верификации
+  // узел начал с чистого состояния.
+  closeAgentForEndpoint(node.endpoint);
+  resetBreaker(node.node_id);
 
   for (const c of consents.values()) {
     if (c.node_id === node.node_id) {
@@ -1430,14 +1831,16 @@ app.post('/admin/nodes/:id/revoke', adminAuth, (req, res) => {
         created_at: node.updated_at,
         detail: { reason: c.revoke_reason },
       });
+      persistConsent(c);
     }
   }
+  await persistNode(node);
 
   addAudit('node_revoked', 'admin', 'node', node.node_id, { reason: req.body.reason });
   res.json({ status: 'revoked', node_id: node.node_id, routable: false });
 });
 
-app.post('/admin/nodes/:id/blacklist', adminAuth, (req, res) => {
+app.post('/admin/nodes/:id/blacklist', adminAuth, async (req, res) => {
   const node = nodes.get(req.params.id);
   const nodeId = req.params.id;
   const endpoint = node ? node.endpoint : req.body.endpoint || 'unknown';
@@ -1447,9 +1850,12 @@ app.post('/admin/nodes/:id/blacklist', adminAuth, (req, res) => {
     node.routable = false;
     node.effective_weight = 0;
     node.updated_at = new Date().toISOString();
+    closeAgentForEndpoint(node.endpoint);
+    resetBreaker(node.node_id);
+    await persistNode(node);
   }
 
-  blacklist.set(nodeId, {
+  const entry: BlacklistItem = {
     node_id: nodeId,
     endpoint,
     reason: req.body.reason || 'Admin manual blacklist',
@@ -1458,15 +1864,21 @@ app.post('/admin/nodes/:id/blacklist', adminAuth, (req, res) => {
     created_at: new Date().toISOString(),
     expires_at: req.body.duration === 'permanent' ? null : new Date(Date.now() + 86400000).toISOString(),
     lifted_at: null,
-  });
+  };
+
+  try {
+    await blacklist.set(entry);
+  } catch (err: any) {
+    logger.warn('blacklist persist failed', { node_id: nodeId, error: err.message });
+  }
 
   addAudit('node_blacklisted', 'admin', 'node', nodeId, { reason: req.body.reason });
   res.json({ status: 'blacklisted', node_id: nodeId });
 });
 
-app.post('/admin/nodes/:id/unblacklist', adminAuth, (req, res) => {
+app.post('/admin/nodes/:id/unblacklist', adminAuth, async (req, res) => {
   const entry = blacklist.get(req.params.id);
-  if (!entry) return res.status(404).json({ error: 'Запись в чёрном списке не найдена' });
+  if (!entry) return notFound(res, 'Запись в чёрном списке не найдена');
 
   entry.lifted_at = new Date().toISOString();
   const node = nodes.get(req.params.id);
@@ -1474,30 +1886,45 @@ app.post('/admin/nodes/:id/unblacklist', adminAuth, (req, res) => {
     node.status = 'healthy';
     node.routable = true;
     node.effective_weight = node.weight;
+    await persistNode(node);
+  }
+
+  try {
+    await blacklist.set(entry);
+  } catch (err: any) {
+    logger.warn('unblacklist persist failed', { node_id: req.params.id, error: err.message });
   }
 
   addAudit('node_unblacklisted', 'admin', 'node', req.params.id);
   res.json({ status: 'unblacklisted', node_id: req.params.id });
 });
 
-app.delete('/admin/nodes/:id', adminAuth, (req, res) => {
+app.delete('/admin/nodes/:id', adminAuth, async (req, res) => {
   const nodeId = req.params.id;
-  if (!nodes.has(nodeId)) return res.status(404).json({ error: 'Узел не найден' });
+  const node = nodes.get(nodeId);
+  if (!node) return notFound(res, 'Узел не найден');
 
-  nodes.delete(nodeId);
+  try {
+    await nodes.delete(nodeId);
+  } catch (err: any) {
+    logger.warn('node delete failed', { node_id: nodeId, error: err.message });
+  }
+  closeAgentForEndpoint(node.endpoint);
+  resetBreaker(nodeId);
   addAudit('node_deleted', 'admin', 'node', nodeId);
   res.json({ status: 'deleted', node_id: nodeId });
 });
 
-app.post('/admin/nodes/:id/labels', adminAuth, (req, res) => {
+app.post('/admin/nodes/:id/labels', adminAuth, async (req, res) => {
   const node = nodes.get(req.params.id);
-  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+  if (!node) return notFound(res, 'Узел не найден');
   const { labels } = req.body;
   if (!Array.isArray(labels)) {
     return res.status(400).json({ error: 'labels должен быть массивом строк' });
   }
   node.labels = labels.map(l => String(l).trim()).filter(Boolean);
   node.updated_at = new Date().toISOString();
+  await persistNode(node);
   addAudit('node_labels_updated', 'admin', 'node', req.params.id, { labels: node.labels });
   res.json({ success: true, node_id: node.node_id, labels: node.labels });
 });
@@ -1537,19 +1964,20 @@ app.get('/admin/nodes/:id/logs', adminAuth, (req, res) => {
 });
 
 // Consents
-app.get('/admin/consents', adminAuth, (req, res) => {
-  res.json({ consents: Array.from(consents.values()) });
+app.get('/admin/consents', adminAuth, async (req, res) => {
+  const list = await consents.list();
+  res.json({ consents: list });
 });
 
-app.get('/admin/consents/:id', adminAuth, (req, res) => {
-  const consent = consents.get(req.params.id);
-  if (!consent) return res.status(404).json({ error: 'Согласие не найдено' });
+app.get('/admin/consents/:id', adminAuth, async (req, res) => {
+  const consent = consents.get(req.params.id) || (await consents.list().then((l) => l.find((c) => c.consent_id === req.params.id)));
+  if (!consent) return notFound(res, 'Согласие не найдено');
   res.json(consent);
 });
 
 // Blacklist
-app.get('/admin/blacklist', adminAuth, (req, res) => {
-  const all = Array.from(blacklist.values());
+app.get('/admin/blacklist', adminAuth, async (req, res) => {
+  const all = await blacklist.list();
   const activeTotal = all.filter((b) => !b.lifted_at).length;
   res.json({ active_total: activeTotal, blacklist: all });
 });
@@ -1978,16 +2406,27 @@ app.get('/admin/discovery/sources', adminAuth, (req, res) => {
 });
 
 // Clear all demo or runtime data on demand
-app.post('/admin/demo/clear', adminAuth, (req, res) => {
+app.post('/admin/demo/clear', adminAuth, async (req, res) => {
   const nCnt = nodes.size;
   const cCnt = candidates.size;
   const bCnt = blacklist.size;
   const csCnt = consents.size;
+  const kCnt = apiKeys.size;
 
-  nodes.clear();
-  candidates.clear();
-  blacklist.clear();
-  consents.clear();
+  try {
+    await tx(async (client) => {
+      await nodes.clear();
+      await candidates.clear();
+      await blacklist.clear();
+      await consents.clear();
+      await apiKeys.clear();
+      await clearAudit();
+    });
+    auditLogs.length = 0;
+    rebuildKeyHashIndex();
+  } catch (err: any) {
+    logger.warn('demo/clear: очистка PG не удалась полностью', { error: err.message });
+  }
 
   addAudit('data_cleared', 'admin', 'gateway', GATEWAY_ID, {
     cleared_nodes: nCnt,
@@ -1996,13 +2435,13 @@ app.post('/admin/demo/clear', adminAuth, (req, res) => {
 
   res.json({
     status: 'cleared',
-    message: 'Все данные (узлы, кандидаты, согласия, чёрный список) успешно очищены.',
-    cleared: { nodes: nCnt, candidates: cCnt, blacklist: bCnt, consents: csCnt },
+    message: 'Все данные (узлы, кандидаты, согласия, чёрный список, ключи, аудит) успешно очищены.',
+    cleared: { nodes: nCnt, candidates: cCnt, blacklist: bCnt, consents: csCnt, api_keys: kCnt },
   });
 });
 
-app.get('/admin/candidates', adminAuth, (req, res) => {
-  const list = Array.from(candidates.values());
+app.get('/admin/candidates', adminAuth, async (req, res) => {
+  const list = await candidates.list();
   res.json({
     total: list.length,
     candidates: list,
@@ -2012,9 +2451,9 @@ app.get('/admin/candidates', adminAuth, (req, res) => {
   });
 });
 
-app.delete('/admin/candidates', adminAuth, (req, res) => {
+app.delete('/admin/candidates', adminAuth, async (req, res) => {
   const count = candidates.size;
-  candidates.clear();
+  await candidates.clear().catch((err: any) => logger.warn('candidates clear failed', { error: err.message }));
   addAudit('candidates_cleared', 'admin', 'discovery', 'all', { count });
   res.json({ status: 'cleared', count });
 });
@@ -2125,6 +2564,9 @@ app.post('/admin/discovery/run', adminAuth, async (req, res) => {
         }
       }
       existingCandidate.observed_at = new Date().toISOString();
+      candidates.set(existingCandidate).catch((err) =>
+        logger.warn('candidate persist failed', { error: err.message })
+      );
     } else {
       const id = `cnd_${crypto.randomBytes(4).toString('hex')}`;
 
@@ -2159,7 +2601,7 @@ app.post('/admin/discovery/run', adminAuth, async (req, res) => {
         observed_at: new Date().toISOString(),
       };
 
-      candidates.set(id, candidate);
+      candidates.set(candidate).catch((err) => logger.warn('candidate persist failed', { error: err.message }));
       created++;
     }
   }
@@ -2280,7 +2722,7 @@ async function verifyAndEnrollCandidate(
     ip: cand.ip,
   };
 
-  nodes.set(nodeId, newNode);
+  await nodes.set(newNode);
   nodeLatencySamples.set(nodeId, generateDefaultSamplesForNode(newNode));
 
   const newConsent: ConsentItem = {
@@ -2312,7 +2754,7 @@ async function verifyAndEnrollCandidate(
     ],
   };
 
-  consents.set(consentId, newConsent);
+  await consents.set(newConsent);
 
   // Update candidate record
   cand.status = 'enrolled';
@@ -2321,6 +2763,7 @@ async function verifyAndEnrollCandidate(
   cand.verified_at = now;
   cand.node_id = nodeId;
   cand.challenge_token = challengeInfo.challenge_token;
+  await candidates.set(cand);
 
   addAudit(
     mode === 'auto' ? 'candidate_auto_verified' : 'candidate_manual_verified',
@@ -2434,18 +2877,22 @@ app.post('/admin/config/toggle-auto-verify', adminAuth, (req, res) => {
   });
 });
 
-app.delete('/admin/candidates/:id', adminAuth, (req, res) => {
+app.delete('/admin/candidates/:id', adminAuth, async (req, res) => {
   if (!candidates.has(req.params.id)) return res.status(404).json({ error: 'Кандидат не найден' });
-  candidates.delete(req.params.id);
+  await candidates.delete(req.params.id);
   res.json({ status: 'deleted', candidate_id: req.params.id });
 });
 
 // API Keys
-app.get('/admin/keys', adminAuth, (req, res) => {
-  res.json({ keys: Array.from(apiKeys.values()) });
+app.get('/admin/keys', adminAuth, async (req, res) => {
+  // Читаем напрямую из PG: ключ мог быть создан другой репликой, и её
+  // in-memory кэш нам недоступен. До этого список брался из локального Map,
+  // поэтому панель могла показывать пустоту даже после успешного создания.
+  const keys = await apiKeys.list();
+  res.json({ keys });
 });
 
-app.post('/admin/keys', adminAuth, (req, res) => {
+app.post('/admin/keys', adminAuth, async (req, res) => {
   const { label, scopes, rate_limit_per_minute, ttl_seconds } = req.body;
   const keyId = `key_${crypto.randomBytes(5).toString('hex')}`;
   const rawKey = `foa_live_${crypto.randomBytes(16).toString('hex')}`;
@@ -2462,9 +2909,11 @@ app.post('/admin/keys', adminAuth, (req, res) => {
     last_used_at: null,
     rate_limit_per_minute: rate_limit_per_minute || 60,
     raw_key: rawKey,
+    key_hash: hashApiKey(rawKey),
   };
 
-  apiKeys.set(keyId, newKey);
+  await apiKeys.set(newKey);
+  rebuildKeyHashIndex();
   addAudit('api_key_created', 'admin', 'api_key', keyId, { label: newKey.label });
 
   res.json({
@@ -2475,43 +2924,41 @@ app.post('/admin/keys', adminAuth, (req, res) => {
   });
 });
 
-app.post('/admin/keys/:id/revoke', adminAuth, (req, res) => {
-  const key = apiKeys.get(req.params.id);
+app.post('/admin/keys/:id/revoke', adminAuth, async (req, res) => {
+  const key = apiKeys.get(req.params.id) || (await apiKeys.findByField('key_id', req.params.id));
   if (!key) return res.status(404).json({ error: 'Ключ не найден' });
   key.revoked = true;
+  await apiKeys.set(key);
+  rebuildKeyHashIndex();
   addAudit('api_key_revoked', 'admin', 'api_key', key.key_id);
   res.json({ status: 'revoked', key_id: key.key_id });
 });
 
-app.post('/admin/keys/:id/rotate', adminAuth, (req, res) => {
-  const oldKey = apiKeys.get(req.params.id);
+app.post('/admin/keys/:id/rotate', adminAuth, async (req, res) => {
+  const oldKey = apiKeys.get(req.params.id) || (await apiKeys.findByField('key_id', req.params.id));
   if (!oldKey) return res.status(404).json({ error: 'Ключ не найден' });
 
   const rawKey = `foa_live_${crypto.randomBytes(16).toString('hex')}`;
   oldKey.raw_key = rawKey;
   oldKey.prefix = rawKey.slice(0, 12);
+  oldKey.key_hash = hashApiKey(rawKey);
   oldKey.revoked = false;
   oldKey.last_used_at = null;
+  await apiKeys.set(oldKey);
+  rebuildKeyHashIndex();
 
   addAudit('api_key_rotated', 'admin', 'api_key', oldKey.key_id);
   res.json({ status: 'rotated', key_id: oldKey.key_id, api_key: rawKey });
 });
 
 // Audit
-app.get('/admin/audit', adminAuth, (req, res) => {
-  let list = auditLogs;
+app.get('/admin/audit', adminAuth, async (req, res) => {
   const eventFilter = req.query.event as string;
   const subjectFilter = req.query.subject_id as string;
   const limit = parseInt(req.query.limit as string) || 100;
 
-  if (eventFilter) {
-    list = list.filter((e) => e.event.includes(eventFilter));
-  }
-  if (subjectFilter) {
-    list = list.filter((e) => e.subject_id.includes(subjectFilter));
-  }
-
-  res.json({ entries: list.slice(0, limit) });
+  const entries = await queryAudit(eventFilter, subjectFilter, limit);
+  res.json({ entries });
 });
 
 // Config
@@ -2528,11 +2975,19 @@ app.post('/admin/config/reload', adminAuth, (req, res) => {
 });
 
 // --- Ollama Compatible User API ---
+// §8.5: X-FOA-Request-ID (корреляция запросов) и X-FOA-Client-Hash
+// (обезличенный идентификатор клиента) проставляются на все запросы
+// пользовательского API. Счётчик — для /metrics.
+app.use('/api', requestIdMiddleware, clientHashMiddleware);
+app.use('/v1', requestIdMiddleware, clientHashMiddleware);
+
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/') || req.path.startsWith('/v1/')) {
     if (req.method === 'POST') {
       recordRequestForRpm(1);
     }
+    // Учитываем ответ для /metrics после завершения запроса.
+    res.on('finish', () => recordRequest(res.statusCode));
   }
   next();
 });
@@ -2584,6 +3039,171 @@ function getRoutableModels() {
     }
   }
   return Array.from(modelsSet);
+}
+
+// --- Реальное проксирование на узлы (§7.6, §7.2–7.5, §6.5) --------------------
+//
+// До этого каждый маршрут сам.sort()-ил узлы по active_connections и звал
+// голый fetch. Теперь выбор узла делает балансировщик (вес + EWMA + circuit
+// breaker), запросы идут через пул keep-alive соединений (undici), а при
+// отказе узла происходит retry на следующий. Fallback-ответы оставлены только
+// на случай, когда весь пул недоступен — иначе клиент получает настоящие
+// данные Ollama.
+
+function breakerCfg() {
+  const cfg = currentConfig.circuit_breaker;
+  return {
+    window_seconds: cfg?.window_seconds ?? 60,
+    minimum_requests: cfg?.minimum_requests ?? 10,
+    error_rate_threshold: cfg?.error_rate_threshold ?? 0.5,
+    open_duration_seconds: cfg?.open_duration_seconds ?? 30,
+    half_open_probes: cfg?.half_open_probes ?? 1,
+  };
+}
+
+// Кандидаты на маршрутизацию: узел должен поддерживать модель, быть routable
+// и не находиться в чёрном списке. Дополнительно учитываем circuit breaker.
+function routableNodesForModel(targetModel: string): NodeItem[] {
+  return Array.from(nodes.values()).filter((n) => {
+    if (!isModelSupportedByNode(n, targetModel)) return false;
+    if (isBreakerOpen(n.node_id, breakerCfg())) return false;
+    if (canAcceptConnection(n)) return true;
+    return false;
+  });
+}
+
+function canAcceptConnection(node: NodeItem): boolean {
+  return node.active_connections < Math.max(1, node.max_concurrency || 1);
+}
+
+// Заголовки, которые передаются на upstream: request-id и client-hash для
+// корреляции и настройки лимитов на стороне узла (§8.5).
+function upstreamHeaders(req: Request, extra: Record<string, string> = {}): Record<string, string> {
+  const h: Record<string, string> = { 'Content-Type': 'application/json' };
+  const requestId = (req as any).requestId;
+  if (requestId) h['X-FOA-Request-ID'] = requestId;
+  const clientHash = (req as any).clientHash;
+  if (clientHash) h['X-FOA-Client-Hash'] = clientHash;
+  const gatewayHeader = currentConfig.security.forward_client_ip !== true;
+  if (gatewayHeader) h['X-FOA-Gateway'] = GATEWAY_ID;
+  return { ...h, ...extra };
+}
+
+interface ProxyResult {
+  ok: boolean;
+  status: number;
+  node?: NodeItem;
+  response?: any;
+  bodyUsed?: boolean;
+}
+
+// fetch-ответ узла. Нужен собственный алиас: `Response` в этом файле — это
+// Express-тип, а нам нужен глобальный fetch Response.
+type FetchResponse = globalThis.Response;
+
+// Вызов upstream на выбранном узле. Возвращает null, если узел недоступен —
+// тогда вызывающая сторона делает retry на другой узел.
+async function callUpstream(
+  req: Request,
+  node: NodeItem,
+  path: string,
+  body: Record<string, any>
+): Promise<FetchResponse | null> {
+  const url = `${node.endpoint.replace(/\/+$/, '')}${path}`;
+  try {
+    const start = Date.now();
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: upstreamHeaders(req),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000),
+      dispatcher: dispatcherFor(node.endpoint, Math.max(1, node.max_concurrency || 4)),
+    } as any);
+    const latency = Date.now() - start;
+
+    if (res.ok) {
+      recordSuccess(node.node_id, latency, breakerCfg());
+      node.error_rate = 0;
+      node.latency_ms = latency;
+      node.ewma_latency_ms = node.ewma_latency_ms
+        ? Math.round(node.ewma_latency_ms * 0.7 + latency * 0.3)
+        : latency;
+    } else if (res.status >= 500) {
+      // 5xx — узел нездоров; учитываем в breaker-е и ретраим.
+      recordFailure(node.node_id, breakerCfg());
+      node.error_rate = Math.min(1, (node.error_rate || 0) + 0.1);
+    } else {
+      // 4xx — клиентская ошибка, узел здесь ни при чём: breaker не трогаем.
+      recordSuccess(node.node_id, latency, breakerCfg());
+    }
+    node.updated_at = new Date().toISOString();
+    return res;
+  } catch (err: any) {
+    recordFailure(node.node_id, breakerCfg());
+    node.error_rate = Math.min(1, (node.error_rate || 0) + 0.2);
+    logger.debug('upstream node unreachable', { node: node.node_id, url, error: err.message });
+    return null;
+  }
+}
+
+// Пробует узлы по порядку, пока один не ответит. §7.6: retry_attempts задаёт,
+// сколько узлов перебрать, прежде чем сдаться.
+async function proxyToPool(
+  req: Request,
+  res: Response,
+  path: string,
+  body: Record<string, any>,
+  targetModel: string,
+  opts: { attempts?: number; contentType?: string } = {}
+): Promise<boolean> {
+  const maxAttempts = opts.attempts ?? Math.max(1, currentConfig.routing.retry_attempts || 2);
+  const candidates = routableNodesForModel(targetModel);
+  if (!candidates.length) return false;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // На каждой попытке заново выбираем узел: состояние breaker-а могло
+    // измениться предыдущей попыткой.
+    const node = selectNode(candidates, breakerCfg());
+    if (!node) break;
+
+    const upstream: FetchResponse | null = await callUpstream(req, node, path, body);
+    if (!upstream) continue;
+
+    node.active_connections++;
+    res.setHeader('X-FOA-Gateway-Node', node.node_id);
+    try {
+      res.status(upstream.status);
+      const ct = upstream.headers.get('content-type') || opts.contentType;
+      if (ct) res.setHeader('Content-Type', ct);
+
+      if (upstream.body) {
+        const reader = (upstream.body as any).getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+      }
+      return true;
+    } finally {
+      node.active_connections = Math.max(0, node.active_connections - 1);
+    }
+  }
+  return false;
+}
+
+// Собирает и отдаёт 503, когда ни один узел не смог ответить.
+function noNodesResponse(res: Response, targetModel: string, isStream: boolean): void {
+  const available = getRoutableModels().slice(0, 10);
+  const message = isStream
+    ? `{"error":"Модель '${targetModel}' недоступна на узлах пула. Доступные модели: ${available.join(', ')}"}`
+    : `Модель '${targetModel}' временно недоступна в пуле авторизованных узлов. Доступные модели: ${available.join(', ')}`;
+  if (isStream) {
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.status(503).send(message);
+    return;
+  }
+  res.status(503).json({ error: message });
 }
 
 app.get('/api/version', userAuth, (req, res) => {
@@ -2949,7 +3569,85 @@ app.use('/admin/*', (req, res) => {
   res.status(501).json({ error: 'Not yet migrated in FOA Node.js gateway' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`FOA Gateway running on http://0.0.0.0:${PORT}`);
-  console.log(`CORS allowed origins: ${allowedCorsOrigins.join(', ') || '*'}`);
-});
+async function startBackgroundLoops(): Promise<void> {
+  // Фоновые циклы выполняются только лидером, чтобы две реплики не
+  // дублировали health-checks узлов и перепроверку согласий (§6.2, §5.4).
+  // Лидерство арендуется в Redis на короткий срок — при падении лидера
+  // роль тут же перехватывает другая реплика.
+  try {
+    const acquired = await tryAcquireLeader(GATEWAY_ID);
+    if (!acquired) {
+      logger.info('Не лидер — фоновые циклы не запускаются', { gateway_id: GATEWAY_ID });
+      return;
+    }
+    logger.info('Лидер выбран — запускаю фоновые циклы', { gateway_id: GATEWAY_ID });
+  } catch (err: any) {
+    logger.warn('Не удалось получить лидерство — циклы продолжатся как у единственной реплики', {
+      error: err.message,
+    });
+  }
+
+  // §6.2 liveness: периодическая проверка живости узлов.
+  setInterval(async () => {
+    if (!(await amILeader(GATEWAY_ID))) return;
+    const checks = Array.from(nodes.values()).map(async (node) => {
+      try {
+        const start = Date.now();
+        const res = await fetch(`${node.endpoint}/api/tags`, {
+          signal: AbortSignal.timeout(3_500),
+          dispatcher: dispatcherFor(node.endpoint, node.max_concurrency || 4) as any,
+        });
+        const latency = Date.now() - start;
+        if (res.ok) {
+          recordSuccess(node.node_id, latency, breakerConfig());
+        } else {
+          recordFailure(node.node_id, breakerConfig());
+        }
+      } catch {
+        recordFailure(node.node_id, breakerConfig());
+      }
+    });
+    await Promise.allSettled(checks);
+  }, 15_000).unref();
+
+  // §4.7 удаление кандидатов старше 90 дней.
+  setInterval(async () => {
+    if (!(await amILeader(GATEWAY_ID))) return;
+    const now = Date.now();
+    for (const cand of candidates.values()) {
+      const observedAt = cand.observed_at ? Date.parse(cand.observed_at) : NaN;
+      if (!Number.isNaN(observedAt) && now - observedAt > 90 * 86400000) {
+        await candidates.delete(cand.candidate_id).catch(() => {});
+      }
+    }
+  }, 3600_000).unref();
+}
+
+function breakerConfig() {
+  return currentConfig.circuit_breaker || {
+    window_seconds: 60,
+    minimum_requests: 10,
+    error_rate_threshold: 0.5,
+    open_duration_seconds: 30,
+    half_open_probes: 1,
+  };
+}
+
+async function main(): Promise<void> {
+  try {
+    await bootstrap();
+    await startBackgroundLoops();
+  } catch (err: any) {
+    // Сбой инициализации хранилищ не должен ронять шлюз: деградируем до
+    // in-memory и продолжаем слушать порт.
+    logger.error('Bootstrap не удался — продолжаем на in-memory хранилище', { error: err.message });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    logger.info('FOA Gateway слушает соединения', { host: '0.0.0.0', port: PORT });
+    console.log(`FOA Gateway running on http://0.0.0.0:${PORT}`);
+    console.log(`CORS allowed origins: ${allowedCorsOrigins.join(', ') || '*'}`);
+  });
+}
+
+main();
