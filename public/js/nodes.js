@@ -360,12 +360,13 @@ function renderNodeRow(n, isChild = false, groupKey = '') {
     <td>${n.routable ? '<span class="badge badge-green">✓</span>' : '<span class="badge badge-gray">✗</span>'}</td>
     <td>
       <div class="btn-group">
-        <button class="btn btn-sm node-detail" data-id="${esc(n.node_id)}" title="Детали">📋</button>
-        <button class="btn btn-sm node-labels" data-id="${esc(n.node_id)}" title="Метки">🏷️</button>
-        <button class="btn btn-sm node-logs" data-id="${esc(n.node_id)}" title="Логи">📄</button>
-        <button class="btn btn-sm btn-success node-verify" data-id="${esc(n.node_id)}" title="Verify">✓</button>
-        <button class="btn btn-sm node-health" data-id="${esc(n.node_id)}" title="Health Check">🩺</button>
-        <button class="btn btn-sm btn-danger node-del" data-id="${esc(n.node_id)}" title="Удалить">🗑</button>
+        <button class="btn btn-xs btn-icon node-detail" data-id="${esc(n.node_id)}" title="Детали">📋</button>
+        <button class="btn btn-xs btn-icon node-chat" data-id="${esc(n.node_id)}" title="Чат с узлом">💬</button>
+        <button class="btn btn-xs btn-icon node-labels" data-id="${esc(n.node_id)}" title="Метки">🏷️</button>
+        <button class="btn btn-xs btn-icon node-logs" data-id="${esc(n.node_id)}" title="Логи">📄</button>
+        <button class="btn btn-xs btn-icon btn-success node-verify" data-id="${esc(n.node_id)}" title="Verify">✓</button>
+        <button class="btn btn-xs btn-icon node-health" data-id="${esc(n.node_id)}" title="Health Check">🩺</button>
+        <button class="btn btn-xs btn-icon btn-danger node-del" data-id="${esc(n.node_id)}" title="Удалить">🗑</button>
       </div>
     </td>
   </tr>`;
@@ -667,7 +668,10 @@ async function renderNodes(container) {
               <div style="font-size: 12px; margin-bottom: 6px;">Страна: <strong>${esc(n.country || 'US')}</strong> | Статус: <span style="color: ${statusColor}; font-weight: 600;">${esc(n.status)}</span></div>
               <div style="font-size: 12px; margin-bottom: 6px;">Задержка: <strong>${n.latency_ms || 0}ms</strong></div>
               <div style="font-size: 12px; margin-bottom: 8px;">Модели: ${(n.models || []).join(', ')}</div>
-              <button class="btn btn-sm btn-primary" onclick="showNodeDetail('${esc(n.node_id)}')">Подробнее</button>
+      <div style="display: flex; gap: 6px; align-items: center;">
+        <button class="btn btn-xs btn-icon" onclick="showNodeChatModal('${esc(n.node_id)}')" title="Чат с узлом">💬</button>
+        <button class="btn btn-sm btn-primary" onclick="showNodeDetail('${esc(n.node_id)}')">Подробнее</button>
+      </div>
             </div>
           `;
           marker.bindPopup(popupContent);
@@ -832,6 +836,7 @@ async function renderNodes(container) {
       const id = btn.dataset.id;
       if (!id) return;
       if (btn.classList.contains('node-detail') || btn.classList.contains('node-link')) await showNodeDetail(id);
+      else if (btn.classList.contains('node-chat')) showNodeChatModal(id);
       else if (btn.classList.contains('node-labels')) await showNodeLabelsModal(id);
       else if (btn.classList.contains('node-logs')) await showNodeLogsModal(id);
       else if (btn.classList.contains('node-verify')) await showVerificationModal(id, false);
@@ -886,6 +891,7 @@ async function showNodeDetail(nodeId) {
         ])
       ),
       h('div', {class: 'modal-footer'},
+        h('button', {class: 'btn btn-primary', onClick: () => { closeModal(); showNodeChatModal(nodeId); }}, '💬 Чат'),
         h('button', {class: 'btn btn-primary', onClick: () => { closeModal(); showNodeLabelsModal(nodeId); }}, '🏷️ Метки'),
         h('button', {class: 'btn btn-primary', onClick: () => { closeModal(); showNodeLogsModal(nodeId); }}, '📄 Логи'),
         h('button', {class: 'btn btn-success', onClick: () => { closeModal(); showVerificationModal(nodeId, false); }}, '✓ Верификация'),

@@ -1815,6 +1815,54 @@ app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
   });
 });
 
+// Прямой прокси-чат с конкретным узлом (для карточки узла в админ-панели)
+app.post('/admin/nodes/:id/chat', adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+
+  const message = String(req.body?.message || '').trim();
+  if (!message) return res.status(400).json({ error: 'Пустое сообщение' });
+
+  const model = req.body?.model || (Array.isArray(node.models) && node.models[0]) || 'llama3';
+  const messages = Array.isArray(req.body?.messages) && req.body.messages.length
+    ? req.body.messages
+    : [{ role: 'user', content: message }];
+
+  const start = Date.now();
+  node.active_connections++;
+  try {
+    const upstreamRes = await fetch(`${node.endpoint}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, messages, stream: false }),
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!upstreamRes.ok) {
+      const text = await upstreamRes.text().catch(() => '');
+      throw new Error(`Узел ответил HTTP ${upstreamRes.status}${text ? `: ${text.slice(0, 200)}` : ''}`);
+    }
+
+    const data = (await upstreamRes.json()) as any;
+    const reply = typeof data.message?.content === 'string'
+      ? data.message.content
+      : (typeof data.response === 'string' ? data.response : '');
+
+    res.json({
+      reply,
+      model: data.model || model,
+      node_id: node.node_id,
+      latency_ms: Date.now() - start,
+      done: data.done !== false,
+    });
+  } catch (err: any) {
+    addAudit('node_chat_error', 'admin', 'node', node.node_id, { error: err.message });
+    res.status(502).json({ error: `Чат с узлом недоступен: ${err.message}` });
+  } finally {
+    node.active_connections = Math.max(0, node.active_connections - 1);
+  }
+});
+
 app.post('/admin/nodes/:id/revoke', adminAuth, async (req, res) => {
   const node = nodes.get(req.params.id);
   if (!node) return notFound(res, 'Узел не найден');
