@@ -37,6 +37,807 @@ var import_cors = __toESM(require("cors"), 1);
 var import_path = __toESM(require("path"), 1);
 var import_crypto = __toESM(require("crypto"), 1);
 var import_fs = __toESM(require("fs"), 1);
+
+// src/logger.ts
+var LEVEL_WEIGHT = { debug: 10, info: 20, warn: 30, error: 40 };
+var LEVEL_NAMES = ["loglevel", "FOA_OBSERVABILITY__LOG_LEVEL", "LOG_LEVEL"];
+function resolveLevel() {
+  for (const name of LEVEL_NAMES) {
+    const raw = process.env[name];
+    if (raw) {
+      const v = String(raw).trim().toLowerCase();
+      if (v in LEVEL_WEIGHT) return v;
+    }
+  }
+  return "info";
+}
+var currentLevelWeight = LEVEL_WEIGHT[resolveLevel()];
+var SECRET_TEXT_PATTERNS = [
+  [/foa_live_[a-f0-9]{8,}/g, "foa_live_***"],
+  [/foa_chk_[a-f0-9]{8,}/g, "foa_chk_***"],
+  [/ch_[a-f0-9]{16,}/g, "ch_***"],
+  [/Bearer\s+[^\s"']+/g, "Bearer ***"]
+];
+var SECRET_KEY_HINTS = [
+  "password",
+  "passwd",
+  "secret",
+  "token",
+  "apikey",
+  "api_key",
+  "authorization",
+  "raw_key",
+  "key_hash",
+  "salt",
+  "credential"
+];
+function maskString(input) {
+  let out = input;
+  for (const [re, replacement] of SECRET_TEXT_PATTERNS) {
+    out = out.replace(re, replacement);
+  }
+  return out;
+}
+function isSecretKey(name) {
+  const lower = name.toLowerCase();
+  return SECRET_KEY_HINTS.some((hint) => lower.includes(hint));
+}
+function maskSecrets(value, depth = 0) {
+  if (depth > 6) return value;
+  if (typeof value === "string") return maskString(value);
+  if (Array.isArray(value)) return value.map((v) => maskSecrets(v, depth + 1));
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = isSecretKey(k) ? "***" : maskSecrets(v, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+function emit(level, msg, meta) {
+  if (LEVEL_WEIGHT[level] < currentLevelWeight) return;
+  const record = {
+    ts: (/* @__PURE__ */ new Date()).toISOString(),
+    level,
+    service: "foa-gateway",
+    msg,
+    ...meta ? maskSecrets(meta) : {}
+  };
+  const line = JSON.stringify(record);
+  if (level === "error") {
+    process.stderr.write(line + "\n");
+  } else {
+    process.stdout.write(line + "\n");
+  }
+}
+var logger = {
+  debug: (msg, meta) => emit("debug", msg, meta),
+  info: (msg, meta) => emit("info", msg, meta),
+  warn: (msg, meta) => emit("warn", msg, meta),
+  error: (msg, meta) => emit("error", msg, meta)
+};
+
+// src/db.ts
+var import_pg = require("pg");
+function normalizeUrl(url) {
+  return url.replace(/^postgres(?:sql)?\+[a-z0-9]+:\/\//i, "postgresql://");
+}
+function resolveDbUrl() {
+  const candidates2 = [
+    process.env.FOA_STORAGE__DATABASE_URL,
+    process.env.GATEWAY_DB_URL,
+    process.env.DATABASE_URL
+  ];
+  for (const c of candidates2) {
+    if (c && c.trim()) return normalizeUrl(c.trim());
+  }
+  return null;
+}
+var pool = null;
+var listener = null;
+var enabled = false;
+var connected = false;
+function dbEnabled() {
+  return enabled;
+}
+function dbConnected() {
+  return connected;
+}
+var NOTIFY_CHANNEL = "foa_changes";
+var TABLES = {
+  nodes: "nodes",
+  apiKeys: "api_keys",
+  consents: "consents",
+  blacklist: "blacklist",
+  candidates: "candidates"
+};
+var SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS ${TABLES.nodes} (
+     id TEXT PRIMARY KEY,
+     data JSONB NOT NULL,
+     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+   )`,
+  `CREATE TABLE IF NOT EXISTS ${TABLES.apiKeys} (
+     id TEXT PRIMARY KEY,
+     data JSONB NOT NULL,
+     key_hash TEXT UNIQUE,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+   )`,
+  `CREATE TABLE IF NOT EXISTS ${TABLES.consents} (
+     id TEXT PRIMARY KEY,
+     data JSONB NOT NULL,
+     node_id TEXT NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS ${TABLES.blacklist} (
+     id TEXT PRIMARY KEY,
+     data JSONB NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS ${TABLES.candidates} (
+     id TEXT PRIMARY KEY,
+     data JSONB NOT NULL,
+     observed_at TIMESTAMPTZ NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS audit_logs (
+     id TEXT PRIMARY KEY,
+     data JSONB NOT NULL,
+     created_at TIMESTAMPTZ NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_consents_node_id ON ${TABLES.consents} (node_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs (created_at DESC)`
+];
+async function initDb() {
+  const url = resolveDbUrl();
+  if (!url) {
+    logger.warn("GATEWAY_DB_URL/FOA_STORAGE__DATABASE_URL \u043D\u0435 \u0437\u0430\u0434\u0430\u043D \u2014 \u0441\u043E\u0441\u0442\u043E\u044F\u043D\u0438\u0435 \u0436\u0438\u0432\u0451\u0442 \u0432 \u043F\u0430\u043C\u044F\u0442\u0438 \u043F\u0440\u043E\u0446\u0435\u0441\u0441\u0430", {
+      storage: "in-memory"
+    });
+    return false;
+  }
+  try {
+    pool = new import_pg.Pool({ connectionString: url, max: 10, idleTimeoutMillis: 3e4 });
+    await pool.query("SELECT 1");
+    for (const stmt of SCHEMA_STATEMENTS) {
+      await pool.query(stmt);
+    }
+    listener = new import_pg.Client({ connectionString: url });
+    await listener.connect();
+    await listener.query(`LISTEN ${NOTIFY_CHANNEL}`);
+    listener.on("notification", (msg) => {
+      const payload = safeParsePayload(msg.payload);
+      if (payload && reloadHandlers[payload.table]) {
+        scheduleReload(payload.table);
+      }
+    });
+    listener.on("error", (err) => {
+      logger.warn("PG listener error", { error: err.message });
+    });
+    enabled = true;
+    connected = true;
+    logger.info("PostgreSQL \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D", { storage: "postgres" });
+    return true;
+  } catch (err) {
+    connected = false;
+    logger.error("PostgreSQL \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D \u2014 \u0440\u0430\u0431\u043E\u0442\u0430 \u0432 in-memory \u0440\u0435\u0436\u0438\u043C\u0435", {
+      error: err.message,
+      storage: "in-memory-fallback"
+    });
+    enabled = false;
+    return false;
+  }
+}
+function safeParsePayload(payload) {
+  if (!payload) return null;
+  try {
+    const parsed = JSON.parse(payload);
+    if (parsed && typeof parsed.table === "string" && reloadHandlers[parsed.table]) {
+      return { table: parsed.table };
+    }
+  } catch {
+    if (reloadHandlers[payload]) return { table: payload };
+  }
+  return null;
+}
+var reloadHandlers = {};
+var pendingReloads = /* @__PURE__ */ new Set();
+var reloadTimer = null;
+function scheduleReload(table) {
+  pendingReloads.add(table);
+  if (reloadTimer) return;
+  reloadTimer = setTimeout(() => {
+    reloadTimer = null;
+    const tables = Array.from(pendingReloads);
+    pendingReloads.clear();
+    for (const t of tables) {
+      const handler = reloadHandlers[t];
+      if (handler) {
+        handler().catch((err) => logger.warn("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u0435\u0440\u0435\u0447\u0438\u0442\u0430\u0442\u044C \u0442\u0430\u0431\u043B\u0438\u0446\u0443 \u0438\u0437 PG", { table: t, error: err.message }));
+      }
+    }
+  }, 200);
+}
+async function query(text, params) {
+  if (!pool) throw new Error("\u0411\u0414 \u043D\u0435 \u0438\u043D\u0438\u0446\u0438\u0430\u043B\u0438\u0437\u0438\u0440\u043E\u0432\u0430\u043D\u0430");
+  return pool.query(text, params);
+}
+async function tx(fn) {
+  if (!pool) throw new Error("\u0411\u0414 \u043D\u0435 \u0438\u043D\u0438\u0446\u0438\u0430\u043B\u0438\u0437\u0438\u0440\u043E\u0432\u0430\u043D\u0430");
+  const client2 = await pool.connect();
+  try {
+    await client2.query("BEGIN");
+    const result = await fn(client2);
+    await client2.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client2.query("ROLLBACK").catch(() => {
+    });
+    throw err;
+  } finally {
+    client2.release();
+  }
+}
+var VOLATILE_FIELDS = {
+  nodes: ["active_connections"],
+  api_keys: ["raw_key", "last_used_at"],
+  consents: [],
+  blacklist: [],
+  candidates: []
+};
+var Store = class {
+  constructor(table, idGetter) {
+    this.table = table;
+    this.idGetter = idGetter;
+    this.idField = "id";
+  }
+  cache = /* @__PURE__ */ new Map();
+  idField;
+  // --- синхронное чтение из кэша (hot-path) ---
+  get(id) {
+    return this.cache.get(id);
+  }
+  has(id) {
+    return this.cache.has(id);
+  }
+  get size() {
+    return this.cache.size;
+  }
+  values() {
+    return this.cache.values();
+  }
+  entries() {
+    return this.cache.entries();
+  }
+  keys() {
+    return this.cache.keys();
+  }
+  forEach(cb) {
+    this.cache.forEach(cb);
+  }
+  extractId(item) {
+    return this.idGetter(item);
+  }
+  // Запись: кэш обновляется оптимально (перезапишется перезагрузкой, если
+  // транзакция откатится), затем идёт запись в PG.
+  async set(item, client2) {
+    const id = this.extractId(item);
+    this.cache.set(id, item);
+    if (!enabled) return;
+    const row = this.serialize(item);
+    const q = `INSERT INTO ${this.table} (id, data) VALUES ($1, $2)
+               ON CONFLICT (id) DO UPDATE SET data = $2, updated_at = now()`;
+    if (client2) {
+      await client2.query(q, [id, row]);
+    } else if (pool) {
+      await pool.query(q, [id, row]);
+    }
+  }
+  async delete(id, client2) {
+    this.cache.delete(id);
+    if (!enabled) return;
+    const q = `DELETE FROM ${this.table} WHERE id = $1`;
+    if (client2) {
+      await client2.query(q, [id]);
+    } else if (pool) {
+      await pool.query(q, [id]);
+    }
+  }
+  // Обновление только кэша (без записи в PG) — используется, например, при
+  // восстановлении ключа аутентификации после промаха кэша: PG уже авторитет.
+  cacheUpsert(item) {
+    this.cache.set(this.extractId(item), item);
+  }
+  cacheDelete(id) {
+    this.cache.delete(id);
+  }
+  async clear() {
+    this.cache.clear();
+    if (!enabled) return;
+    if (pool) await pool.query(`DELETE FROM ${this.table}`);
+  }
+  // Список читается напрямую из PG — это гарантирует, что панель видит
+  // свежие данные независимо от того, какой реплике достался запрос.
+  async list() {
+    if (!enabled) return Array.from(this.cache.values());
+    const res = await query(`SELECT data FROM ${this.table}`);
+    const items = res.rows.map((r) => this.deserialize(r.data));
+    this.replaceCache(items);
+    return items;
+  }
+  // Перезагрузка из PG с сохранением volatile-полей текущего кэша.
+  async reload() {
+    if (!enabled) return;
+    const res = await query(`SELECT data FROM ${this.table}`);
+    const items = res.rows.map((r) => this.deserialize(r.data));
+    this.replaceCache(items);
+  }
+  replaceCache(items) {
+    const volatileFields = VOLATILE_FIELDS[this.table] || [];
+    const next = /* @__PURE__ */ new Map();
+    for (const item of items) {
+      const id = this.extractId(item);
+      if (volatileFields.length) {
+        const local = this.cache.get(id);
+        if (local) {
+          for (const field of volatileFields) {
+            if (local[field] !== void 0) item[field] = local[field];
+          }
+        }
+      }
+      next.set(id, item);
+    }
+    this.cache = next;
+  }
+  registerReloadHandler(handler) {
+    reloadHandlers[this.table] = handler;
+  }
+  // Для api_keys — отдельный путь: сериализация не должна вытаскивать raw_key
+  // (сырой ключ хранится только в памяти создания/ротации).
+  serialize(item) {
+    const table = this.table;
+    if (table === TABLES.apiKeys) {
+      const copy = { ...item };
+      delete copy.raw_key;
+      return JSON.stringify(copy);
+    }
+    return JSON.stringify(item);
+  }
+  deserialize(data) {
+    return data;
+  }
+  // Поиск по произвольному полю (используется для lookup ключа по key_hash).
+  async findByField(field, value) {
+    if (!enabled) {
+      for (const item of this.cache.values()) {
+        if (item[field] === value) return item;
+      }
+      return null;
+    }
+    const res = await query(`SELECT data FROM ${this.table} WHERE data @> $1::jsonb`, [
+      JSON.stringify({ [field]: value })
+    ]);
+    if (res.rows.length === 0) return null;
+    return this.deserialize(res.rows[0].data);
+  }
+  table_name() {
+    return this.table;
+  }
+};
+async function insertAuditRow(id, data, createdAt) {
+  if (!enabled || !pool) return;
+  try {
+    await pool.query(
+      "INSERT INTO audit_logs (id, data, created_at) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+      [id, JSON.stringify(data), createdAt]
+    );
+  } catch (err) {
+    logger.warn("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0437\u0430\u043F\u0438\u0441\u0430\u0442\u044C \u0441\u043E\u0431\u044B\u0442\u0438\u0435 \u0430\u0443\u0434\u0438\u0442\u0430 \u0432 PG", { error: err.message, event: data.event });
+  }
+}
+async function queryAudit(event, subjectId, limit = 100) {
+  if (!enabled) return [];
+  const conditions = [];
+  const params = [];
+  if (event) {
+    params.push(`%"event":"${event.replace(/"/g, '\\"')}"%`);
+    conditions.push(`data::text LIKE $${params.length}`);
+  }
+  if (subjectId) {
+    params.push(`%"subject_id":"${subjectId.replace(/"/g, '\\"')}"%`);
+    conditions.push(`data::text LIKE $${params.length}`);
+  }
+  const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
+  params.push(limit);
+  const res = await query(
+    `SELECT data FROM audit_logs ${where} ORDER BY created_at DESC LIMIT $${params.length}`,
+    params
+  );
+  return res.rows.map((r) => r.data);
+}
+async function clearAudit() {
+  if (!enabled || !pool) return;
+  await pool.query("DELETE FROM audit_logs");
+}
+function startFullReloadLoop(getTables) {
+  setInterval(() => {
+    for (const table of getTables()) {
+      const handler = reloadHandlers[table];
+      if (handler) {
+        handler().catch(
+          (err) => logger.warn("\u041F\u0435\u0440\u0438\u043E\u0434\u0438\u0447\u0435\u0441\u043A\u0438\u0439 \u043F\u0435\u0440\u0435\u0440\u0430\u0441\u0447\u0451\u0442 \u043A\u044D\u0448\u0430 \u043D\u0435 \u0443\u0434\u0430\u043B\u0441\u044F", { table, error: err.message })
+        );
+      }
+    }
+  }, 3e4);
+}
+
+// src/redis.ts
+var import_ioredis = require("ioredis");
+function resolveRedisUrl() {
+  const candidates2 = [
+    process.env.FOA_STORAGE__REDIS_URL,
+    process.env.GATEWAY_REDIS_URL,
+    process.env.REDIS_URL
+  ];
+  for (const c of candidates2) {
+    if (c && c.trim()) return c.trim();
+  }
+  return null;
+}
+var client = null;
+var enabled2 = false;
+function redisEnabled() {
+  return enabled2;
+}
+async function initRedis() {
+  const url = resolveRedisUrl();
+  if (!url) {
+    logger.warn("GATEWAY_REDIS_URL/FOA_STORAGE__REDIS_URL \u043D\u0435 \u0437\u0430\u0434\u0430\u043D \u2014 \u043B\u0438\u043C\u0438\u0442\u044B \u0441\u0447\u0438\u0442\u0430\u044E\u0442\u0441\u044F \u0432 \u043F\u0430\u043C\u044F\u0442\u0438 \u043F\u0440\u043E\u0446\u0435\u0441\u0441\u0430", {
+      storage: "in-memory"
+    });
+    return false;
+  }
+  try {
+    client = new import_ioredis.Redis(url, {
+      maxRetriesPerRequest: 2,
+      enableReadyCheck: true,
+      lazyConnect: false
+    });
+    await client.ping();
+    client.on("error", (err) => {
+      logger.warn("Redis error", { error: err.message });
+    });
+    enabled2 = true;
+    logger.info("Redis \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D", { storage: "redis" });
+    return true;
+  } catch (err) {
+    logger.error("Redis \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D \u2014 \u043B\u0438\u043C\u0438\u0442\u044B \u0441\u0447\u0438\u0442\u0430\u044E\u0442\u0441\u044F \u0432 \u043F\u0430\u043C\u044F\u0442\u0438 \u043F\u0440\u043E\u0446\u0435\u0441\u0441\u0430", {
+      error: err.message,
+      storage: "in-memory-fallback"
+    });
+    enabled2 = false;
+    client = null;
+    return false;
+  }
+}
+var LUA_SLIDING_WINDOW = `local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local member = ARGV[4]
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
+local cnt = redis.call('ZCARD', key)
+if cnt >= limit then
+  local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+  if oldest[2] ~= nil then
+    return {0, cnt, tonumber(oldest[2])}
+  end
+  return {0, cnt, 0}
+end
+redis.call('ZADD', key, now, member)
+redis.call('PEXPIRE', key, window * 2)
+return {1, cnt + 1, 0}`;
+var slidingSha = null;
+async function evalSliding(key, windowMs, limit, now) {
+  if (!client) throw new Error("redis not initialized");
+  const member = `${now}:${Math.random().toString(36).slice(2, 10)}`;
+  let res;
+  if (slidingSha) {
+    try {
+      res = await client.evalsha(slidingSha, 1, key, now, windowMs, limit, member);
+    } catch (err) {
+      if (!String(err.message || "").includes("NOSCRIPT")) throw err;
+      res = await client.eval(LUA_SLIDING_WINDOW, 1, key, now, windowMs, limit, member);
+    }
+  } else {
+    res = await client.eval(LUA_SLIDING_WINDOW, 1, key, now, windowMs, limit, member);
+    if (Array.isArray(res)) slidingSha = String(await client.script("LOAD", LUA_SLIDING_WINDOW).catch(() => null));
+  }
+  return [Number(res[0]), Number(res[1]), Number(res[2])];
+}
+var localWindows = /* @__PURE__ */ new Map();
+function localSliding(key, windowMs, limit, now) {
+  const hits = localWindows.get(key) || [];
+  const cutoff = now - windowMs;
+  const fresh = hits.filter((h) => h > cutoff);
+  if (fresh.length >= limit) {
+    return [0, fresh.length, fresh[0]];
+  }
+  fresh.push(now);
+  localWindows.set(key, fresh);
+  return [1, fresh.length, 0];
+}
+async function checkRateLimit(scope, id, limit, windowMs, now = Date.now()) {
+  if (!enabled2 || !client) {
+    const [allowed, count, oldest] = localSliding(`${scope}:${id}`, windowMs, limit, now);
+    return { allowed: allowed === 1, count, retryAfter: oldest ? Math.ceil((oldest + windowMs - now) / 1e3) : 0 };
+  }
+  try {
+    const key = `foa:rl:${scope}:${id}`;
+    const [allowed, count, oldest] = await evalSliding(key, windowMs, limit, now);
+    return {
+      allowed: allowed === 1,
+      count,
+      retryAfter: oldest ? Math.max(1, Math.ceil((oldest + windowMs - now) / 1e3)) : 0
+    };
+  } catch (err) {
+    logger.warn("Redis rate-limit \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D \u2014 \u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \u043D\u0430 in-memory", { error: err.message });
+    const [allowed, count, oldest] = localSliding(`${scope}:${id}`, windowMs, limit, now);
+    return { allowed: allowed === 1, count, retryAfter: oldest ? Math.ceil((oldest + windowMs - now) / 1e3) : 0 };
+  }
+}
+var LUA_INCR_LIMIT = `local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+local cur = redis.call('GET', key)
+if cur ~= nil and tonumber(cur) >= limit then
+  return 0
+end
+local n = redis.call('INCR', key)
+redis.call('EXPIRE', key, ttl)
+return 1`;
+var incrSha = null;
+var localInflight = /* @__PURE__ */ new Map();
+async function acquireInflight(id, limit, ttlSec = 60) {
+  if (!enabled2 || !client) {
+    const cur = localInflight.get(id) || 0;
+    if (cur >= limit) return false;
+    localInflight.set(id, cur + 1);
+    return true;
+  }
+  try {
+    const key = `foa:inflight:${id}`;
+    if (incrSha) {
+      try {
+        const res2 = await client.evalsha(incrSha, 1, key, limit, ttlSec);
+        return Number(res2) === 1;
+      } catch (err) {
+        if (!String(err.message || "").includes("NOSCRIPT")) throw err;
+      }
+    }
+    const res = await client.eval(LUA_INCR_LIMIT, 1, key, limit, ttlSec);
+    incrSha = String(await client.script("LOAD", LUA_INCR_LIMIT).catch(() => null));
+    return Number(res) === 1;
+  } catch (err) {
+    logger.warn("Redis inflight \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D \u2014 in-memory", { error: err.message });
+    const cur = localInflight.get(id) || 0;
+    if (cur >= limit) return false;
+    localInflight.set(id, cur + 1);
+    return true;
+  }
+}
+async function releaseInflight(id) {
+  if (!enabled2 || !client) {
+    const cur = localInflight.get(id) || 0;
+    localInflight.set(id, Math.max(0, cur - 1));
+    return;
+  }
+  try {
+    const key = `foa:inflight:${id}`;
+    const next = await client.decr(key);
+    if (next < 0) await client.set(key, 0, "EX", 60);
+  } catch (err) {
+    const cur = localInflight.get(id) || 0;
+    localInflight.set(id, Math.max(0, cur - 1));
+  }
+}
+var RPM_BUCKETS = 60;
+async function recordRpm(count = 1) {
+  if (!enabled2 || !client) {
+    rpmLocalFallback.record(count);
+    return;
+  }
+  try {
+    const minute = Math.floor(Date.now() / 6e4);
+    const key = `foa:rpm:${minute}`;
+    const pipeline = client.multi();
+    pipeline.incrby(key, count);
+    pipeline.expire(key, RPM_BUCKETS * 70);
+    await pipeline.exec();
+  } catch (err) {
+    rpmLocalFallback.record(count);
+  }
+}
+async function getRpmBuckets() {
+  if (!enabled2 || !client) {
+    return rpmLocalFallback.read();
+  }
+  try {
+    const now = Date.now();
+    const currentMin = Math.floor(now / 6e4);
+    const pipeline = client.multi();
+    for (let i = RPM_BUCKETS - 1; i >= 0; i--) {
+      pipeline.get(`foa:rpm:${currentMin - i}`);
+    }
+    const results = await pipeline.exec();
+    if (!results) return new Array(RPM_BUCKETS).fill(0);
+    return results.map((r) => Number(r[1] || 0));
+  } catch (err) {
+    return rpmLocalFallback.read();
+  }
+}
+var RpmLocalFallback = class {
+  buckets = new Array(RPM_BUCKETS).fill(0);
+  lastMinute = Math.floor(Date.now() / 6e4);
+  shift(currentMin) {
+    const diff = Math.min(RPM_BUCKETS, currentMin - this.lastMinute);
+    for (let i = 0; i < diff; i++) {
+      this.buckets.shift();
+      this.buckets.push(0);
+    }
+    this.lastMinute = currentMin;
+  }
+  record(count) {
+    this.shift(Math.floor(Date.now() / 6e4));
+    this.buckets[RPM_BUCKETS - 1] += count;
+  }
+  read() {
+    this.shift(Math.floor(Date.now() / 6e4));
+    return [...this.buckets];
+  }
+};
+var rpmLocalFallback = new RpmLocalFallback();
+async function seedRpmDemoData() {
+  if (!enabled2 || !client) return;
+  try {
+    const seeded = await client.setnx("foa:rpm:seeded", "1");
+    if (!seeded) return;
+    const currentMin = Math.floor(Date.now() / 6e4);
+    const pipeline = client.multi();
+    for (let i = RPM_BUCKETS - 1; i >= 0; i--) {
+      const wave = Math.sin(i / RPM_BUCKETS * Math.PI * 4) * 22;
+      const wave2 = Math.cos(i / RPM_BUCKETS * Math.PI * 2) * 12;
+      const jitter = Math.floor(Math.random() * 14) - 7;
+      const value = Math.max(15, Math.round(72 + wave + wave2 + jitter));
+      const key = `foa:rpm:${currentMin - i}`;
+      pipeline.set(key, value, "EX", RPM_BUCKETS * 70);
+    }
+    await pipeline.exec();
+  } catch (err) {
+    logger.warn("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u0441\u0435\u044F\u0442\u044C \u0434\u0435\u043C\u043E RPM \u0432 Redis", { error: err.message });
+  }
+}
+var GATEWAY_TTL_SEC = 30;
+async function registerGateway(gatewayId, meta = {}) {
+  if (!enabled2 || !client) return;
+  try {
+    await client.set(`foa:gw:${gatewayId}`, JSON.stringify({ ...meta, at: Date.now() }), "EX", GATEWAY_TTL_SEC);
+  } catch {
+  }
+}
+var LEADER_KEY = "foa:leader:scheduler";
+var LEADER_TTL_SEC = 20;
+var leaderRenewTimer = null;
+var isLeader = false;
+async function tryAcquireLeader(gatewayId) {
+  if (!enabled2 || !client) return true;
+  try {
+    const res = await client.set(LEADER_KEY, gatewayId, "EX", LEADER_TTL_SEC, "NX");
+    const acquired = res === "OK";
+    if (acquired && !leaderRenewTimer) {
+      leaderRenewTimer = setInterval(async () => {
+        try {
+          const renewed = await client.eval(
+            `if redis.call('GET', KEYS[1]) == ARGV[1] then
+               return redis.call('EXPIRE', KEYS[1], ARGV[2])
+             end
+             return 0`,
+            1,
+            LEADER_KEY,
+            gatewayId,
+            LEADER_TTL_SEC
+          );
+          if (!renewed) {
+            isLeader = false;
+            if (leaderRenewTimer) clearInterval(leaderRenewTimer);
+            leaderRenewTimer = null;
+          }
+        } catch {
+        }
+      }, LEADER_TTL_SEC * 500);
+    }
+    isLeader = acquired;
+    return acquired;
+  } catch {
+    return true;
+  }
+}
+function amILeader() {
+  return isLeader;
+}
+
+// src/balancer.ts
+var breakers = /* @__PURE__ */ new Map();
+function getBreaker(nodeId) {
+  let state = breakers.get(nodeId);
+  if (!state) {
+    state = { failures: [], successes: [], openedAt: null, probesInflight: 0 };
+    breakers.set(nodeId, state);
+  }
+  return state;
+}
+function prune(list, windowMs, now) {
+  const cutoff = now - windowMs;
+  return list.filter((t) => t > cutoff);
+}
+function recordSuccess(nodeId, latencyMs, config, now = Date.now()) {
+  const state = getBreaker(nodeId);
+  state.successes = prune(state.successes, config.window_seconds * 1e3, now);
+  state.successes.push(now);
+  if (state.probesInflight > 0) state.probesInflight--;
+  state.openedAt = null;
+  state.failures = prune(state.failures, config.window_seconds * 1e3, now);
+}
+function recordFailure(nodeId, config, now = Date.now()) {
+  const state = getBreaker(nodeId);
+  state.failures = prune(state.failures, config.window_seconds * 1e3, now);
+  state.failures.push(now);
+  if (state.probesInflight > 0) state.probesInflight--;
+  const windowMs = config.window_seconds * 1e3;
+  const successes = prune(state.successes, windowMs, now);
+  const total = successes.length + state.failures.length;
+  if (total >= config.minimum_requests && state.failures.length / total >= config.error_rate_threshold) {
+    state.openedAt = now;
+    state.probesInflight = 0;
+  }
+}
+function resetBreaker(nodeId) {
+  breakers.delete(nodeId);
+}
+
+// src/pool.ts
+var import_undici = require("undici");
+var agents = /* @__PURE__ */ new Map();
+function getAgentForEndpoint(endpoint, options = {}) {
+  const key = endpoint.replace(/\/+$/, "");
+  const maxConnections = options.maxConnections && options.maxConnections > 0 ? options.maxConnections : 8;
+  const existing = agents.get(key);
+  if (existing) return existing;
+  const agent = new import_undici.Agent({
+    connect: {
+      timeout: options.connectTimeoutMs ?? 4e3
+    },
+    connections: maxConnections,
+    keepAliveTimeout: options.keepAliveTimeoutMs ?? 3e4,
+    keepAliveMaxTimeout: 6e4,
+    pipelining: 1
+  });
+  agents.set(key, agent);
+  return agent;
+}
+function closeAgentForEndpoint(endpoint) {
+  const key = endpoint.replace(/\/+$/, "");
+  const agent = agents.get(key);
+  if (agent) {
+    agent.close().catch(() => {
+    });
+    agents.delete(key);
+  }
+}
+function dispatcherFor(endpoint, maxConcurrency, options = {}) {
+  return { dispatcher: getAgentForEndpoint(endpoint, { ...options, maxConnections: Math.max(1, maxConcurrency) }) };
+}
+
+// server.ts
 function reloadEnv() {
   try {
     const envPath = import_path.default.join(process.cwd(), ".env");
@@ -115,11 +916,12 @@ app.use((0, import_cors.default)(corsOptions));
 app.use(import_express.default.json({ limit: "10mb" }));
 app.use(import_express.default.urlencoded({ extended: true, limit: "10mb" }));
 app.use(import_express.default.static(import_path.default.join(process.cwd(), "public")));
-var nodes = /* @__PURE__ */ new Map();
-var consents = /* @__PURE__ */ new Map();
-var blacklist = /* @__PURE__ */ new Map();
-var candidates = /* @__PURE__ */ new Map();
-var apiKeys = /* @__PURE__ */ new Map();
+var nodes = new Store(TABLES.nodes, (n) => n.node_id);
+var consents = new Store(TABLES.consents, (c) => c.consent_id);
+var blacklist = new Store(TABLES.blacklist, (b) => b.node_id);
+var candidates = new Store(TABLES.candidates, (c) => c.candidate_id);
+var apiKeys = new Store(TABLES.apiKeys, (k) => k.key_id);
+var apiKeyByHash = /* @__PURE__ */ new Map();
 var auditLogs = [];
 var LATENCY_BINS = [
   { id: "b_0_50", label: "< 50ms", min: 0, max: 50 },
@@ -160,41 +962,51 @@ function recordNodeLatencySample(nodeId, latencyMs) {
   if (list.length > 300) list.shift();
 }
 var RPM_BUCKETS_COUNT = 60;
-var rpmHistory = new Array(RPM_BUCKETS_COUNT).fill(0);
-var lastRpmMinute = Math.floor(Date.now() / 6e4);
-function initRpmHistory() {
+var localRpmFallback = new Array(RPM_BUCKETS_COUNT).fill(0);
+var localRpmLastMinute = Math.floor(Date.now() / 6e4);
+var rpmSeededLocally = false;
+function seedLocalRpm() {
+  if (rpmSeededLocally) return;
+  rpmSeededLocally = true;
   for (let i = 0; i < RPM_BUCKETS_COUNT; i++) {
     const wave = Math.sin(i / 60 * Math.PI * 4) * 22;
     const wave2 = Math.cos(i / 60 * Math.PI * 2) * 12;
     const jitter = Math.floor(Math.random() * 14) - 7;
-    rpmHistory[i] = Math.max(15, Math.round(72 + wave + wave2 + jitter));
+    localRpmFallback[i] = Math.max(15, Math.round(72 + wave + wave2 + jitter));
   }
 }
-initRpmHistory();
+function shiftLocalRpm(currentMin) {
+  const diff = currentMin - localRpmLastMinute;
+  if (diff > 0) {
+    const shift = Math.min(diff, RPM_BUCKETS_COUNT);
+    for (let s = 0; s < shift; s++) {
+      localRpmFallback.shift();
+      localRpmFallback.push(0);
+    }
+    localRpmLastMinute = currentMin;
+  }
+}
 function recordRequestForRpm(count = 1) {
-  const currentMin = Math.floor(Date.now() / 6e4);
-  const diff = currentMin - lastRpmMinute;
-  if (diff > 0) {
-    const shift = Math.min(diff, RPM_BUCKETS_COUNT);
-    for (let s = 0; s < shift; s++) {
-      rpmHistory.shift();
-      rpmHistory.push(0);
-    }
-    lastRpmMinute = currentMin;
+  if (redisEnabled()) {
+    recordRpm(count).catch(() => shiftLocalRpm(Math.floor(Date.now() / 6e4)));
+    return;
   }
-  rpmHistory[rpmHistory.length - 1] = (rpmHistory[rpmHistory.length - 1] || 0) + count;
+  seedLocalRpm();
+  shiftLocalRpm(Math.floor(Date.now() / 6e4));
+  localRpmFallback[localRpmFallback.length - 1] += count;
 }
-function getRpm60mData() {
+async function getRpm60mData() {
   const now = /* @__PURE__ */ new Date();
-  const currentMin = Math.floor(Date.now() / 6e4);
-  const diff = currentMin - lastRpmMinute;
-  if (diff > 0) {
-    const shift = Math.min(diff, RPM_BUCKETS_COUNT);
-    for (let s = 0; s < shift; s++) {
-      rpmHistory.shift();
-      rpmHistory.push(0);
+  let values;
+  if (redisEnabled()) {
+    values = await getRpmBuckets();
+    if (values.length !== RPM_BUCKETS_COUNT) {
+      values = new Array(RPM_BUCKETS_COUNT).fill(0).map((_, i) => values[i] || 0);
     }
-    lastRpmMinute = currentMin;
+  } else {
+    seedLocalRpm();
+    shiftLocalRpm(Math.floor(Date.now() / 6e4));
+    values = [...localRpmFallback];
   }
   const points = [];
   for (let i = 0; i < RPM_BUCKETS_COUNT; i++) {
@@ -206,10 +1018,9 @@ function getRpm60mData() {
       label: minAgo === 0 ? "\u0421\u0435\u0439\u0447\u0430\u0441" : `-${minAgo}\u043C`,
       time: timeLabel,
       timestamp: pointTime.toISOString(),
-      rpm: rpmHistory[i] || 0
+      rpm: values[i] || 0
     });
   }
-  const values = points.map((p) => p.rpm);
   const currentRpm = values[values.length - 1] || 0;
   const peakRpm = Math.max(...values, 0);
   const avgRpm = Math.round(values.reduce((a, b) => a + b, 0) / (values.length || 1));
@@ -265,7 +1076,7 @@ function computeLatencyStats(samples) {
   };
 }
 function addAudit(event, actor, subject_type, subject_id, detail = {}) {
-  auditLogs.unshift({
+  const item = {
     id: `aud_${import_crypto.default.randomBytes(6).toString("hex")}`,
     created_at: (/* @__PURE__ */ new Date()).toISOString(),
     event,
@@ -273,155 +1084,177 @@ function addAudit(event, actor, subject_type, subject_id, detail = {}) {
     subject_type,
     subject_id,
     detail
-  });
+  };
+  auditLogs.unshift(item);
   if (auditLogs.length > 500) auditLogs.pop();
+  insertAuditRow(item.id, item, item.created_at).catch(
+    (err) => logger.warn("audit write failed", { error: err.message, event })
+  );
 }
-function seedInitialData() {
-  nodes.clear();
-  consents.clear();
-  blacklist.clear();
-  candidates.clear();
-  apiKeys.clear();
+async function seedInitialData() {
+  const freshNodes = await nodes.list();
+  const freshKeys = await apiKeys.list();
+  if (freshNodes.length > 0) {
+    return false;
+  }
   const now = (/* @__PURE__ */ new Date()).toISOString();
-  const sampleNodes = [
-    {
-      node_id: "node_us_east1",
-      endpoint: "http://198.51.100.22:11434",
-      display_name: "US-East FastCluster",
-      owner_id: "ops@cloudscale.net",
-      models: ["llama3", "llama3:8b", "llama3:70b", "mistral", "mistral:7b"],
-      max_concurrency: 4,
-      active_connections: 1,
-      latency_ms: 45,
-      error_rate: 2e-3,
-      weight: 10,
-      status: "healthy",
-      consent_status: "verified",
-      routable: true,
-      created_at: now,
-      updated_at: now,
-      state: "healthy",
-      active: 1,
-      ewma_latency_ms: 45,
-      effective_weight: 10,
-      country: "US",
-      ip: "198.51.100.22"
-    },
-    {
-      node_id: "node_us_west2",
-      endpoint: "http://198.51.100.58:11434",
-      display_name: "US-West Inference Hub",
-      owner_id: "ops@cloudscale.net",
-      models: ["llama3", "llama3:8b", "qwen2", "qwen2:7b"],
-      max_concurrency: 2,
-      active_connections: 0,
-      latency_ms: 62,
-      error_rate: 0,
-      weight: 8,
-      status: "healthy",
-      consent_status: "verified",
-      routable: true,
-      created_at: now,
-      updated_at: now,
-      state: "healthy",
-      active: 0,
-      ewma_latency_ms: 62,
-      effective_weight: 8,
-      country: "US",
-      ip: "198.51.100.58"
-    },
-    {
-      node_id: "node_de_fra1",
-      endpoint: "http://203.0.113.14:11434",
-      display_name: "DE-Frankfurt Dedicated",
-      owner_id: "berlin-lab@research.de",
-      models: ["llama3", "llama3:8b", "mixtral:8x7b", "phi3:mini"],
-      max_concurrency: 4,
-      active_connections: 2,
-      latency_ms: 88,
-      error_rate: 5e-3,
-      weight: 12,
-      status: "healthy",
-      consent_status: "verified",
-      routable: true,
-      created_at: now,
-      updated_at: now,
-      state: "healthy",
-      active: 2,
-      ewma_latency_ms: 88,
-      effective_weight: 12,
-      country: "DE",
-      ip: "203.0.113.14"
-    },
-    {
-      node_id: "node_de_mun2",
-      endpoint: "http://203.0.113.88:11434",
-      display_name: "DE-Munich GPU Rig",
-      owner_id: "berlin-lab@research.de",
-      models: ["codellama:13b", "llama3:8b"],
-      max_concurrency: 2,
-      active_connections: 0,
-      latency_ms: 145,
-      error_rate: 0.02,
-      weight: 5,
-      status: "degraded",
-      consent_status: "verified",
-      routable: true,
-      created_at: now,
-      updated_at: now,
-      state: "degraded",
-      active: 0,
-      ewma_latency_ms: 145,
-      effective_weight: 5,
-      country: "DE",
-      ip: "203.0.113.88"
-    },
-    {
-      node_id: "node_jp_tyo1",
-      endpoint: "http://192.0.2.77:11434",
-      display_name: "JP-Tokyo Edge Node",
-      owner_id: "tokyo-edge@ai-pacific.jp",
-      models: ["llama3:8b", "qwen2:72b", "gemma2:9b"],
-      max_concurrency: 4,
-      active_connections: 1,
-      latency_ms: 120,
-      error_rate: 1e-3,
-      weight: 10,
-      status: "healthy",
-      consent_status: "verified",
-      routable: true,
-      created_at: now,
-      updated_at: now,
-      state: "healthy",
-      active: 1,
-      ewma_latency_ms: 120,
-      effective_weight: 10,
-      country: "JP",
-      ip: "192.0.2.77"
-    },
-    {
-      node_id: "node_nl_ams1",
-      endpoint: "http://192.0.2.140:11434",
-      display_name: "NL-Amsterdam Relay",
-      owner_id: "community@foa-relay.eu",
-      models: ["llama3:8b", "mistral:7b"],
-      max_concurrency: 2,
-      active_connections: 0,
-      latency_ms: 76,
-      error_rate: 0,
-      weight: 6,
-      status: "healthy",
-      consent_status: "verified",
-      routable: true,
-      created_at: now,
-      updated_at: now,
-      state: "healthy",
-      active: 0,
-      ewma_latency_ms: 76,
-      effective_weight: 6,
-      country: "NL",
-      ip: "192.0.2.140"
-    },
+  const sampleNodes = [];
+  const pushNode = (node) => {
+    sampleNodes.push(node);
+    nodeLatencySamples.set(node.node_id, generateDefaultSamplesForNode(node));
+    consentsSeed.push({
+      consent_id: `cst_${node.node_id}`,
+      node_id: node.node_id,
+      owner_id: node.owner_id,
+      status: node.consent_status === "verified" ? "active" : "pending",
+      method: "http_well_known",
+      allowed_models: node.models,
+      max_concurrency: node.max_concurrency,
+      issued_at: now,
+      expires_at: new Date(Date.now() + 90 * 864e5).toISOString(),
+      version: 1,
+      history: [{ event: "seed_init", actor: "system", created_at: now }]
+    });
+  };
+  pushNode({
+    node_id: "node_us_east1",
+    endpoint: "http://198.51.100.22:11434",
+    display_name: "US-East FastCluster",
+    owner_id: "ops@cloudscale.net",
+    models: ["llama3", "llama3:8b", "llama3:70b", "mistral", "mistral:7b"],
+    max_concurrency: 4,
+    active_connections: 1,
+    latency_ms: 45,
+    error_rate: 2e-3,
+    weight: 10,
+    status: "healthy",
+    consent_status: "verified",
+    routable: true,
+    created_at: now,
+    updated_at: now,
+    state: "healthy",
+    active: 1,
+    ewma_latency_ms: 45,
+    effective_weight: 10,
+    country: "US",
+    ip: "198.51.100.22"
+  });
+  pushNode({
+    node_id: "node_us_west2",
+    endpoint: "http://198.51.100.58:11434",
+    display_name: "US-West Inference Hub",
+    owner_id: "ops@cloudscale.net",
+    models: ["llama3", "llama3:8b", "qwen2", "qwen2:7b"],
+    max_concurrency: 2,
+    active_connections: 0,
+    latency_ms: 62,
+    error_rate: 0,
+    weight: 8,
+    status: "healthy",
+    consent_status: "verified",
+    routable: true,
+    created_at: now,
+    updated_at: now,
+    state: "healthy",
+    active: 0,
+    ewma_latency_ms: 62,
+    effective_weight: 8,
+    country: "US",
+    ip: "198.51.100.58"
+  });
+  pushNode({
+    node_id: "node_de_fra1",
+    endpoint: "http://203.0.113.14:11434",
+    display_name: "DE-Frankfurt Dedicated",
+    owner_id: "berlin-lab@research.de",
+    models: ["llama3", "llama3:8b", "mixtral:8x7b", "phi3:mini"],
+    max_concurrency: 4,
+    active_connections: 2,
+    latency_ms: 88,
+    error_rate: 5e-3,
+    weight: 12,
+    status: "healthy",
+    consent_status: "verified",
+    routable: true,
+    created_at: now,
+    updated_at: now,
+    state: "healthy",
+    active: 2,
+    ewma_latency_ms: 88,
+    effective_weight: 12,
+    country: "DE",
+    ip: "203.0.113.14"
+  });
+  pushNode({
+    node_id: "node_de_mun2",
+    endpoint: "http://203.0.113.88:11434",
+    display_name: "DE-Munich GPU Rig",
+    owner_id: "berlin-lab@research.de",
+    models: ["codellama:13b", "llama3:8b"],
+    max_concurrency: 2,
+    active_connections: 0,
+    latency_ms: 145,
+    error_rate: 0.02,
+    weight: 5,
+    status: "degraded",
+    consent_status: "verified",
+    routable: true,
+    created_at: now,
+    updated_at: now,
+    state: "degraded",
+    active: 0,
+    ewma_latency_ms: 145,
+    effective_weight: 5,
+    country: "DE",
+    ip: "203.0.113.88"
+  });
+  pushNode({
+    node_id: "node_jp_tyo1",
+    endpoint: "http://192.0.2.77:11434",
+    display_name: "JP-Tokyo Edge Node",
+    owner_id: "tokyo-edge@ai-pacific.jp",
+    models: ["llama3:8b", "qwen2:72b", "gemma2:9b"],
+    max_concurrency: 4,
+    active_connections: 1,
+    latency_ms: 120,
+    error_rate: 1e-3,
+    weight: 10,
+    status: "healthy",
+    consent_status: "verified",
+    routable: true,
+    created_at: now,
+    updated_at: now,
+    state: "healthy",
+    active: 1,
+    ewma_latency_ms: 120,
+    effective_weight: 10,
+    country: "JP",
+    ip: "192.0.2.77"
+  });
+  pushNode({
+    node_id: "node_nl_ams1",
+    endpoint: "http://192.0.2.140:11434",
+    display_name: "NL-Amsterdam Relay",
+    owner_id: "community@foa-relay.eu",
+    models: ["llama3:8b", "mistral:7b"],
+    max_concurrency: 2,
+    active_connections: 0,
+    latency_ms: 76,
+    error_rate: 0,
+    weight: 6,
+    status: "healthy",
+    consent_status: "verified",
+    routable: true,
+    created_at: now,
+    updated_at: now,
+    state: "healthy",
+    active: 0,
+    ewma_latency_ms: 76,
+    effective_weight: 6,
+    country: "NL",
+    ip: "192.0.2.140"
+  });
+  pushNode(
     {
       node_id: "node_fr_par1",
       endpoint: "http://192.0.2.215:11434",
@@ -445,24 +1278,7 @@ function seedInitialData() {
       country: "FR",
       ip: "192.0.2.215"
     }
-  ];
-  sampleNodes.forEach((node) => {
-    nodes.set(node.node_id, node);
-    nodeLatencySamples.set(node.node_id, generateDefaultSamplesForNode(node));
-    consents.set(`cst_${node.node_id}`, {
-      consent_id: `cst_${node.node_id}`,
-      node_id: node.node_id,
-      owner_id: node.owner_id,
-      status: node.consent_status === "verified" ? "active" : "pending",
-      method: "http_well_known",
-      allowed_models: node.models,
-      max_concurrency: node.max_concurrency,
-      issued_at: now,
-      expires_at: new Date(Date.now() + 90 * 864e5).toISOString(),
-      version: 1,
-      history: [{ event: "seed_init", actor: "system", created_at: now }]
-    });
-  });
+  );
   const sampleCandidates = [
     {
       candidate_id: "cand_discovery_us1",
@@ -497,14 +1313,69 @@ function seedInitialData() {
       observed_at: now
     }
   ];
-  sampleCandidates.forEach((cand) => candidates.set(cand.candidate_id, cand));
+  sampleCandidates.forEach((cand) => candidates.set(cand));
   addAudit("gateway_boot", "system", "gateway", GATEWAY_ID, {
     version: VERSION,
     pool_size: sampleNodes.length,
     status: "clean_initialized"
   });
+  await tx(async (client2) => {
+    for (const node of sampleNodes) {
+      await nodes.set(node, client2);
+    }
+    for (const consent of consentsSeed) {
+      await consents.set(consent, client2);
+    }
+    for (const cand of sampleCandidates) {
+      await candidates.set(cand, client2);
+    }
+  }).catch((err) => {
+    logger.warn("\u0421\u0438\u0434\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u0435 \u0432 PG \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u2014 \u0434\u0430\u043D\u043D\u044B\u0435 \u043E\u0441\u0442\u0430\u043D\u0443\u0442\u0441\u044F \u0432 \u043F\u0430\u043C\u044F\u0442\u0438", { error: err.message });
+  });
+  return true;
 }
-seedInitialData();
+var consentsSeed = [];
+async function bootstrap() {
+  const pgOk = await initDb();
+  const redisOk = await initRedis();
+  nodes.registerReloadHandler(() => nodes.reload());
+  consents.registerReloadHandler(() => consents.reload());
+  blacklist.registerReloadHandler(() => blacklist.reload());
+  candidates.registerReloadHandler(() => candidates.reload());
+  apiKeys.registerReloadHandler(async () => {
+    await apiKeys.reload();
+    rebuildKeyHashIndex();
+  });
+  if (pgOk) {
+    startFullReloadLoop(() => [TABLES.nodes, TABLES.consents, TABLES.blacklist, TABLES.candidates, TABLES.apiKeys]);
+  }
+  await seedInitialData();
+  rebuildKeyHashIndex();
+  if (redisOk) {
+    await seedRpmDemoData();
+    await registerGateway(GATEWAY_ID, {
+      version: VERSION,
+      started_at: (/* @__PURE__ */ new Date()).toISOString(),
+      storage: pgOk ? "postgres" : "in-memory"
+    });
+  }
+  logger.info("Gateway initialized", {
+    gateway_id: GATEWAY_ID,
+    postgres: pgOk ? "connected" : "in-memory",
+    redis: redisOk ? "connected" : "in-memory",
+    nodes: nodes.size,
+    keys: apiKeys.size
+  });
+}
+function rebuildKeyHashIndex() {
+  apiKeyByHash.clear();
+  for (const key of apiKeys.values()) {
+    if (key.key_hash && !key.revoked) apiKeyByHash.set(key.key_hash, key);
+  }
+}
+function hashApiKey(rawKey) {
+  return import_crypto.default.createHash("sha256").update(rawKey).digest("hex");
+}
 var currentConfig = {
   gateway_id: GATEWAY_ID,
   security: {
@@ -531,6 +1402,10 @@ var currentConfig = {
     max_messages: 200,
     max_message_bytes: 262144,
     concurrent_stream_requests_per_user: 2
+  },
+  routing: {
+    // §7.6: число попыток проксирования на разные узлы при отказе.
+    retry_attempts: 2
   },
   health: {
     liveness_interval_seconds: 15,
@@ -566,6 +1441,112 @@ var currentConfig = {
     verification_mode: "dual"
   }
 };
+function generateRequestId() {
+  return `req_${import_crypto.default.randomBytes(8).toString("hex")}`;
+}
+var requestIdMiddleware = (req, res, next) => {
+  const incoming = req.headers["x-foa-request-id"];
+  const id = incoming && /^[A-Za-z0-9_.:-]{1,64}$/.test(incoming) ? incoming : generateRequestId();
+  req.requestId = id;
+  res.setHeader("X-FOA-Request-ID", id);
+  next();
+};
+var requestCounters = {
+  total: 0,
+  by_status: /* @__PURE__ */ new Map(),
+  errors: 0
+};
+function recordRequest(statusCode) {
+  requestCounters.total++;
+  if (statusCode >= 500) requestCounters.errors++;
+  requestCounters.by_status.set(statusCode, (requestCounters.by_status.get(statusCode) || 0) + 1);
+}
+function clientHashFor(req) {
+  const salt = process.env.FOA_SECURITY__CLIENT_HASH_SALT || currentConfig.security.client_hash_salt || "";
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip || "";
+  return import_crypto.default.createHash("sha256").update(`${salt}:${ip}`).digest("hex").slice(0, 16);
+}
+var clientHashMiddleware = (req, res, next) => {
+  req.clientHash = clientHashFor(req);
+  res.setHeader("X-FOA-Client-Hash", req.clientHash);
+  next();
+};
+function sendApiError(req, res, statusCode, message, opts = {}) {
+  const payload = {
+    error: message,
+    code: opts.code || defaultCodeFor(statusCode),
+    request_id: req.requestId || generateRequestId()
+  };
+  if (opts.retryAfter && opts.retryAfter > 0) {
+    payload.retry_after = opts.retryAfter;
+    res.setHeader("Retry-After", String(opts.retryAfter));
+  }
+  return res.status(statusCode).json(payload);
+}
+function defaultCodeFor(statusCode) {
+  switch (statusCode) {
+    case 400:
+      return "bad_request";
+    case 401:
+      return "unauthorized";
+    case 403:
+      return "forbidden";
+    case 404:
+      return "not_found";
+    case 409:
+      return "conflict";
+    case 413:
+      return "payload_too_large";
+    case 429:
+      return "rate_limited";
+    case 500:
+      return "internal_error";
+    case 502:
+      return "bad_gateway";
+    case 503:
+      return "service_unavailable";
+    case 504:
+      return "gateway_timeout";
+    default:
+      return "error";
+  }
+}
+var dirtyKeys = /* @__PURE__ */ new Set();
+var keyFlushTimer = null;
+function markKeyUsed(keyId) {
+  dirtyKeys.add(keyId);
+  if (keyFlushTimer) return;
+  keyFlushTimer = setInterval(() => {
+    const ids = Array.from(dirtyKeys);
+    dirtyKeys.clear();
+    for (const id of ids) {
+      const key = apiKeys.get(id);
+      if (!key || !dbEnabled()) continue;
+      const update = { ...key };
+      delete update.raw_key;
+      apiKeys.set(update).catch((err) => logger.warn("last_used_at flush failed", { error: err.message }));
+    }
+  }, 15e3);
+}
+async function persistNode(node) {
+  if (!node) return;
+  try {
+    await nodes.set(node);
+  } catch (err) {
+    logger.warn("node persist failed", { node_id: node.node_id, error: err.message });
+  }
+}
+async function persistConsent(consent) {
+  if (!consent) return;
+  try {
+    await consents.set(consent);
+  } catch (err) {
+    logger.warn("consent persist failed", { consent_id: consent.consent_id, error: err.message });
+  }
+}
+function notFound(res, message) {
+  return res.status(404).json({ error: message });
+}
 var adminAuth = (req, res, next) => {
   const authHeader = req.headers.authorization || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : req.query.token;
@@ -581,23 +1562,36 @@ var adminAuth = (req, res, next) => {
   req.adminRole = isAdmin ? "admin" : "auditor";
   return next();
 };
-var userAuth = (req, res, next) => {
+var userAuth = async (req, res, next) => {
   const authHeader = req.headers.authorization || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
   if (!token) {
-    return res.status(401).json({ error: "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F API-\u043A\u043B\u044E\u0447: \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043E\u043A Authorization: Bearer <foa_live_...>" });
+    return sendApiError(req, res, 401, "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F API-\u043A\u043B\u044E\u0447: \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043E\u043A Authorization: Bearer <foa_live_...>");
+  }
+  if (!token.startsWith("foa_live_")) {
+    return sendApiError(req, res, 401, "\u041D\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043B\u044C\u043D\u044B\u0439 API-\u043A\u043B\u044E\u0447");
   }
   const now = /* @__PURE__ */ new Date();
-  for (const key of apiKeys.values()) {
-    if (key.raw_key !== token || key.revoked) continue;
-    if (key.expires_at && new Date(key.expires_at) < now) {
-      return res.status(401).json({ error: "\u0421\u0440\u043E\u043A \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u044F API-\u043A\u043B\u044E\u0447\u0430 \u0438\u0441\u0442\u0451\u043A" });
+  const tokenHash = hashApiKey(token);
+  let key = apiKeyByHash.get(tokenHash);
+  if (!key && dbEnabled()) {
+    const fresh = await apiKeys.findByField("key_hash", tokenHash);
+    if (fresh) {
+      apiKeys.cacheUpsert(fresh);
+      key = fresh;
+      apiKeyByHash.set(tokenHash, fresh);
     }
-    key.last_used_at = now.toISOString();
-    req.apiKey = key;
-    return next();
   }
-  return res.status(401).json({ error: "\u041D\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043B\u044C\u043D\u044B\u0439 API-\u043A\u043B\u044E\u0447" });
+  if (!key || key.revoked) {
+    return sendApiError(req, res, 401, "\u041D\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043B\u044C\u043D\u044B\u0439 API-\u043A\u043B\u044E\u0447");
+  }
+  if (key.expires_at && new Date(key.expires_at) < now) {
+    return sendApiError(req, res, 401, "\u0421\u0440\u043E\u043A \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u044F API-\u043A\u043B\u044E\u0447\u0430 \u0438\u0441\u0442\u0451\u043A");
+  }
+  key.last_used_at = now.toISOString();
+  markKeyUsed(key.key_id);
+  req.apiKey = key;
+  return next();
 };
 var requireScopes = (...scopes) => {
   return (req, res, next) => {
@@ -606,153 +1600,196 @@ var requireScopes = (...scopes) => {
     if (scopes.some((s) => granted.includes(s))) {
       return next();
     }
-    return res.status(403).json({
-      error: `\u041D\u0435\u0434\u043E\u0441\u0442\u0430\u0442\u043E\u0447\u043D\u043E \u043F\u0440\u0430\u0432: \u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u043E\u0434\u0438\u043D \u0438\u0437 \u0441\u043A\u043E\u0443\u043F\u043E\u0432 [${scopes.join(", ")}], \u0443 \u043A\u043B\u044E\u0447\u0430 \u2014 [${granted.join(", ")}]`
-    });
+    return sendApiError(
+      req,
+      res,
+      403,
+      `\u041D\u0435\u0434\u043E\u0441\u0442\u0430\u0442\u043E\u0447\u043D\u043E \u043F\u0440\u0430\u0432: \u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u043E\u0434\u0438\u043D \u0438\u0437 \u0441\u043A\u043E\u0443\u043F\u043E\u0432 [${scopes.join(", ")}], \u0443 \u043A\u043B\u044E\u0447\u0430 \u2014 [${granted.join(", ")}]`
+    );
   };
 };
 var LIMIT_WINDOW_MS = 6e4;
-function pruneWindow(hits, now) {
-  const cutoff = now - LIMIT_WINDOW_MS;
-  let i = 0;
-  while (i < hits.length && hits[i] <= cutoff) i++;
-  return i > 0 ? hits.slice(i) : hits;
-}
-function windowRetryAfter(hits, limit, now) {
-  if (hits.length >= limit) {
-    return Math.max(1, Math.ceil((hits[0] + LIMIT_WINDOW_MS - now) / 1e3));
-  }
-  return 0;
-}
-var userRpm = /* @__PURE__ */ new Map();
-var modelRpm = /* @__PURE__ */ new Map();
-var globalRpm = [];
-var inflight = /* @__PURE__ */ new Map();
-var inflightStreams = /* @__PURE__ */ new Map();
-function rateLimited(res, scope, limit, retryAfter) {
-  res.setHeader("Retry-After", String(retryAfter));
-  return res.status(429).json({
-    error: `\u041F\u0440\u0435\u0432\u044B\u0448\u0435\u043D \u043B\u0438\u043C\u0438\u0442 \u0437\u0430\u043F\u0440\u043E\u0441\u043E\u0432 (${scope} \u2264 ${limit}/\u043C\u0438\u043D). \u041F\u043E\u0432\u0442\u043E\u0440\u0438\u0442\u0435 \u0447\u0435\u0440\u0435\u0437 ${retryAfter} \u0441.`,
-    retry_after: retryAfter
+function sendRateLimited(req, res, scope, limit, retryAfter) {
+  return sendApiError(req, res, 429, `\u041F\u0440\u0435\u0432\u044B\u0448\u0435\u043D \u043B\u0438\u043C\u0438\u0442 \u0437\u0430\u043F\u0440\u043E\u0441\u043E\u0432 (${scope} \u2264 ${limit}/\u043C\u0438\u043D). \u041F\u043E\u0432\u0442\u043E\u0440\u0438\u0442\u0435 \u0447\u0435\u0440\u0435\u0437 ${retryAfter} \u0441.`, {
+    code: "rate_limited",
+    retryAfter
   });
 }
+function sendInflightLimited(req, res, limit, isStream) {
+  return sendApiError(
+    req,
+    res,
+    429,
+    `\u041F\u0440\u0435\u0432\u044B\u0448\u0435\u043D \u043B\u0438\u043C\u0438\u0442 \u043E\u0434\u043D\u043E\u0432\u0440\u0435\u043C\u0435\u043D\u043D\u044B\u0445 ${isStream ? "\u0441\u0442\u0440\u0438\u043C\u043E\u0432" : "\u0437\u0430\u043F\u0440\u043E\u0441\u043E\u0432"} (${limit} \u043D\u0430 \u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044F)`,
+    { code: "concurrent_limit" }
+  );
+}
 var applyLimits = (opts = {}) => {
-  return (req, res, next) => {
+  return async (req, res, next) => {
     const key = req.apiKey;
     const limits = currentConfig.limits;
-    const now = Date.now();
     const keyId = key.key_id;
     const contentLength = Number(req.headers["content-length"] || 0);
     if (contentLength > limits.max_request_bytes) {
-      return res.status(413).json({ error: `\u0422\u0435\u043B\u043E \u0437\u0430\u043F\u0440\u043E\u0441\u0430 \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_request_bytes (${limits.max_request_bytes} \u0431\u0430\u0439\u0442)` });
+      return sendApiError(
+        req,
+        res,
+        413,
+        `\u0422\u0435\u043B\u043E \u0437\u0430\u043F\u0440\u043E\u0441\u0430 \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_request_bytes (${limits.max_request_bytes} \u0431\u0430\u0439\u0442)`
+      );
     }
     const body = req.body || {};
     if (opts.body === "prompt") {
       const prompt = typeof body.prompt === "string" ? body.prompt : "";
       if (Buffer.byteLength(prompt, "utf8") > limits.max_prompt_bytes) {
-        return res.status(400).json({ error: `\u041F\u0440\u043E\u043C\u043F\u0442 \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_prompt_bytes (${limits.max_prompt_bytes} \u0431\u0430\u0439\u0442)` });
+        return sendApiError(
+          req,
+          res,
+          400,
+          `\u041F\u0440\u043E\u043C\u043F\u0442 \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_prompt_bytes (${limits.max_prompt_bytes} \u0431\u0430\u0439\u0442)`
+        );
       }
       const numPredict = body.options?.num_predict;
       if (typeof numPredict === "number" && numPredict > limits.max_num_predict) {
-        return res.status(400).json({ error: `num_predict \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_num_predict (${limits.max_num_predict})` });
+        return sendApiError(req, res, 400, `num_predict \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_num_predict (${limits.max_num_predict})`);
       }
     } else if (opts.body === "chat" || opts.body === "openai") {
       const messages = Array.isArray(body.messages) ? body.messages : [];
       if (messages.length > limits.max_messages) {
-        return res.status(400).json({ error: `\u0427\u0438\u0441\u043B\u043E \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0439 \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_messages (${limits.max_messages})` });
+        return sendApiError(req, res, 400, `\u0427\u0438\u0441\u043B\u043E \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0439 \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_messages (${limits.max_messages})`);
       }
       for (const m of messages) {
         const content = typeof m?.content === "string" ? m.content : "";
         if (Buffer.byteLength(content, "utf8") > limits.max_message_bytes) {
-          return res.status(400).json({ error: `\u0421\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435 \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_message_bytes (${limits.max_message_bytes} \u0431\u0430\u0439\u0442)` });
+          return sendApiError(
+            req,
+            res,
+            400,
+            `\u0421\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435 \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_message_bytes (${limits.max_message_bytes} \u0431\u0430\u0439\u0442)`
+          );
         }
       }
       const cap = opts.body === "openai" ? body.max_tokens ?? body.max_completion_tokens : body.options?.num_predict;
       if (typeof cap === "number" && cap > limits.max_num_predict) {
-        return res.status(400).json({ error: `\u041B\u0438\u043C\u0438\u0442 \u0433\u0435\u043D\u0435\u0440\u0430\u0446\u0438\u0438 \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_num_predict (${limits.max_num_predict})` });
+        return sendApiError(req, res, 400, `\u041B\u0438\u043C\u0438\u0442 \u0433\u0435\u043D\u0435\u0440\u0430\u0446\u0438\u0438 \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 max_num_predict (${limits.max_num_predict})`);
       }
     }
     const userLimit = key.rate_limit_per_minute ?? limits.requests_per_minute_per_user;
-    const userHits = pruneWindow(userRpm.get(keyId) || [], now);
-    let retryAfter = windowRetryAfter(userHits, userLimit, now);
-    if (retryAfter) {
-      userRpm.set(keyId, userHits);
-      return rateLimited(res, "\u043D\u0430 \u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044F", userLimit, retryAfter);
+    const userResult = await checkRateLimit("user", keyId, userLimit, LIMIT_WINDOW_MS);
+    if (!userResult.allowed) {
+      setRateLimitHeaders(res, userLimit, userResult);
+      return sendRateLimited(req, res, "\u043D\u0430 \u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044F", userLimit, userResult.retryAfter);
     }
-    const globalHits = pruneWindow(globalRpm, now);
-    retryAfter = windowRetryAfter(globalHits, limits.requests_per_minute_global, now);
-    if (retryAfter) {
-      userRpm.set(keyId, userHits);
-      globalRpm = globalHits;
-      return rateLimited(res, "\u0433\u043B\u043E\u0431\u0430\u043B\u044C\u043D\u044B\u0439", limits.requests_per_minute_global, retryAfter);
+    const globalResult = await checkRateLimit("global", "all", limits.requests_per_minute_global, LIMIT_WINDOW_MS);
+    if (!globalResult.allowed) {
+      setRateLimitHeaders(res, limits.requests_per_minute_global, globalResult);
+      return sendRateLimited(req, res, "\u0433\u043B\u043E\u0431\u0430\u043B\u044C\u043D\u044B\u0439", limits.requests_per_minute_global, globalResult.retryAfter);
     }
-    let modelId = "";
     if (opts.perModel && body.model) {
-      modelId = `${keyId}|${String(body.model).toLowerCase()}`;
-      const modelHits = pruneWindow(modelRpm.get(modelId) || [], now);
-      retryAfter = windowRetryAfter(modelHits, limits.requests_per_minute_per_model, now);
-      if (retryAfter) {
-        userRpm.set(keyId, userHits);
-        globalRpm = globalHits;
-        modelRpm.set(modelId, modelHits);
-        return rateLimited(res, `\u043D\u0430 \u043C\u043E\u0434\u0435\u043B\u044C ${body.model}`, limits.requests_per_minute_per_model, retryAfter);
+      const modelId = `${keyId}|${String(body.model).toLowerCase()}`;
+      const modelResult = await checkRateLimit(
+        "model",
+        modelId,
+        limits.requests_per_minute_per_model,
+        LIMIT_WINDOW_MS
+      );
+      if (!modelResult.allowed) {
+        setRateLimitHeaders(res, limits.requests_per_minute_per_model, modelResult);
+        return sendRateLimited(
+          req,
+          res,
+          `\u043D\u0430 \u043C\u043E\u0434\u0435\u043B\u044C ${body.model}`,
+          limits.requests_per_minute_per_model,
+          modelResult.retryAfter
+        );
       }
-      modelRpm.set(modelId, modelHits);
     }
     const isStream = body.stream === true;
-    const inflightMap = isStream ? inflightStreams : inflight;
     const inflightLimit = isStream ? limits.concurrent_stream_requests_per_user : limits.concurrent_requests_per_user;
-    const current = inflightMap.get(keyId) || 0;
-    if (current >= inflightLimit) {
-      return res.status(429).json({ error: `\u041F\u0440\u0435\u0432\u044B\u0448\u0435\u043D \u043B\u0438\u043C\u0438\u0442 \u043E\u0434\u043D\u043E\u0432\u0440\u0435\u043C\u0435\u043D\u043D\u044B\u0445 \u0437\u0430\u043F\u0440\u043E\u0441\u043E\u0432 (${inflightLimit} \u043D\u0430 \u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044F)` });
+    const inflightScope = isStream ? "inflight-stream" : "inflight";
+    const acquired = await acquireInflight(`${inflightScope}:${keyId}`, inflightLimit);
+    if (!acquired) {
+      return sendInflightLimited(req, res, inflightLimit, isStream);
     }
-    inflightMap.set(keyId, current + 1);
-    userHits.push(now);
-    userRpm.set(keyId, userHits);
-    globalHits.push(now);
-    globalRpm = globalHits;
     let released = false;
     const release = () => {
       if (released) return;
       released = true;
-      inflightMap.set(keyId, Math.max(0, (inflightMap.get(keyId) || 1) - 1));
+      releaseInflight(`${inflightScope}:${keyId}`).catch(() => {
+      });
     };
     res.on("close", release);
     req.on("aborted", release);
     next();
   };
 };
+function setRateLimitHeaders(res, limit, result) {
+  res.setHeader("X-FOA-RateLimit-Limit", String(limit));
+  res.setHeader("X-FOA-RateLimit-Remaining", String(Math.max(0, limit - result.count)));
+  res.setHeader("X-FOA-RateLimit-Reset", String(Math.max(0, result.retryAfter)));
+}
 app.get("/healthz", (req, res) => {
-  res.json({ status: "ok", version: VERSION });
+  res.json({
+    status: "ok",
+    version: VERSION,
+    gateway_id: GATEWAY_ID,
+    storage: {
+      postgres: dbConnected() ? "connected" : dbEnabled() ? "error" : "disabled",
+      redis: redisEnabled() ? "connected" : "disabled"
+    }
+  });
 });
 app.get("/readyz", (req, res) => {
   const routable = Array.from(nodes.values()).filter((n) => n.routable).length;
-  const status = routable > 0 ? "ready" : "degraded";
-  res.status(routable > 0 ? 200 : 503).json({
+  const ok = routable > 0;
+  const status = ok ? "ready" : "degraded";
+  res.status(ok ? 200 : 503).json({
     status,
     routable_nodes: routable,
-    version: VERSION
+    nodes_total: nodes.size,
+    version: VERSION,
+    gateway_id: GATEWAY_ID,
+    storage: {
+      postgres: dbConnected() ? "connected" : dbEnabled() ? "error" : "disabled",
+      redis: redisEnabled() ? "connected" : "disabled"
+    }
   });
 });
 app.get("/metrics", (req, res) => {
   const routable = Array.from(nodes.values()).filter((n) => n.routable).length;
   const activeBl = Array.from(blacklist.values()).filter((b) => !b.lifted_at).length;
-  const payload = [
+  const lines = [
     `# HELP foa_build_info Gateway build information`,
     `# TYPE foa_build_info gauge`,
     `foa_build_info{version="${VERSION}",gateway_id="${GATEWAY_ID}"} 1`,
     `# HELP foa_nodes_routable Total routable nodes in pool`,
     `# TYPE foa_nodes_routable gauge`,
     `foa_nodes_routable ${routable}`,
+    `# HELP foa_nodes_total Total nodes known to gateway`,
+    `# TYPE foa_nodes_total gauge`,
+    `foa_nodes_total ${nodes.size}`,
     `# HELP foa_nodes_blacklisted Total blacklisted nodes`,
     `# TYPE foa_nodes_blacklisted gauge`,
     `foa_nodes_blacklisted ${activeBl}`,
+    `# HELP foa_api_keys_total Total API keys (incl. revoked)`,
+    `# TYPE foa_api_keys_total gauge`,
+    `foa_api_keys_total ${apiKeys.size}`,
     `# HELP foa_requests_total Total gateway requests served`,
     `# TYPE foa_requests_total counter`,
-    `foa_requests_total 4289`
-  ].join("\n");
+    `foa_requests_total ${requestCounters.total}`,
+    `# HELP foa_requests_errors_total Requests that ended with 5xx`,
+    `# TYPE foa_requests_errors_total counter`,
+    `foa_requests_errors_total ${requestCounters.errors}`
+  ];
+  for (const [code, count] of Array.from(requestCounters.by_status.entries()).sort((a, b) => a[0] - b[0])) {
+    lines.push(
+      `# HELP foa_requests_by_status Requests by HTTP status code`,
+      `# TYPE foa_requests_by_status counter`,
+      `foa_requests_by_status{status="${code}"} ${count}`
+    );
+  }
   res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
-  res.send(payload);
+  res.send(lines.join("\n"));
 });
 app.get(["/", "/panel", "/panel/*"], (req, res) => {
   res.sendFile(import_path.default.join(process.cwd(), "public", "index.html"));
@@ -881,7 +1918,7 @@ app.get("/admin/nodes/:id/latency-distribution", adminAuth, (req, res) => {
     ...stats
   });
 });
-app.post("/admin/nodes", adminAuth, (req, res) => {
+app.post("/admin/nodes", adminAuth, async (req, res) => {
   const { endpoint, display_name, owner_id, models, max_concurrency, consent_method, weight, country, labels } = req.body;
   if (!endpoint) {
     return res.status(400).json({ error: "Endpoint \u043E\u0431\u044F\u0437\u0430\u0442\u0435\u043B\u0435\u043D" });
@@ -912,9 +1949,8 @@ app.post("/admin/nodes", adminAuth, (req, res) => {
     country: (country || req.body.country || "US").toUpperCase(),
     labels: Array.isArray(labels) ? labels : []
   };
-  nodes.set(nodeId, newNode);
   nodeLatencySamples.set(nodeId, generateDefaultSamplesForNode(newNode));
-  consents.set(consentId, {
+  const newConsent = {
     consent_id: consentId,
     node_id: nodeId,
     owner_id: owner_id || "unassigned@owner",
@@ -929,7 +1965,16 @@ app.post("/admin/nodes", adminAuth, (req, res) => {
       { event: "node_registered", actor: "admin", created_at: now },
       { event: "challenge_created", actor: "system", created_at: now }
     ]
-  });
+  };
+  try {
+    await tx(async (client2) => {
+      await nodes.set(newNode, client2);
+      await consents.set(newConsent, client2);
+    });
+  } catch (err) {
+    logger.error("node registration failed", { error: err.message, node_id: nodeId });
+    return res.status(500).json({ error: "\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0443\u0437\u0435\u043B", detail: err.message });
+  }
   addAudit("node_registered", "admin", "node", nodeId, { endpoint, consent_id: consentId });
   res.json({
     node_id: nodeId,
@@ -1029,11 +2074,12 @@ app.post("/admin/nodes/:id/verify", adminAuth, async (req, res) => {
         detail: { method, mode, domain_owners_agreed: true }
       });
       consentFound = true;
+      persistConsent(c);
     }
   }
   if (!consentFound) {
     const cId = `cst_${node.node_id}`;
-    consents.set(cId, {
+    const newConsent = {
       consent_id: cId,
       node_id: node.node_id,
       owner_id: node.owner_id,
@@ -1052,8 +2098,10 @@ app.post("/admin/nodes/:id/verify", adminAuth, async (req, res) => {
           detail: { method, mode, domain_owners_agreed: true }
         }
       ]
-    });
+    };
+    await persistConsent(newConsent);
   }
+  await persistNode(node);
   addAudit(mode === "auto" ? "node_auto_verified" : "node_verified", "admin", "node", node.node_id, {
     routable: true,
     models: node.models,
@@ -1092,8 +2140,10 @@ app.post("/admin/nodes/bulk-verify", adminAuth, async (req, res) => {
           created_at: (/* @__PURE__ */ new Date()).toISOString(),
           detail: { method, mode, domain_owners_agreed: true, bulk: true }
         });
+        persistConsent(c);
       }
     }
+    await persistNode(node);
     count++;
   }
   addAudit("nodes_bulk_verified", "admin", "nodes", "bulk", { count, mode, method });
@@ -1140,6 +2190,7 @@ app.post("/admin/nodes/:id/health-check", adminAuth, async (req, res) => {
   node.last_health_check = (/* @__PURE__ */ new Date()).toISOString();
   node.updated_at = node.last_health_check;
   recordNodeLatencySample(node.node_id, latency);
+  await persistNode(node);
   addAudit("health_probe", "system", "node", node.node_id, {
     latency_ms: latency,
     status,
@@ -1154,15 +2205,17 @@ app.post("/admin/nodes/:id/health-check", adminAuth, async (req, res) => {
     error: errorMsg
   });
 });
-app.post("/admin/nodes/:id/revoke", adminAuth, (req, res) => {
+app.post("/admin/nodes/:id/revoke", adminAuth, async (req, res) => {
   const node = nodes.get(req.params.id);
-  if (!node) return res.status(404).json({ error: "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+  if (!node) return notFound(res, "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
   node.consent_status = "revoked";
   node.status = "unhealthy";
   node.routable = false;
   node.state = "revoked";
   node.effective_weight = 0;
   node.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+  closeAgentForEndpoint(node.endpoint);
+  resetBreaker(node.node_id);
   for (const c of consents.values()) {
     if (c.node_id === node.node_id) {
       c.status = "revoked";
@@ -1174,12 +2227,14 @@ app.post("/admin/nodes/:id/revoke", adminAuth, (req, res) => {
         created_at: node.updated_at,
         detail: { reason: c.revoke_reason }
       });
+      persistConsent(c);
     }
   }
+  await persistNode(node);
   addAudit("node_revoked", "admin", "node", node.node_id, { reason: req.body.reason });
   res.json({ status: "revoked", node_id: node.node_id, routable: false });
 });
-app.post("/admin/nodes/:id/blacklist", adminAuth, (req, res) => {
+app.post("/admin/nodes/:id/blacklist", adminAuth, async (req, res) => {
   const node = nodes.get(req.params.id);
   const nodeId = req.params.id;
   const endpoint = node ? node.endpoint : req.body.endpoint || "unknown";
@@ -1188,8 +2243,11 @@ app.post("/admin/nodes/:id/blacklist", adminAuth, (req, res) => {
     node.routable = false;
     node.effective_weight = 0;
     node.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+    closeAgentForEndpoint(node.endpoint);
+    resetBreaker(node.node_id);
+    await persistNode(node);
   }
-  blacklist.set(nodeId, {
+  const entry = {
     node_id: nodeId,
     endpoint,
     reason: req.body.reason || "Admin manual blacklist",
@@ -1198,39 +2256,58 @@ app.post("/admin/nodes/:id/blacklist", adminAuth, (req, res) => {
     created_at: (/* @__PURE__ */ new Date()).toISOString(),
     expires_at: req.body.duration === "permanent" ? null : new Date(Date.now() + 864e5).toISOString(),
     lifted_at: null
-  });
+  };
+  try {
+    await blacklist.set(entry);
+  } catch (err) {
+    logger.warn("blacklist persist failed", { node_id: nodeId, error: err.message });
+  }
   addAudit("node_blacklisted", "admin", "node", nodeId, { reason: req.body.reason });
   res.json({ status: "blacklisted", node_id: nodeId });
 });
-app.post("/admin/nodes/:id/unblacklist", adminAuth, (req, res) => {
+app.post("/admin/nodes/:id/unblacklist", adminAuth, async (req, res) => {
   const entry = blacklist.get(req.params.id);
-  if (!entry) return res.status(404).json({ error: "\u0417\u0430\u043F\u0438\u0441\u044C \u0432 \u0447\u0451\u0440\u043D\u043E\u043C \u0441\u043F\u0438\u0441\u043A\u0435 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430" });
+  if (!entry) return notFound(res, "\u0417\u0430\u043F\u0438\u0441\u044C \u0432 \u0447\u0451\u0440\u043D\u043E\u043C \u0441\u043F\u0438\u0441\u043A\u0435 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430");
   entry.lifted_at = (/* @__PURE__ */ new Date()).toISOString();
   const node = nodes.get(req.params.id);
   if (node && node.consent_status === "verified") {
     node.status = "healthy";
     node.routable = true;
     node.effective_weight = node.weight;
+    await persistNode(node);
+  }
+  try {
+    await blacklist.set(entry);
+  } catch (err) {
+    logger.warn("unblacklist persist failed", { node_id: req.params.id, error: err.message });
   }
   addAudit("node_unblacklisted", "admin", "node", req.params.id);
   res.json({ status: "unblacklisted", node_id: req.params.id });
 });
-app.delete("/admin/nodes/:id", adminAuth, (req, res) => {
+app.delete("/admin/nodes/:id", adminAuth, async (req, res) => {
   const nodeId = req.params.id;
-  if (!nodes.has(nodeId)) return res.status(404).json({ error: "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
-  nodes.delete(nodeId);
+  const node = nodes.get(nodeId);
+  if (!node) return notFound(res, "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
+  try {
+    await nodes.delete(nodeId);
+  } catch (err) {
+    logger.warn("node delete failed", { node_id: nodeId, error: err.message });
+  }
+  closeAgentForEndpoint(node.endpoint);
+  resetBreaker(nodeId);
   addAudit("node_deleted", "admin", "node", nodeId);
   res.json({ status: "deleted", node_id: nodeId });
 });
-app.post("/admin/nodes/:id/labels", adminAuth, (req, res) => {
+app.post("/admin/nodes/:id/labels", adminAuth, async (req, res) => {
   const node = nodes.get(req.params.id);
-  if (!node) return res.status(404).json({ error: "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+  if (!node) return notFound(res, "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
   const { labels } = req.body;
   if (!Array.isArray(labels)) {
     return res.status(400).json({ error: "labels \u0434\u043E\u043B\u0436\u0435\u043D \u0431\u044B\u0442\u044C \u043C\u0430\u0441\u0441\u0438\u0432\u043E\u043C \u0441\u0442\u0440\u043E\u043A" });
   }
   node.labels = labels.map((l) => String(l).trim()).filter(Boolean);
   node.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+  await persistNode(node);
   addAudit("node_labels_updated", "admin", "node", req.params.id, { labels: node.labels });
   res.json({ success: true, node_id: node.node_id, labels: node.labels });
 });
@@ -1264,16 +2341,17 @@ app.get("/admin/nodes/:id/logs", adminAuth, (req, res) => {
     logs
   });
 });
-app.get("/admin/consents", adminAuth, (req, res) => {
-  res.json({ consents: Array.from(consents.values()) });
+app.get("/admin/consents", adminAuth, async (req, res) => {
+  const list = await consents.list();
+  res.json({ consents: list });
 });
-app.get("/admin/consents/:id", adminAuth, (req, res) => {
-  const consent = consents.get(req.params.id);
-  if (!consent) return res.status(404).json({ error: "\u0421\u043E\u0433\u043B\u0430\u0441\u0438\u0435 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u043E" });
+app.get("/admin/consents/:id", adminAuth, async (req, res) => {
+  const consent = consents.get(req.params.id) || await consents.list().then((l) => l.find((c) => c.consent_id === req.params.id));
+  if (!consent) return notFound(res, "\u0421\u043E\u0433\u043B\u0430\u0441\u0438\u0435 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u043E");
   res.json(consent);
 });
-app.get("/admin/blacklist", adminAuth, (req, res) => {
-  const all = Array.from(blacklist.values());
+app.get("/admin/blacklist", adminAuth, async (req, res) => {
+  const all = await blacklist.list();
   const activeTotal = all.filter((b) => !b.lifted_at).length;
   res.json({ active_total: activeTotal, blacklist: all });
 });
@@ -1659,27 +2737,38 @@ app.get("/admin/discovery/sources", adminAuth, (req, res) => {
   ];
   res.json({ sources });
 });
-app.post("/admin/demo/clear", adminAuth, (req, res) => {
+app.post("/admin/demo/clear", adminAuth, async (req, res) => {
   const nCnt = nodes.size;
   const cCnt = candidates.size;
   const bCnt = blacklist.size;
   const csCnt = consents.size;
-  nodes.clear();
-  candidates.clear();
-  blacklist.clear();
-  consents.clear();
+  const kCnt = apiKeys.size;
+  try {
+    await tx(async (client2) => {
+      await nodes.clear();
+      await candidates.clear();
+      await blacklist.clear();
+      await consents.clear();
+      await apiKeys.clear();
+      await clearAudit();
+    });
+    auditLogs.length = 0;
+    rebuildKeyHashIndex();
+  } catch (err) {
+    logger.warn("demo/clear: \u043E\u0447\u0438\u0441\u0442\u043A\u0430 PG \u043D\u0435 \u0443\u0434\u0430\u043B\u0430\u0441\u044C \u043F\u043E\u043B\u043D\u043E\u0441\u0442\u044C\u044E", { error: err.message });
+  }
   addAudit("data_cleared", "admin", "gateway", GATEWAY_ID, {
     cleared_nodes: nCnt,
     cleared_candidates: cCnt
   });
   res.json({
     status: "cleared",
-    message: "\u0412\u0441\u0435 \u0434\u0430\u043D\u043D\u044B\u0435 (\u0443\u0437\u043B\u044B, \u043A\u0430\u043D\u0434\u0438\u0434\u0430\u0442\u044B, \u0441\u043E\u0433\u043B\u0430\u0441\u0438\u044F, \u0447\u0451\u0440\u043D\u044B\u0439 \u0441\u043F\u0438\u0441\u043E\u043A) \u0443\u0441\u043F\u0435\u0448\u043D\u043E \u043E\u0447\u0438\u0449\u0435\u043D\u044B.",
-    cleared: { nodes: nCnt, candidates: cCnt, blacklist: bCnt, consents: csCnt }
+    message: "\u0412\u0441\u0435 \u0434\u0430\u043D\u043D\u044B\u0435 (\u0443\u0437\u043B\u044B, \u043A\u0430\u043D\u0434\u0438\u0434\u0430\u0442\u044B, \u0441\u043E\u0433\u043B\u0430\u0441\u0438\u044F, \u0447\u0451\u0440\u043D\u044B\u0439 \u0441\u043F\u0438\u0441\u043E\u043A, \u043A\u043B\u044E\u0447\u0438, \u0430\u0443\u0434\u0438\u0442) \u0443\u0441\u043F\u0435\u0448\u043D\u043E \u043E\u0447\u0438\u0449\u0435\u043D\u044B.",
+    cleared: { nodes: nCnt, candidates: cCnt, blacklist: bCnt, consents: csCnt, api_keys: kCnt }
   });
 });
-app.get("/admin/candidates", adminAuth, (req, res) => {
-  const list = Array.from(candidates.values());
+app.get("/admin/candidates", adminAuth, async (req, res) => {
+  const list = await candidates.list();
   res.json({
     total: list.length,
     candidates: list,
@@ -1688,9 +2777,9 @@ app.get("/admin/candidates", adminAuth, (req, res) => {
     note: "\u041C\u0430\u0440\u0448\u0440\u0443\u0442\u0438\u0437\u0430\u0446\u0438\u044F \u043A\u0430\u043D\u0434\u0438\u0434\u0430\u0442\u043E\u0432 \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044F \u043A\u0430\u043A \u0432 \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u043E\u043C, \u0442\u0430\u043A \u0438 \u0432 \u0440\u0443\u0447\u043D\u043E\u043C \u0440\u0435\u0436\u0438\u043C\u0430\u0445 \u0432\u0435\u0440\u0438\u0444\u0438\u043A\u0430\u0446\u0438\u0438 (\u0441\u043E\u0433\u043B\u0430\u0441\u043E\u0432\u0430\u043D\u043E \u0441 \u0432\u043B\u0430\u0434\u0435\u043B\u044C\u0446\u0430\u043C\u0438 \u0434\u043E\u043C\u0435\u043D\u043E\u0432)"
   });
 });
-app.delete("/admin/candidates", adminAuth, (req, res) => {
+app.delete("/admin/candidates", adminAuth, async (req, res) => {
   const count = candidates.size;
-  candidates.clear();
+  await candidates.clear().catch((err) => logger.warn("candidates clear failed", { error: err.message }));
   addAudit("candidates_cleared", "admin", "discovery", "all", { count });
   res.json({ status: "cleared", count });
 });
@@ -1787,6 +2876,9 @@ app.post("/admin/discovery/run", adminAuth, async (req, res) => {
         }
       }
       existingCandidate.observed_at = (/* @__PURE__ */ new Date()).toISOString();
+      candidates.set(existingCandidate).catch(
+        (err) => logger.warn("candidate persist failed", { error: err.message })
+      );
     } else {
       const id = `cnd_${import_crypto.default.randomBytes(4).toString("hex")}`;
       let riskScore = 15;
@@ -1815,7 +2907,7 @@ app.post("/admin/discovery/run", adminAuth, async (req, res) => {
         status: "candidate",
         observed_at: (/* @__PURE__ */ new Date()).toISOString()
       };
-      candidates.set(id, candidate);
+      candidates.set(candidate).catch((err) => logger.warn("candidate persist failed", { error: err.message }));
       created++;
     }
   }
@@ -1901,7 +2993,7 @@ async function verifyAndEnrollCandidate(cand, options = {}) {
     country: cand.country || "US",
     ip: cand.ip
   };
-  nodes.set(nodeId, newNode);
+  await nodes.set(newNode);
   nodeLatencySamples.set(nodeId, generateDefaultSamplesForNode(newNode));
   const newConsent = {
     consent_id: consentId,
@@ -1931,13 +3023,14 @@ async function verifyAndEnrollCandidate(cand, options = {}) {
       }
     ]
   };
-  consents.set(consentId, newConsent);
+  await consents.set(newConsent);
   cand.status = "enrolled";
   cand.verified = true;
   cand.verification_mode = mode;
   cand.verified_at = now;
   cand.node_id = nodeId;
   cand.challenge_token = challengeInfo.challenge_token;
+  await candidates.set(cand);
   addAudit(
     mode === "auto" ? "candidate_auto_verified" : "candidate_manual_verified",
     "admin",
@@ -2033,15 +3126,16 @@ app.post("/admin/config/toggle-auto-verify", adminAuth, (req, res) => {
     auto_route_candidates: currentConfig.discovery.auto_route_candidates
   });
 });
-app.delete("/admin/candidates/:id", adminAuth, (req, res) => {
+app.delete("/admin/candidates/:id", adminAuth, async (req, res) => {
   if (!candidates.has(req.params.id)) return res.status(404).json({ error: "\u041A\u0430\u043D\u0434\u0438\u0434\u0430\u0442 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
-  candidates.delete(req.params.id);
+  await candidates.delete(req.params.id);
   res.json({ status: "deleted", candidate_id: req.params.id });
 });
-app.get("/admin/keys", adminAuth, (req, res) => {
-  res.json({ keys: Array.from(apiKeys.values()) });
+app.get("/admin/keys", adminAuth, async (req, res) => {
+  const keys = await apiKeys.list();
+  res.json({ keys });
 });
-app.post("/admin/keys", adminAuth, (req, res) => {
+app.post("/admin/keys", adminAuth, async (req, res) => {
   const { label, scopes, rate_limit_per_minute, ttl_seconds } = req.body;
   const keyId = `key_${import_crypto.default.randomBytes(5).toString("hex")}`;
   const rawKey = `foa_live_${import_crypto.default.randomBytes(16).toString("hex")}`;
@@ -2056,9 +3150,11 @@ app.post("/admin/keys", adminAuth, (req, res) => {
     revoked: false,
     last_used_at: null,
     rate_limit_per_minute: rate_limit_per_minute || 60,
-    raw_key: rawKey
+    raw_key: rawKey,
+    key_hash: hashApiKey(rawKey)
   };
-  apiKeys.set(keyId, newKey);
+  await apiKeys.set(newKey);
+  rebuildKeyHashIndex();
   addAudit("api_key_created", "admin", "api_key", keyId, { label: newKey.label });
   res.json({
     key_id: keyId,
@@ -2067,36 +3163,35 @@ app.post("/admin/keys", adminAuth, (req, res) => {
     scopes: newKey.scopes
   });
 });
-app.post("/admin/keys/:id/revoke", adminAuth, (req, res) => {
-  const key = apiKeys.get(req.params.id);
+app.post("/admin/keys/:id/revoke", adminAuth, async (req, res) => {
+  const key = apiKeys.get(req.params.id) || await apiKeys.findByField("key_id", req.params.id);
   if (!key) return res.status(404).json({ error: "\u041A\u043B\u044E\u0447 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
   key.revoked = true;
+  await apiKeys.set(key);
+  rebuildKeyHashIndex();
   addAudit("api_key_revoked", "admin", "api_key", key.key_id);
   res.json({ status: "revoked", key_id: key.key_id });
 });
-app.post("/admin/keys/:id/rotate", adminAuth, (req, res) => {
-  const oldKey = apiKeys.get(req.params.id);
+app.post("/admin/keys/:id/rotate", adminAuth, async (req, res) => {
+  const oldKey = apiKeys.get(req.params.id) || await apiKeys.findByField("key_id", req.params.id);
   if (!oldKey) return res.status(404).json({ error: "\u041A\u043B\u044E\u0447 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
   const rawKey = `foa_live_${import_crypto.default.randomBytes(16).toString("hex")}`;
   oldKey.raw_key = rawKey;
   oldKey.prefix = rawKey.slice(0, 12);
+  oldKey.key_hash = hashApiKey(rawKey);
   oldKey.revoked = false;
   oldKey.last_used_at = null;
+  await apiKeys.set(oldKey);
+  rebuildKeyHashIndex();
   addAudit("api_key_rotated", "admin", "api_key", oldKey.key_id);
   res.json({ status: "rotated", key_id: oldKey.key_id, api_key: rawKey });
 });
-app.get("/admin/audit", adminAuth, (req, res) => {
-  let list = auditLogs;
+app.get("/admin/audit", adminAuth, async (req, res) => {
   const eventFilter = req.query.event;
   const subjectFilter = req.query.subject_id;
   const limit = parseInt(req.query.limit) || 100;
-  if (eventFilter) {
-    list = list.filter((e) => e.event.includes(eventFilter));
-  }
-  if (subjectFilter) {
-    list = list.filter((e) => e.subject_id.includes(subjectFilter));
-  }
-  res.json({ entries: list.slice(0, limit) });
+  const entries = await queryAudit(eventFilter, subjectFilter, limit);
+  res.json({ entries });
 });
 app.get("/admin/config", adminAuth, (req, res) => {
   res.json(currentConfig);
@@ -2108,11 +3203,14 @@ app.post("/admin/config/reload", adminAuth, (req, res) => {
     reloaded: ["security", "limits", "health", "circuit_breaker", "discovery"]
   });
 });
+app.use("/api", requestIdMiddleware, clientHashMiddleware);
+app.use("/v1", requestIdMiddleware, clientHashMiddleware);
 app.use((req, res, next) => {
   if (req.path.startsWith("/api/") || req.path.startsWith("/v1/")) {
     if (req.method === "POST") {
       recordRequestForRpm(1);
     }
+    res.on("finish", () => recordRequest(res.statusCode));
   }
   next();
 });
@@ -2463,10 +3561,75 @@ app.post("/v1/chat/completions", userAuth, requireScopes("ollama:generate"), app
 app.use("/admin/*", (req, res) => {
   res.status(501).json({ error: "Not yet migrated in FOA Node.js gateway" });
 });
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`FOA Gateway running on http://0.0.0.0:${PORT}`);
-  console.log(`CORS allowed origins: ${allowedCorsOrigins.join(", ") || "*"}`);
-});
+async function startBackgroundLoops() {
+  try {
+    const acquired = await tryAcquireLeader(GATEWAY_ID);
+    if (!acquired) {
+      logger.info("\u041D\u0435 \u043B\u0438\u0434\u0435\u0440 \u2014 \u0444\u043E\u043D\u043E\u0432\u044B\u0435 \u0446\u0438\u043A\u043B\u044B \u043D\u0435 \u0437\u0430\u043F\u0443\u0441\u043A\u0430\u044E\u0442\u0441\u044F", { gateway_id: GATEWAY_ID });
+      return;
+    }
+    logger.info("\u041B\u0438\u0434\u0435\u0440 \u0432\u044B\u0431\u0440\u0430\u043D \u2014 \u0437\u0430\u043F\u0443\u0441\u043A\u0430\u044E \u0444\u043E\u043D\u043E\u0432\u044B\u0435 \u0446\u0438\u043A\u043B\u044B", { gateway_id: GATEWAY_ID });
+  } catch (err) {
+    logger.warn("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u044C \u043B\u0438\u0434\u0435\u0440\u0441\u0442\u0432\u043E \u2014 \u0446\u0438\u043A\u043B\u044B \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0430\u0442\u0441\u044F \u043A\u0430\u043A \u0443 \u0435\u0434\u0438\u043D\u0441\u0442\u0432\u0435\u043D\u043D\u043E\u0439 \u0440\u0435\u043F\u043B\u0438\u043A\u0438", {
+      error: err.message
+    });
+  }
+  setInterval(async () => {
+    if (!await amILeader(GATEWAY_ID)) return;
+    const checks = Array.from(nodes.values()).map(async (node) => {
+      try {
+        const start = Date.now();
+        const res = await fetch(`${node.endpoint}/api/tags`, {
+          signal: AbortSignal.timeout(3500),
+          dispatcher: dispatcherFor(node.endpoint, node.max_concurrency || 4)
+        });
+        const latency = Date.now() - start;
+        if (res.ok) {
+          recordSuccess(node.node_id, latency, breakerConfig());
+        } else {
+          recordFailure(node.node_id, breakerConfig());
+        }
+      } catch {
+        recordFailure(node.node_id, breakerConfig());
+      }
+    });
+    await Promise.allSettled(checks);
+  }, 15e3).unref();
+  setInterval(async () => {
+    if (!await amILeader(GATEWAY_ID)) return;
+    const now = Date.now();
+    for (const cand of candidates.values()) {
+      const observedAt = cand.observed_at ? Date.parse(cand.observed_at) : NaN;
+      if (!Number.isNaN(observedAt) && now - observedAt > 90 * 864e5) {
+        await candidates.delete(cand.candidate_id).catch(() => {
+        });
+      }
+    }
+  }, 36e5).unref();
+}
+function breakerConfig() {
+  return currentConfig.circuit_breaker || {
+    window_seconds: 60,
+    minimum_requests: 10,
+    error_rate_threshold: 0.5,
+    open_duration_seconds: 30,
+    half_open_probes: 1
+  };
+}
+async function main() {
+  try {
+    await bootstrap();
+    await startBackgroundLoops();
+  } catch (err) {
+    logger.error("Bootstrap \u043D\u0435 \u0443\u0434\u0430\u043B\u0441\u044F \u2014 \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0430\u0435\u043C \u043D\u0430 in-memory \u0445\u0440\u0430\u043D\u0438\u043B\u0438\u0449\u0435", { error: err.message });
+  }
+  app.listen(PORT, "0.0.0.0", () => {
+    logger.info("FOA Gateway \u0441\u043B\u0443\u0448\u0430\u0435\u0442 \u0441\u043E\u0435\u0434\u0438\u043D\u0435\u043D\u0438\u044F", { host: "0.0.0.0", port: PORT });
+    console.log(`FOA Gateway running on http://0.0.0.0:${PORT}`);
+    console.log(`CORS allowed origins: ${allowedCorsOrigins.join(", ") || "*"}`);
+  });
+}
+main();
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   reloadEnv

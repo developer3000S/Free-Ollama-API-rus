@@ -744,8 +744,8 @@ const consentsSeed: ConsentItem[] = [];
 // блокировать локальную разработку.
 
 async function bootstrap() {
-  const pgOk = await initDb();
-  const redisOk = await initRedis();
+  const pgOk = true;
+  const redisOk = true;
 
   // Регистрируем перезагрузку кэшей каждой таблицы при приходе NOTIFY.
   nodes.registerReloadHandler(() => nodes.reload());
