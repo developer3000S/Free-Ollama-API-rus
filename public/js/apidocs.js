@@ -58,115 +58,157 @@ async function renderApiDocs(container) {
     );
     container.appendChild(keyCard);
 
-    const groups = [
-      {
-        title: '🤖 Ollama Compatible User API',
-        desc: 'Контракт (§9.3) для взаимодействия с языковыми моделями через привычные Ollama REST эндпоинты.',
-        endpoints: [
-          { method: 'POST', path: '/api/chat', summary: 'Чат-комплишен с потоковой (SSE) или JSON выдачей', auth: 'Bearer Token', body: { model: 'llama3', messages: [{ role: 'user', content: 'Привет!' }] } },
-          { method: 'POST', path: '/api/generate', summary: 'Генерация текста по промпту', auth: 'Bearer Token', body: { model: 'llama3:8b', prompt: 'Объясни квантовые вычисления в двух предложениях.' } },
-          { method: 'GET', path: '/api/tags', summary: 'Получить список доступных моделей в маршрутизируемом пуле', auth: 'Bearer Token', body: null },
-          { method: 'GET', path: '/api/version', summary: 'Получить версию шлюза', auth: 'Bearer Token', body: null },
-        ]
-      },
-      {
-        title: '⚡ OpenAI Compatible API (/v1/*)',
-        desc: 'Совместимость с экосистемой OpenAI SDK, LangChain, LlamaIndex, Open WebUI и LibreChat.',
-        endpoints: [
-          { method: 'POST', path: '/v1/chat/completions', summary: 'OpenAI Chat Completions эндпоинт', auth: 'Bearer Token', body: { model: 'llama3', messages: [{ role: 'user', content: 'Hello!' }] } },
-          { method: 'GET', path: '/v1/models', summary: 'OpenAI Models list', auth: 'Bearer Token', body: null },
-        ]
-      },
-      {
-        title: '🛡️ Admin Management API',
-        desc: 'Эндпоинты административного контроля, мониторинга узлов, ключей и аудита.',
-        endpoints: [
-          { method: 'GET', path: '/admin/status', summary: 'Статус шлюза, статистика узлов, безопасность и метрики RPM за час', auth: 'Admin Token', body: null },
-          { method: 'GET', path: '/admin/nodes?detailed=true', summary: 'Детальный реестр всех узлов пула с распределением задержек', auth: 'Admin Token', body: null },
-          { method: 'GET', path: '/admin/keys', summary: 'Список всех выданных API-ключей', auth: 'Admin Token', body: null },
-          { method: 'POST', path: '/admin/keys', summary: 'Выпустить новый API-ключ', auth: 'Admin Token', body: { label: 'SDK Client', scopes: ['ollama:generate'], rate_limit_per_minute: 120 } },
-          { method: 'GET', path: '/admin/audit', summary: 'Журнал аудита системы', auth: 'Admin Token', body: null },
-          { method: 'GET', path: '/admin/config', summary: 'Текущая конфигурация шлюза', auth: 'Admin Token', body: null },
-        ]
-      }
-    ];
+    // Список эндпоинтов загружается с сервера (GET /admin/apidocs/spec),
+    // который обходит стек роутов Express. Раньше список был захардкожен
+    // здесь и рассинхронизировался с кодом — новые эндпоинты не попадали
+    // на страницу. Теперь любой добавленный маршрут отображается автоматически.
+    let spec;
+    try {
+      spec = await API.get('/admin/apidocs/spec');
+    } catch (e) {
+      container.appendChild(h('div', {class: 'empty-state'},
+        h('span', {class: 'icon'}, '⚠️'),
+        h('p', null, 'Не удалось загрузить спецификацию API: ' + esc(e.message || 'нет ответа сервера'))
+      ));
+      return;
+    }
+    const routes = Array.isArray(spec?.routes) ? spec.routes : [];
+    if (!routes.length) {
+      container.appendChild(h('div', {class: 'empty-state'},
+        h('span', {class: 'icon'}, '📭'),
+        h('p', null, 'Маршруты не найдены')
+      ));
+      return;
+    }
 
-    groups.forEach((g, gIdx) => {
-      const gCard = h('div', {class: 'card', style: {marginBottom: '16px'}},
-        h('div', {style: {fontSize: '16px', fontWeight: '700', marginBottom: '6px'}}, g.title),
-        h('div', {style: {fontSize: '13px', color: 'var(--text2)', marginBottom: '14px'}}, g.desc)
-      );
+    // Группировка маршрутов по разделам в порядке, заданном сервером.
+    const groupMap = new Map();
+    for (const r of routes) {
+      if (!groupMap.has(r.group)) groupMap.set(r.group, []);
+      groupMap.get(r.group).push(r);
+    }
 
-      g.endpoints.forEach((ep, epIdx) => {
-        const methodColor = ep.method === 'GET' ? 'var(--blue)' : ep.method === 'POST' ? 'var(--green)' : 'var(--red)';
-        const epBox = h('div', {
-          style: {
-            background: 'var(--bg3)',
-            border: '1px solid var(--border)',
-            borderRadius: '8px',
-            marginBottom: '10px',
-            overflow: 'hidden'
-          }
-        });
+    // Поле поиска: фильтрует по методу, пути и описанию — при 60+ эндпоинтах
+    // без него нужный маршрут не найти.
+    const searchWrap = h('div', {class: 'card', style: {marginBottom: '20px', padding: '12px 16px'}},
+      h('div', {style: {display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap'}},
+        h('span', {style: {fontSize: '14px'}}, '🔍'),
+        h('input', {
+          id: 'apidocs-search',
+          class: 'form-control',
+          type: 'search',
+          placeholder: `Поиск по ${routes.length} эндпоинтам (путь, метод, описание)…`,
+          style: {flex: '1', minWidth: '240px', fontSize: '13px'},
+          oninput: () => applyApiDocsFilter(),
+        }),
+        h('span', {
+          id: 'apidocs-count',
+          style: {fontSize: '12px', color: 'var(--text2)', whiteSpace: 'nowrap'}
+        }, `${routes.length} / ${routes.length}`)
+      )
+    );
+    container.appendChild(searchWrap);
 
-        const epHeader = h('div', {
-          style: {
-            padding: '12px 16px',
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center',
-            cursor: 'pointer',
-            background: 'var(--bg4)'
-          },
-          onClick: () => {
-            const bodyDiv = document.getElementById(`doc-body-${gIdx}-${epIdx}`);
-            if (bodyDiv) bodyDiv.style.display = bodyDiv.style.display === 'none' ? 'block' : 'none';
-          }
-        },
-          h('div', {style: {display: 'flex', alignItems: 'center', gap: '12px'}},
-            h('span', {style: {padding: '2px 8px', borderRadius: '4px', background: methodColor, color: '#fff', fontWeight: '700', fontSize: '11px', minWidth: '55px', textAlign: 'center'}}, ep.method),
-            h('span', {class: 'mono', style: {fontWeight: '600', fontSize: '13px'}}, ep.path),
-            h('span', {style: {fontSize: '12px', color: 'var(--text2)'}}, ep.summary)
-          ),
-          h('div', {style: {display: 'flex', alignItems: 'center', gap: '8px'}},
-            h('span', {class: 'badge badge-gray', style: {fontSize: '11px'}}, ep.auth),
-            h('span', {style: {fontSize: '12px', color: 'var(--text3)'}}, '▼')
-          )
+    const groupsContainer = h('div', {id: 'apidocs-groups'});
+    container.appendChild(groupsContainer);
+
+    function applyApiDocsFilter() {
+      const q = ($('#apidocs-search')?.value || '').trim().toLowerCase();
+      const cnt = $('#apidocs-count');
+      let shown = 0;
+      groupsContainer.innerHTML = '';
+
+      groupMap.forEach((eps, gTitle) => {
+        const filtered = q
+          ? eps.filter((ep) =>
+              ep.path.toLowerCase().includes(q) ||
+              ep.method.toLowerCase().includes(q) ||
+              (ep.summary || '').toLowerCase().includes(q))
+          : eps;
+        shown += filtered.length;
+        if (!filtered.length) return;
+
+        const gCard = h('div', {class: 'card', style: {marginBottom: '16px'}},
+          h('div', {style: {fontSize: '16px', fontWeight: '700', marginBottom: '6px'}}, gTitle),
+          h('div', {style: {fontSize: '13px', color: 'var(--text2)', marginBottom: '14px'}}, `${filtered.length} эндпоинтов`)
         );
-        epBox.appendChild(epHeader);
 
-        const epBody = h('div', {
-          id: `doc-body-${gIdx}-${epIdx}`,
-          style: {padding: '16px', display: 'none', borderTop: '1px solid var(--border)'}
+        filtered.forEach((ep) => {
+          const gIdx = gTitle, epIdx = ep.path + ep.method;
+          const methodColor = ep.method === 'GET' ? 'var(--blue)' : ep.method === 'POST' ? 'var(--green)' : ep.method === 'DELETE' ? 'var(--red)' : 'var(--text2)';
+          const epBox = h('div', {
+            style: {
+              background: 'var(--bg3)',
+              border: '1px solid var(--border)',
+              borderRadius: '8px',
+              marginBottom: '10px',
+              overflow: 'hidden'
+            }
+          });
+
+          const epHeader = h('div', {
+            style: {
+              padding: '12px 16px',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              cursor: 'pointer',
+              background: 'var(--bg4)'
+            },
+            onClick: () => {
+              const bodyDiv = document.getElementById(`doc-body-${gIdx}-${epIdx}`);
+              if (bodyDiv) bodyDiv.style.display = bodyDiv.style.display === 'none' ? 'block' : 'none';
+            }
+          },
+            h('div', {style: {display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap'}},
+              h('span', {style: {padding: '2px 8px', borderRadius: '4px', background: methodColor, color: '#fff', fontWeight: '700', fontSize: '11px', minWidth: '55px', textAlign: 'center'}}, ep.method),
+              h('span', {class: 'mono', style: {fontWeight: '600', fontSize: '13px'}}, ep.path),
+              h('span', {style: {fontSize: '12px', color: 'var(--text2)'}}, ep.summary || '')
+            ),
+            h('div', {style: {display: 'flex', alignItems: 'center', gap: '8px'}},
+              h('span', {class: 'badge badge-gray', style: {fontSize: '11px'}}, ep.auth),
+              h('span', {style: {fontSize: '12px', color: 'var(--text3)'}}, '▼')
+            )
+          );
+          epBox.appendChild(epHeader);
+
+          const epBody = h('div', {
+            id: `doc-body-${gIdx}-${epIdx}`,
+            style: {padding: '16px', display: 'none', borderTop: '1px solid var(--border)'}
+          });
+
+          let bodyHtml = `
+            <div style="margin-bottom: 12px; font-size: 13px;"><strong>Описание:</strong> ${esc(ep.summary || '—')}</div>
+            <div style="margin-bottom: 12px; font-size: 13px;"><strong>Аутентификация:</strong> <code>${esc(ep.auth)}</code></div>
+          `;
+
+          if (ep.body) {
+            bodyHtml += `
+              <div style="margin-bottom: 8px; font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-dim);">Пример тела запроса (JSON):</div>
+              <textarea id="doc-req-${gIdx}-${epIdx}" class="form-control mono" style="font-size: 12px; height: 100px; margin-bottom: 10px; resize: vertical;">${esc(JSON.stringify(ep.body, null, 2))}</textarea>
+            `;
+          }
+
+          bodyHtml += `
+            <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 12px;">
+              <button class="btn btn-sm btn-primary" onclick="testApiDocEndpoint('${escAttr(ep.method)}', '${escAttr(ep.path)}', '${gIdx}', '${escAttr(epIdx)}', '${escAttr(ep.auth)}')">🚀 Выполнить запрос (Try It Out)</button>
+            </div>
+            <div style="font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-dim); margin-bottom: 6px;">Ответ сервера:</div>
+            <pre id="doc-res-${gIdx}-${epIdx}" class="mono" style="background: var(--bg); padding: 10px; border-radius: 6px; font-size: 12px; max-height: 220px; overflow-y: auto; color: var(--green);">Нажмите «Выполнить запрос», чтобы увидеть результат...</pre>
+          `;
+
+          epBody.innerHTML = bodyHtml;
+          epBox.appendChild(epBody);
+          gCard.appendChild(epBox);
         });
 
-        let bodyHtml = `
-          <div style="margin-bottom: 12px; font-size: 13px;"><strong>Описание:</strong> ${esc(ep.summary)}</div>
-          <div style="margin-bottom: 12px; font-size: 13px;"><strong>Аутентификация:</strong> <code>${esc(ep.auth)}</code></div>
-        `;
-
-        if (ep.body) {
-          bodyHtml += `
-            <div style="margin-bottom: 8px; font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-dim);">Пример тела запроса (JSON):</div>
-            <textarea id="doc-req-${gIdx}-${epIdx}" class="form-control mono" style="font-size: 12px; height: 100px; margin-bottom: 10px; resize: vertical;">${esc(JSON.stringify(ep.body, null, 2))}</textarea>
-          `;
-        }
-
-        bodyHtml += `
-          <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 12px;">
-            <button class="btn btn-sm btn-primary" onclick="testApiDocEndpoint('${escAttr(ep.method)}', '${escAttr(ep.path)}', ${gIdx}, ${epIdx}, '${escAttr(ep.auth)}')">🚀 Выполнить запрос (Try It Out)</button>
-          </div>
-          <div style="font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-dim); margin-bottom: 6px;">Ответ сервера:</div>
-          <pre id="doc-res-${gIdx}-${epIdx}" class="mono" style="background: var(--bg); padding: 10px; border-radius: 6px; font-size: 12px; max-height: 220px; overflow-y: auto; color: var(--green);">Нажмите «Выполнить запрос», чтобы увидеть результат...</pre>
-        `;
-
-        epBody.innerHTML = bodyHtml;
-        epBox.appendChild(epBody);
-        gCard.appendChild(epBox);
+        groupsContainer.appendChild(gCard);
       });
 
-      container.appendChild(gCard);
-    });
+      if (cnt) cnt.textContent = `${shown} / ${routes.length}`;
+    }
+
+    applyApiDocsFilter();
 
   } catch (e) {
     container.innerHTML = `<div class="empty-state"><span class="icon">⚠️</span><p>${esc(e.message)}</p></div>`;

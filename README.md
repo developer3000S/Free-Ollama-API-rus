@@ -95,6 +95,7 @@ chmod +x docker-run.sh
 
 ```bash
 cp .env.example .env    # заполните FOA_ADMIN_TOKEN, FOA_AUDITOR_TOKEN, POSTGRES_PASSWORD
+npm install
 docker compose build --no-cache
 docker compose up -d
 docker compose logs -f gateway-a

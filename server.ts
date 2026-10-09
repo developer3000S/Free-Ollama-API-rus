@@ -1,6 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import path from 'path';
+import { pathToFileURL } from 'node:url';
 import crypto from 'crypto';
 import fs from 'fs';
 
@@ -3911,6 +3912,204 @@ app.post('/v1/chat/completions', userAuth, requireScopes('ollama:generate'), app
   });
 });
 
+// --- Спецификация API для страницы "API Docs & OpenAPI" -------------------
+//
+// Список маршрутов генерируется из стека роутов Express, а не поддерживается
+// вручную: любой новый эндпоинт автоматически появляется на странице API Docs.
+// Без этого документация (public/js/apidocs.js) рассинхронизировалась бы с
+// кодом — именно так на странице перестали отображаться добавленные эндпоинты.
+
+// Описания и примеры тел запросов для известных маршрутов. Найденные в стеке,
+// но отсутствующие здесь эндпоинты тоже выводятся — с автогенерируемым
+// описанием, чтобы документация не молчала о новых роутах.
+const API_DOC_META: Record<string, { summary?: string; body?: Record<string, unknown> | null; group?: string }> = {
+  '/healthz': { summary: 'Liveness: процесс жив и отвечает на запросы', group: 'Служебные' },
+  '/readyz': { summary: 'Готовность обслуживать трафик; 503, если маршрутизируемых узлов 0', group: 'Служебные' },
+  '/metrics': { summary: 'Выгрузка метрик Prometheus (foa_build_info, foa_nodes_*)', group: 'Служебные' },
+  '/api/version': { summary: 'Версия upstream-контракта Ollama', group: 'Пользовательский API (Ollama-совместимый)' },
+  '/api/endpoints': { summary: 'Публичный список вариантов подключения (HTTPS + запасной HTTP); без авторизации', group: 'Пользовательский API (Ollama-совместимый)' },
+  '/api/tags': { summary: 'Агрегатный список моделей всех маршрутизируемых узлов', group: 'Пользовательский API (Ollama-совместимый)' },
+  '/api/generate': {
+    summary: 'Генерация текста по промпту; stream:true → NDJSON',
+    body: { model: 'llama3:8b', prompt: 'Объясни квантовые вычисления в двух предложениях.', stream: false },
+    group: 'Пользовательский API (Ollama-совместимый)',
+  },
+  '/api/chat': {
+    summary: 'Чат-комплишен; stream:true → NDJSON',
+    body: { model: 'llama3', messages: [{ role: 'user', content: 'Привет!' }], stream: false },
+    group: 'Пользовательский API (Ollama-совместимый)',
+  },
+  '/api/embed': {
+    summary: 'Эмбеддинги текста',
+    body: { model: 'nomic-embed-text', input: 'привет' },
+    group: 'Пользовательский API (Ollama-совместимый)',
+  },
+  '/v1/models': { summary: 'Список моделей в формате OpenAI', group: 'OpenAI-совместимый API (/v1/*)' },
+  '/v1/models/:model': { summary: 'Карточка модели в формате OpenAI', group: 'OpenAI-совместимый API (/v1/*)' },
+  '/v1/chat/completions': {
+    summary: 'OpenAI Chat Completions; stream:true → SSE chat.completion.chunk',
+    body: { model: 'llama3', messages: [{ role: 'user', content: 'Hello!' }], stream: false },
+    group: 'OpenAI-совместимый API (/v1/*)',
+  },
+  '/admin/status': { summary: 'Сводный статус шлюза: узлы, пул, безопасность, RPM', group: 'Административный API' },
+  '/admin/metrics/rpm': { summary: 'История запросов в минуту за последний час', group: 'Административный API' },
+  '/admin/config': { summary: 'Действующая конфигурация шлюза', group: 'Административный API' },
+  '/admin/config/reload': { summary: 'Перечитать .env и зафиксировать событие в аудите', group: 'Административный API' },
+  '/admin/config/toggle-auto-verify': { summary: 'Переключить авто-верификацию кандидатов', group: 'Административный API' },
+  '/admin/audit': { summary: 'Журнал аудита (фильтры event, subject_id, limit)', group: 'Административный API' },
+  '/admin/demo/clear': { summary: 'Очистить узлы, кандидаты, согласия, блэклист (аудит сохраняется)', group: 'Административный API' },
+  '/admin/keys': { summary: 'Список выпущенных API-ключей foa_live_…', group: 'Ключи API' },
+  '/admin/nodes': { summary: 'Реестр узлов пула (detailed=true — с распределением задержек)', group: 'Узлы' },
+  '/admin/nodes/metrics': { summary: 'История CPU/Memory по узлам (источник — Ollama /api/ps)', group: 'Узлы' },
+  '/admin/nodes/latency-distribution': { summary: 'Распределение задержек по всем маршрутизируемым узлам', group: 'Узлы' },
+  '/admin/ollama/endpoints': { summary: 'Машиночитаемая справка по всем маршрутам прокси Ollama', group: 'Узлы' },
+  '/admin/consents': { summary: 'Реестр согласий с историей событий', group: 'Согласия и блэклист' },
+  '/admin/blacklist': { summary: 'Чёрный список узлов', group: 'Согласия и блэклист' },
+  '/admin/discovery/sources': { summary: 'Состояние источников discovery: настроен / нет', group: 'Discovery' },
+  '/admin/discovery/run': { summary: 'Запустить цикл discovery (опрашивает настроенные источники)', group: 'Discovery' },
+  '/admin/candidates': { summary: 'Список кандидатов discovery', group: 'Discovery' },
+  '/admin/candidates/:id/challenge': { summary: 'Challenge для подтверждения владения кандидатом', group: 'Discovery' },
+  '/admin/candidates/:id/enroll': { summary: 'Перевести кандидата в узел (статус pending_consent)', group: 'Discovery' },
+  '/admin/candidates/:id/verify': { summary: 'Подтверждение владения кандидатом', group: 'Discovery' },
+  '/admin/candidates/auto-verify-all': { summary: 'Авто-верификация всех кандидатов', group: 'Discovery' },
+  '/admin/candidates/:id': { summary: 'Удалить одного кандидата', group: 'Discovery' },
+  '/admin/keys/:id/revoke': { summary: 'Отзыв API-ключа', group: 'Ключи API' },
+  '/admin/keys/:id/rotate': { summary: 'Ротация API-ключа (новый foa_live_…)', group: 'Ключи API' },
+  '/admin/consents/:id': { summary: 'Карточка согласия с историей событий', group: 'Согласия и блэклист' },
+  '/admin/nodes/:id': { summary: 'Карточка узла', group: 'Узлы' },
+  '/admin/nodes/:id/challenge': { summary: 'Данные challenge: well-known JSON + DNS TXT', group: 'Узлы' },
+  '/admin/nodes/:id/verify': { summary: 'Подтверждение владения узлом (mode: auto|manual)', group: 'Узлы' },
+  '/admin/nodes/:id/health-check': { summary: 'Проверка доступности узла + обновление кэша моделей', group: 'Узлы' },
+  '/admin/nodes/bulk-verify': { summary: 'Групповая верификация узлов (node_ids, mode)', group: 'Узлы' },
+  '/admin/nodes/bulk-health-check': { summary: 'Массовая перепроверка статусов: {node_ids:[...]} или {all:true}', group: 'Узлы' },
+  '/admin/nodes/:id/chat': { summary: 'Чат с конкретным узлом в обход пользовательских ключей', group: 'Узлы' },
+  '/admin/nodes/:id/models': { summary: 'Список моделей узла (кэш; при пустости — опрос /api/tags)', group: 'Узлы' },
+  '/admin/nodes/:id/revoke': { summary: 'Отзыв согласия → узел исключается из маршрутизации', group: 'Узлы' },
+  '/admin/nodes/:id/blacklist': { summary: 'Блокировка узла', group: 'Узлы' },
+  '/admin/nodes/:id/unblacklist': { summary: 'Снятие блокировки', group: 'Узлы' },
+  '/admin/nodes/:id/labels': { summary: 'Управление метками узла', group: 'Узлы' },
+  '/admin/nodes/:id/logs': { summary: 'Журнал событий узла', group: 'Узлы' },
+  '/admin/nodes/:id/latency-distribution': { summary: 'Распределение задержек по одному узлу', group: 'Узлы' },
+  '/admin/nodes/:id/proxy/*': { summary: 'Универсальный прокси: любой поддерживаемый путь Ollama', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/tags': { summary: 'Прокси Ollama: список моделей узла', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/ps': { summary: 'Прокси Ollama: загруженные в память модели', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/version': { summary: 'Прокси Ollama: версия узла', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/show': { summary: 'Прокси Ollama: детали модели (?model=…)', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/show/:model': { summary: 'Прокси Ollama: детали модели (путь)', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/usage': { summary: 'Прокси Ollama: использование', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/balance': { summary: 'Прокси Ollama: баланс', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/generate': { summary: 'Прокси Ollama: генерация по промпту', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/chat': { summary: 'Прокси Ollama: чат', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/embed': { summary: 'Прокси Ollama: эмбеддинги', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/create': { summary: 'Прокси Ollama: создание модели из Modelfile', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/copy': { summary: 'Прокси Ollama: копирование модели', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/pull': { summary: 'Прокси Ollama: загрузка модели (долгий запрос)', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/push': { summary: 'Прокси Ollama: публикация модели (долгий запрос)', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/api/delete': { summary: 'Прокси Ollama: удаление модели', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/v1/models/:model': { summary: 'Прокси Ollama: карточка модели (формат OpenAI)', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/v1/systemone': { summary: 'Прокси Ollama: /v1/systemone', group: 'Прокси Ollama API узла' },
+  '/admin/nodes/:id/v1/responses': { summary: 'Прокси Ollama: /v1/responses', group: 'Прокси Ollama API узла' },
+};
+
+// Маршруты, не несущие смысловой нагрузки в документации (раздача статики,
+// панели и catch-all). Их не показываем.
+const API_DOC_HIDDEN = new Set(['/', '/panel', '/panel/*', '/admin/apidocs/spec']);
+
+// Тип авторизации определяется по пути: /admin/* — админ-токен, /api/* и /v1/*
+// (кроме публичных) — пользовательский ключ, остальное — без авторизации.
+function authTypeForPath(path: string): string {
+  if (path.startsWith('/admin/')) return 'Admin Token';
+  const isPublic = path === '/api/endpoints' || path.startsWith('/healthz') || path.startsWith('/readyz') || path.startsWith('/metrics');
+  if (!isPublic && (path.startsWith('/api/') || path.startsWith('/v1/'))) return 'Bearer Token';
+  return 'Без авторизации';
+}
+
+function apiDocGroupFor(path: string, metaGroup?: string): string {
+  if (metaGroup) return metaGroup;
+  // Per-node прокси нативного Ollama API: /admin/nodes/:id/api/*,
+  // /admin/nodes/:id/v1/*, /admin/nodes/:id/proxy/* — отдельный раздел,
+  // иначе 75 однотипных маршрутов захламляют раздел «Узлы».
+  if (/^\/admin\/nodes\/[^/]+\/(api|v1|proxy)\//.test(path)) return 'Прокси Ollama API узла';
+  if (path.startsWith('/v1/')) return 'OpenAI-совместимый API (/v1/*)';
+  if (path.startsWith('/api/')) return 'Пользовательский API (Ollama-совместимый)';
+  if (path.startsWith('/admin/nodes')) return 'Узлы';
+  if (path.startsWith('/admin/consents')) return 'Согласия и блэклист';
+  if (path.startsWith('/admin/blacklist')) return 'Согласия и блэклист';
+  if (path.startsWith('/admin/candidates') || path.startsWith('/admin/discovery')) return 'Discovery';
+  if (path.startsWith('/admin/keys')) return 'Ключи API';
+  if (path.startsWith('/admin/')) return 'Административный API';
+  return 'Служебные';
+}
+
+// Обходит стек роутов Express и собирает плоский список маршрутов.
+// Слои middleware (без route) пропускаются; у каждого route берутся все
+// разрешённые методы из route.methods.
+function collectApiDocRoutes(): Array<{ method: string; path: string; auth: string; summary: string; group: string; body: Record<string, unknown> | null }> {
+  const stack = (app as any)._router?.stack;
+  if (!Array.isArray(stack)) return [];
+
+  // app.all(...) (универсальный прокси /proxy/*) регистрирует все ~30 методов
+  // Node, включая ACL, BIND, CHECKOUT, LOCK, PURGE… Для документации нужны
+  // только стандартные HTTP-методы, остальное — шум.
+  const STD_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']);
+
+  const found: Array<{ method: string; path: string }> = [];
+  for (const layer of stack) {
+    const route = layer.route;
+    if (!route || typeof route.path !== 'string') continue;
+    if (API_DOC_HIDDEN.has(route.path)) continue;
+    const methods = Object.keys(route.methods || {}).filter((m) => route.methods[m]);
+    for (const method of methods) {
+      const m = method.toUpperCase();
+      if (!STD_METHODS.has(m)) continue;
+      found.push({ method: m, path: route.path });
+    }
+  }
+
+  // Сортировка по группам и путям — стабильный порядок в документации.
+  const groupOrder = [
+    'Служебные',
+    'Пользовательский API (Ollama-совместимый)',
+    'OpenAI-совместимый API (/v1/*)',
+    'Административный API',
+    'Узлы',
+    'Прокси Ollama API узла',
+    'Согласия и блэклист',
+    'Ключи API',
+    'Discovery',
+  ];
+
+  return found
+    .map(({ method, path }) => {
+      const meta = API_DOC_META[path] || {};
+      return {
+        method,
+        path,
+        auth: authTypeForPath(path),
+        summary: meta.summary || '',
+        group: apiDocGroupFor(path, meta.group),
+        body: meta.body !== undefined ? meta.body : null,
+      };
+    })
+    .sort((a, b) => {
+      const gi = groupOrder.indexOf(a.group) - groupOrder.indexOf(b.group);
+      if (gi !== 0) return gi;
+      if (a.path !== b.path) return a.path < b.path ? -1 : 1;
+      return a.method < b.method ? -1 : 1;
+    });
+}
+
+app.get('/admin/apidocs/spec', adminAuth, (req, res) => {
+  const routes = collectApiDocRoutes();
+  res.json({
+    gateway_id: GATEWAY_ID,
+    version: VERSION,
+    generated_at: new Date().toISOString(),
+    base_url: `${req.protocol}://${req.get('host')}`,
+    routes,
+  });
+});
+
 // Fallback for unhandled API routes
 app.use('/admin/*', (req, res) => {
   res.status(501).json({ error: 'Not yet migrated in FOA Node.js gateway' });
@@ -4022,7 +4221,25 @@ async function main(): Promise<void> {
 // запускать сервер — main() вызывается только при прямом запуске файла.
 export { app as foaApp, bootstrap, startBackgroundLoops };
 
-const isDirectRun = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
+// Импортирующий тест провоцирует запуск сервера только если он сам является
+// главным модулем. Проверка должна работать и в ESM (tsx/dev), и в CJS-бандле
+// esbuild: import.meta.url там заменяется на пустой объект, поэтому ESM-ветка
+// недостижима и определяется через require.main / process.argv[1].
+const isDirectRun = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const entryUrl = typeof import.meta.url === 'string' && import.meta.url.startsWith('file:')
+    ? import.meta.url
+    : undefined;
+  if (entryUrl) return entryUrl === pathToFileURL(entry).href;
+  // CJS-бандл: путь точки входа может быть абсолютным или относительным —
+  // нормализуем и сравниваем с __filename самого бандла.
+  try {
+    return path.resolve(entry) === __filename;
+  } catch {
+    return false;
+  }
+})();
 if (isDirectRun) {
   main();
 }
