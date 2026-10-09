@@ -564,3 +564,19 @@ select.form-control { appearance: auto; }
 .node-chat-input-row { display: flex; gap: 8px; }
 .node-chat-input { flex: 1; }
 .node-chat-send { flex-shrink: 0; }
+
+/* Dropdown-меню перепроверки статусов узлов (Узлы → «🔄 Проверить статусы») */
+.dropdown-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: calc(var(--radius) - 4px);
+  font-size: 13px;
+  cursor: pointer;
+}
+.dropdown-item:hover:not(:disabled) { background: var(--bg3, rgba(255,255,255,.06)); }
+.dropdown-item:disabled { cursor: not-allowed; }

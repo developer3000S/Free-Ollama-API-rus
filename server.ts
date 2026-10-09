@@ -185,6 +185,10 @@ interface NodeItem {
   country?: string;
   ip?: string;
   labels?: string[];
+  // Доверять самоподписанному TLS-сертификату этого узла (per-node флаг из
+  // панели). Без него и без FOA_INSECURE_TLS запросы падают с
+  // DEPTH_ZERO_SELF_SIGNED_CERT.
+  insecure_tls?: boolean;
 }
 
 interface ConsentItem {
@@ -794,6 +798,9 @@ function markKeyUsed(keyId: string): void {
       apiKeys.set(update).catch((err) => logger.warn('last_used_at flush failed', { error: err.message }));
     }
   }, 15_000);
+  // Фоновый flush не должен удерживать процесс живым (важно для тестов,
+  // где после закрытия сервера процесс обязан завершиться сам).
+  keyFlushTimer.unref();
 }
 
 // --- Хелпер персистентности узлов --------------------------------------------
@@ -1320,7 +1327,7 @@ app.get('/admin/nodes/:id/latency-distribution', adminAuth, (req, res) => {
 });
 
 app.post('/admin/nodes', adminAuth, async (req, res) => {
-  const { endpoint, display_name, owner_id, models, max_concurrency, consent_method, weight, country, labels } = req.body;
+  const { endpoint, display_name, owner_id, models, max_concurrency, consent_method, weight, country, labels, insecure_tls } = req.body;
   if (!endpoint) {
     return res.status(400).json({ error: 'Endpoint обязателен' });
   }
@@ -1351,6 +1358,7 @@ app.post('/admin/nodes', adminAuth, async (req, res) => {
     effective_weight: 0,
     country: (country || req.body.country || 'US').toUpperCase(),
     labels: Array.isArray(labels) ? labels : [],
+    insecure_tls: insecure_tls === true,
   };
 
   nodeLatencySamples.set(nodeId, generateDefaultSamplesForNode(newNode));
@@ -1586,27 +1594,76 @@ app.post('/admin/nodes/bulk-verify', adminAuth, async (req, res) => {
   res.json({ status: 'completed', count });
 });
 
-app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
-  const node = nodes.get(req.params.id);
-  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+// Массовая перепроверка статуса узлов (кнопка «🔄 Проверить статусы» в разделе
+// «Узлы»): node_ids — конкретные узлы (выбор чекбоксами), all=true — все
+// зарегистрированные узлы сразу. Проверки выполняются параллельно (с ограничением
+// конкурентности), каждый узел получает свежий health-пробу через runNodeHealthCheck.
+app.post('/admin/nodes/bulk-health-check', adminAuth, async (req, res) => {
+  const { node_ids = [], all = false } = req.body || {};
+  let targets: any[];
+  if (all === true) {
+    targets = Array.from(nodes.values());
+  } else {
+    targets = Array.from(new Set((Array.isArray(node_ids) ? node_ids : []).map(String)))
+      .map(id => nodes.get(id))
+      .filter(Boolean);
+  }
+  if (!targets.length) {
+    return res.json({ status: 'completed', checked: 0, results: [] });
+  }
 
+  const CONCURRENCY = 5;
+  const queue = [...targets];
+  const results: any[] = [];
+  const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
+    while (queue.length) {
+      const node = queue.shift()!;
+      try {
+        const r = await runNodeHealthCheck(node);
+        results.push({ node_id: node.node_id, ...r });
+      } catch (err: any) {
+        results.push({ node_id: node.node_id, status: 'unhealthy', latency_ms: 0, error: String(err?.message || err) });
+      }
+    }
+  });
+  await Promise.all(workers);
+
+  addAudit('nodes_bulk_health_check', 'admin', 'nodes', 'bulk', {
+    count: results.length,
+    all: all === true,
+    healthy: results.filter(r => r.status === 'healthy').length,
+    degraded: results.filter(r => r.status === 'degraded').length,
+    unhealthy: results.filter(r => r.status === 'unhealthy').length,
+  });
+  res.json({ status: 'completed', checked: results.length, results });
+});
+
+// Одиночный health-check переписан на общую функцию runNodeHealthCheck —
+// её же использует bulk-режим выше.
+async function runNodeHealthCheck(node: any): Promise<{ status: string; latency_ms: number; models: string[]; error?: string }> {
+  // Per-node флаг «доверять самоподписанному TLS» уже сохранён на узле.
   const start = Date.now();
   let status: 'healthy' | 'degraded' | 'unhealthy' = 'unhealthy';
   let latency = 0;
   let errorMsg: string | undefined;
 
   try {
-    const probeRes = await fetch(`${node.endpoint}/api/version`, nodeFetchOpts({
-      signal: AbortSignal.timeout(4000),
-    }));
+    // nodeFetch вместо сырого fetch: TLS-fallback для самоподписанных
+    // сертификатов + повтор при ECONNRESET — иначе health-check падал там,
+    // где чат позже работал.
+    const { res: probeRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, '')}/api/version`, {
+      method: 'GET',
+      timeoutMs: 4000,
+    }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
     latency = Date.now() - start;
     if (probeRes.ok) {
       status = latency > 600 ? 'degraded' : 'healthy';
 
       try {
-        const tagsRes = await fetch(`${node.endpoint}/api/tags`, nodeFetchOpts({
-          signal: AbortSignal.timeout(3000),
-        }));
+        const { res: tagsRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, '')}/api/tags`, {
+          method: 'GET',
+          timeoutMs: 3000,
+        }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
         if (tagsRes.ok) {
           const tData = (await tagsRes.json()) as any;
           if (Array.isArray(tData.models) && tData.models.length) {
@@ -1622,7 +1679,7 @@ app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
   } catch (err: any) {
     latency = Date.now() - start;
     status = 'unhealthy';
-    errorMsg = err.message;
+    errorMsg = err?.message === 'fetch failed' ? describeFetchError(err) : String(err?.message || err);
   }
 
   node.latency_ms = latency;
@@ -1642,13 +1699,21 @@ app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
     error: errorMsg,
   });
 
-  res.json({
-    status,
-    latency_ms: latency,
-    node_id: node.node_id,
-    models: node.models,
-    error: errorMsg,
-  });
+  return { status, latency_ms: latency, models: node.models || [], error: errorMsg };
+}
+
+app.post('/admin/nodes/:id/health-check', adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+
+  // Per-node флаг «доверять самоподписанному TLS» из панели.
+  if (typeof req.body?.insecure_tls === 'boolean' && req.body.insecure_tls !== node.insecure_tls) {
+    node.insecure_tls = req.body.insecure_tls;
+    addAudit('node_insecure_tls_updated', 'admin', 'node', node.node_id, { insecure_tls: node.insecure_tls });
+  }
+
+  const r = await runNodeHealthCheck(node);
+  res.json({ ...r, node_id: node.node_id });
 });
 
 // Разбор сетевых ошибок undici/node-fetch («fetch failed») в человеческое
@@ -1725,7 +1790,7 @@ app.post('/admin/nodes/:id/chat', adminAuth, async (req, res) => {
         body: JSON.stringify({ model, messages, stream: false }),
         timeoutMs: 120_000,
       },
-      { maxConcurrency: Math.max(1, node.max_concurrency || 4) }
+      { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true }
     );
 
     if (!upstreamRes.ok) {
@@ -1762,11 +1827,14 @@ app.post('/admin/nodes/:id/chat', adminAuth, async (req, res) => {
   } catch (err: any) {
     addAudit('node_chat_error', 'admin', 'node', node.node_id, { error: err?.message, cause: err?.cause?.code });
     const isTimeout = err?.name === 'TimeoutError' || err?.cause?.name === 'TimeoutError';
-    const friendly = isTimeout
+    const friendlyBase = isTimeout
       ? `Узел не ответил за 120 с по адресу ${node.endpoint}. Модель могла ещё не быть загружена в память (первый запрос к крупной модели качает её минуты). Повторите отправку — второй запрос обычно быстрее.`
       : String(err?.message || '') === 'fetch failed'
-      ? `Чат с узлом недоступен: узел не отвечает по адресу ${node.endpoint} (${describeFetchError(err)})`
+      ? `Чат с узлом недоступен: узел не отвечает по адресу ${node.endpoint} (${describeFetchError(err)}). Повторите отправку — шлюз уже сделал автоматический повтор при разрыве соединения.`
       : `Чат с узлом недоступен: ${err?.message || 'неизвестная ошибка'}`;
+    const tlsHint = /TLS-сертификата|SELF_SIGNED/i.test(friendlyBase)
+      ? ' Совет: включите на карточке узла «Доверять самоподписанному TLS» и повторите проверку здоровья.' : '';
+    const friendly = friendlyBase + tlsHint;
     res.status(502).json({ error: friendly });
   } finally {
     node.active_connections = Math.max(0, node.active_connections - 1);
@@ -1787,7 +1855,7 @@ app.get('/admin/nodes/:id/models', adminAuth, async (req, res) => {
       const { res: tagsRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, '')}/api/tags`, {
         method: 'GET',
         timeoutMs: 15_000,
-      }, { maxConcurrency: Math.max(1, node.max_concurrency || 4) });
+      }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
       if (tagsRes.ok) {
         const tData = (await tagsRes.json()) as any;
         if (Array.isArray(tData.models)) {
@@ -1805,6 +1873,238 @@ app.get('/admin/nodes/:id/models', adminAuth, async (req, res) => {
     }
   }
   res.json({ node_id: node.node_id, models, fetched });
+});
+
+// ─── Проксирование Ollama API выбранного узла ────────────────────────────────
+// Полный набор эндпоинтов Ollama (https://docs.ollama.com/api/introduction):
+//   GET  /api/tags, /api/ps, /api/version, /api/show/:model, /api/usage, /api/balance,
+//        /v1/models, /v1/models/{model}, /v1/systemone
+//   POST /api/generate, /api/chat, /api/embed, /api/create, /api/copy,
+//        /api/pull, /api/push, /api/delete, /v1/chat/completions, /v1/responses
+// Все они доступны админу как прямой прокси на конкретный узел — удобно для
+// диагностики и управления моделями из панели.
+
+const NODE_PROXY_TIMEOUT_MS = 120_000; // pull/push/generate могут идти долго
+const NODE_PROXY_GET_TIMEOUT_MS = 30_000;
+
+type NodeProxyRoute = { method: 'GET' | 'POST'; upstream: string };
+
+const NODE_PROXY_ROUTES: Record<string, NodeProxyRoute> = {
+  // native API
+  '/api/tags':          { method: 'GET',  upstream: '/api/tags' },
+  '/api/ps':            { method: 'GET',  upstream: '/api/ps' },
+  '/api/version':       { method: 'GET',  upstream: '/api/version' },
+  '/api/show':          { method: 'GET',  upstream: '/api/show' },      // ?model= или /show/:model
+  '/api/usage':         { method: 'GET',  upstream: '/api/usage' },
+  '/api/balance':       { method: 'GET',  upstream: '/api/balance' },
+  '/api/generate':      { method: 'POST', upstream: '/api/generate' },
+  '/api/chat':          { method: 'POST', upstream: '/api/chat' },
+  '/api/embed':         { method: 'POST', upstream: '/api/embed' },
+  '/api/create':        { method: 'POST', upstream: '/api/create' },
+  '/api/copy':          { method: 'POST', upstream: '/api/copy' },
+  '/api/pull':          { method: 'POST', upstream: '/api/pull' },
+  '/api/push':          { method: 'POST', upstream: '/api/push' },
+  // В нативном Ollama /api/delete — это POST (docs: DELETE request via POST body)
+  '/api/delete':        { method: 'POST', upstream: '/api/delete' },
+  // OpenAI-совместимый API (https://docs.ollama.com/api/openai-compatibility)
+  '/v1/models':         { method: 'GET',  upstream: '/v1/models' },
+  '/v1/chat/completions': { method: 'POST', upstream: '/v1/chat/completions' },
+  '/v1/responses':      { method: 'POST', upstream: '/v1/responses' },
+  '/v1/systemone':      { method: 'GET',  upstream: '/v1/systemone' },
+};
+
+// Универсальный прокси: /admin/nodes/:id/proxy/<путь Ollama>. Тело запроса
+// передаётся как есть (stream:false → JSON; stream:true пока не поддерживается
+// в этом режиме), заголовки Content-Type сохраняются.
+app.all('/admin/nodes/:id/proxy/*', adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+  if (!node.endpoint || !/^https?:\/\//i.test(node.endpoint)) {
+    return res.status(400).json({ error: `Некорректный endpoint узла: ${node.endpoint || '(пусто)'}` });
+  }
+
+  const subPath = ('/' + String((req.params as any)[0] ?? '').replace(/^\/+/, '')) as string;
+  const httpMethod = req.method.toUpperCase();
+  // Поддержка параметризованных путей: /api/show/:model, /v1/models/:model
+  let routeKey = subPath;
+  let upstreamSuffix = '';
+  const showDyn = /^\/api\/show\/(.+)$/.exec(subPath);
+  if (showDyn) { routeKey = '/api/show'; upstreamSuffix = `?model=${encodeURIComponent(showDyn[1])}`; }
+  const modelsDyn = /^\/v1\/models\/(.+)$/.exec(subPath);
+  if (modelsDyn) { routeKey = '/v1/models'; upstreamSuffix = `/${encodeURIComponent(modelsDyn[1])}`; }
+  // Алиасы публичного API на конкретный узел: /admin/nodes/:id/api/tags и т.п.
+  // тоже приходят сюда через этот wildcard — нативные пути Ollama разрешаем.
+  const dynAlias = /^(\/(?:api|v1)\/[^?]+?)\/([^/]+)$/.exec(subPath);
+  if (!NODE_PROXY_ROUTES[routeKey] && dynAlias) {
+    const aliasBase = NODE_PROXY_ROUTES[dynAlias[1]];
+    if (aliasBase) {
+      routeKey = dynAlias[1];
+      if (routeKey === '/api/show') upstreamSuffix = `?model=${encodeURIComponent(dynAlias[2])}`;
+      else upstreamSuffix = `/${encodeURIComponent(dynAlias[2])}`;
+    }
+  }
+
+  const allowed = NODE_PROXY_ROUTES[routeKey];
+  if (!allowed) {
+    return res.status(400).json({
+      error: `Путь ${subPath} не входит в список поддерживаемых Ollama-эндпоинтов`,
+      supported: Object.keys(NODE_PROXY_ROUTES),
+    });
+  }
+  // POST-эндпоинты Ollama также допускают DELETE для /api/delete из UI
+  const methodOk = allowed.method === 'POST'
+    ? (httpMethod === 'POST' || (routeKey === '/api/delete' && httpMethod === 'DELETE'))
+    : httpMethod === 'GET';
+  if (!methodOk) {
+    return res.status(405).json({ error: `${httpMethod} ${subPath} не поддерживается, используйте ${allowed.method}` });
+  }
+
+  const base = node.endpoint.replace(/\/+$/, '');
+  const upstreamUrl = `${base}${allowed.upstream}${upstreamSuffix}`;
+  const sendBody = allowed.method === 'POST' && httpMethod !== 'GET';
+  const timeoutMs = sendBody ? NODE_PROXY_TIMEOUT_MS : NODE_PROXY_GET_TIMEOUT_MS;
+
+  try {
+    const { res: upstreamRes } = await nodeFetch(upstreamUrl, {
+      method: sendBody ? 'POST' : 'GET',
+      headers: upstreamHeaders(req, { 'Content-Type': 'application/json' }),
+      ...(sendBody && req.body !== undefined ? { body: JSON.stringify(req.body ?? {}) } : {}),
+      timeoutMs,
+    }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
+
+    const ct = upstreamRes.headers.get('content-type') || '';
+    res.status(upstreamRes.status);
+    if (ct.includes('application/json')) {
+      res.json(await upstreamRes.json().catch(() => ({ raw: '' })));
+    } else {
+      res.type(ct || 'text/plain').send(await upstreamRes.text().catch(() => ''));
+    }
+    addAudit('node_api_proxy', 'admin', 'node', node.node_id, { path: subPath, status: upstreamRes.status });
+  } catch (err: any) {
+    addAudit('node_api_proxy_error', 'admin', 'node', node.node_id, { path: subPath, error: err?.message, cause: err?.cause?.code });
+    const isTimeout = err?.name === 'TimeoutError' || err?.cause?.name === 'TimeoutError';
+    res.status(502).json({
+      error: isTimeout
+        ? `Узел не ответил за ${Math.round(timeoutMs / 1000)} с по адресу ${node.endpoint}`
+        : `Прокси-запрос к узлу не выполнен: ${err?.message === 'fetch failed' ? describeFetchError(err) : (err?.message || 'неизвестная ошибка')}`,
+    });
+  }
+});
+
+// Именованные алиасы всех Ollama-эндпоинтов на конкретном узле — удобнее для UI
+// и тестов, чем общий /proxy/*. Формат ответа — нативный JSON узла без изменений.
+const nodeProxyAlias = (path: string, route: NodeProxyRoute) => {
+  const handler = async (req: Request, res: Response) => {
+    const node = nodes.get(req.params.id);
+    if (!node) return res.status(404).json({ error: 'Узел не найден' });
+    if (!node.endpoint || !/^https?:\/\//i.test(node.endpoint)) {
+      return res.status(400).json({ error: `Некорректный endpoint узла: ${node.endpoint || '(пусто)'}` });
+    }
+    const isGet = route.method === 'GET';
+    const timeoutMs = isGet ? NODE_PROXY_GET_TIMEOUT_MS : NODE_PROXY_TIMEOUT_MS;
+    let upstreamPath = route.upstream;
+    // Поддержка параметризованной формы: GET /api/show/:model → /api/show?model=:model
+    if (upstreamPath === '/api/show' && (req.params as any).model) {
+      upstreamPath = `/api/show?model=${encodeURIComponent(String((req.params as any).model))}`;
+    }
+    try {
+      const { res: upstreamRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, '')}${upstreamPath}`, {
+        method: route.method,
+        headers: upstreamHeaders(req, { 'Content-Type': 'application/json' }),
+        ...(!isGet && req.body !== undefined ? { body: JSON.stringify(req.body ?? {}) } : {}),
+        timeoutMs,
+      }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
+      res.status(upstreamRes.status);
+      const data = await upstreamRes.json().catch(async () => ({ raw: await upstreamRes.text().catch(() => '') }));
+      res.json(data);
+    } catch (err: any) {
+      const isTimeout = err?.name === 'TimeoutError' || err?.cause?.name === 'TimeoutError';
+      res.status(502).json({
+        error: isTimeout
+          ? `Узел не ответил за ${Math.round(timeoutMs / 1000)} с (${route.upstream})`
+          : `Запрос ${route.upstream} к узлу не выполнен: ${err?.message === 'fetch failed' ? describeFetchError(err) : (err?.message || 'неизвестная ошибка')}`,
+      });
+    }
+  };
+  if (route.method === 'GET') app.get(`/admin/nodes/:id${path}`, adminAuth, handler);
+  else app.post(`/admin/nodes/:id${path}`, adminAuth, handler);
+};
+
+for (const [p, r] of Object.entries(NODE_PROXY_ROUTES)) {
+  // /v1/models/{model} регистрируется отдельно (параметризованный путь)
+  if (p === '/v1/models') continue;
+  nodeProxyAlias(p, r);
+}
+// Отдельные регистрации для путей с параметром модели. Express матчит
+// сегменты строго, поэтому '/admin/nodes/:id/v1/models' НЕ покрывает
+// '/admin/nodes/:id/v1/models/llama3' — регистрируем явно ДО общего пути.
+app.get('/admin/nodes/:id/v1/models/:model', adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+  if (!node.endpoint || !/^https?:\/\//i.test(node.endpoint)) {
+    return res.status(400).json({ error: `Некорректный endpoint узла: ${node.endpoint || '(пусто)'}` });
+  }
+  try {
+    const { res: upstreamRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, '')}/v1/models/${encodeURIComponent(req.params.model)}`, {
+      method: 'GET',
+      headers: upstreamHeaders(req),
+      timeoutMs: NODE_PROXY_GET_TIMEOUT_MS,
+    }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
+    res.status(upstreamRes.status).json(await upstreamRes.json().catch(() => ({ raw: '' })));
+  } catch (err: any) {
+    res.status(502).json({ error: `Запрос /v1/models к узлу не выполнен: ${err?.message === 'fetch failed' ? describeFetchError(err) : (err?.message || 'неизвестная ошибка')}` });
+  }
+});
+// GET /admin/nodes/:id/api/show/:model — детали модели (нативный show через параметр пути)
+app.get('/admin/nodes/:id/api/show/:model', adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+  if (!node.endpoint || !/^https?:\/\//i.test(node.endpoint)) {
+    return res.status(400).json({ error: `Некорректный endpoint узла: ${node.endpoint || '(пусто)'}` });
+  }
+  try {
+    const { res: upstreamRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, '')}/api/show?model=${encodeURIComponent(req.params.model)}`, {
+      method: 'GET',
+      headers: upstreamHeaders(req),
+      timeoutMs: NODE_PROXY_GET_TIMEOUT_MS,
+    }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
+    res.status(upstreamRes.status).json(await upstreamRes.json().catch(() => ({ raw: '' })));
+  } catch (err: any) {
+    res.status(502).json({ error: `Запрос /api/show к узлу не выполнен: ${err?.message === 'fetch failed' ? describeFetchError(err) : (err?.message || 'неизвестная ошибка')}` });
+  }
+});
+// /api/delete принимает и POST (нативный Ollama), и DELETE для удобства
+app.delete('/admin/nodes/:id/api/delete', adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Узел не найден' });
+  try {
+    const { res: upstreamRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, '')}/api/delete`, {
+      method: 'POST', // Ollama ожидает POST даже для удаления модели
+      headers: upstreamHeaders(req, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(req.body ?? {}),
+      timeoutMs: NODE_PROXY_GET_TIMEOUT_MS,
+    }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
+    res.status(upstreamRes.status).json(await upstreamRes.json().catch(() => ({ status: `HTTP ${upstreamRes.status}` })));
+  } catch (err: any) {
+    res.status(502).json({ error: `Удаление модели на узле не выполнено: ${err?.message === 'fetch failed' ? describeFetchError(err) : (err?.message || 'неизвестная ошибка')}` });
+  }
+});
+
+// GET /admin/ollama/endpoints — справка по поддерживаемым путям для панели/docs
+app.get('/admin/ollama/endpoints', adminAuth, (_req, res) => {
+  res.json({
+    docs: ['https://docs.ollama.com/api/introduction', 'https://docs.ollama.com/api/openai-compatibility'],
+    per_node_base: '/admin/nodes/{node_id}',
+    endpoints: (Object.entries(NODE_PROXY_ROUTES).map(([p, r]) => ({
+      gateway_path: `/admin/nodes/{node_id}${p}`,
+      method: r.method as string,
+      ollama_path: r.upstream,
+    })) as { gateway_path: string; method: string; ollama_path: string }[]).concat([
+      { gateway_path: '/admin/nodes/{node_id}/v1/models/{model}', method: 'GET', ollama_path: '/v1/models/{model}' },
+      { gateway_path: '/admin/nodes/{node_id}/api/show/{model}', method: 'GET', ollama_path: '/api/show?model={model}' },
+      { gateway_path: '/admin/nodes/{node_id}/proxy/*', method: 'GET|POST', ollama_path: '<любой поддерживаемый путь>' },
+    ]),
+  });
 });
 
 app.post('/admin/nodes/:id/revoke', adminAuth, async (req, res) => {
@@ -3211,6 +3511,59 @@ async function proxyToPool(
   return false;
 }
 
+// §7.4/§7.6/§8.1: пользовательский generate-трафик идёт через балансировщик
+// (selectNode + circuit breaker) с ретраем на следующий узел. Ответ узла
+// транслируется клиенту байт-в-байт (stream=true корректно для NDJSON/SSE).
+// Возвращает true, если узел ответил; false — нет здоровых узлов или все
+// попытки сорвались (тогда вызывающая сторона отдаёт fallback-ответ шлюза).
+async function proxyToPoolPassthrough(
+  req: Request,
+  res: Response,
+  path: string,
+  body: Record<string, any>,
+  targetModel: string
+): Promise<boolean> {
+  const maxAttempts = Math.max(1, currentConfig.routing.retry_attempts || 2);
+  const candidates = routableNodesForModel(targetModel);
+  if (!candidates.length) return false;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const node = selectNode(candidates, breakerCfg());
+    if (!node) break;
+
+    const upstream: FetchResponse | null = await callUpstream(req, node, path, body);
+    if (!upstream) continue;
+
+    node.active_connections++;
+    try {
+      res.setHeader('X-FOA-Gateway-Node', node.node_id);
+      res.status(upstream.status);
+      const ct = upstream.headers.get('content-type');
+      if (ct) res.setHeader('Content-Type', ct);
+
+      if (upstream.body) {
+        const reader = (upstream.body as any).getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+      }
+      res.end();
+      return true;
+    } catch {
+      // Поток оборвался в полутрансляции — повтор уже невозможен (клиент
+      // получил часть ответа). Закрытие соединения честно сигнализирует
+      // обрыв вместо бесконечного зависания.
+      try { res.destroy(); } catch { /* noop */ }
+      return true;
+    } finally {
+      node.active_connections = Math.max(0, node.active_connections - 1);
+    }
+  }
+  return false;
+}
+
 // Собирает и отдаёт 503, когда ни один узел не смог ответить.
 function noNodesResponse(res: Response, targetModel: string, isStream: boolean): void {
   const available = getRoutableModels().slice(0, 10);
@@ -3281,7 +3634,7 @@ app.get('/api/tags', userAuth, requireScopes('ollama:read'), applyLimits(), (req
 app.post('/api/generate', userAuth, requireScopes('ollama:generate'), applyLimits({ perModel: true, body: 'prompt' }), async (req, res) => {
   const { model, prompt, stream } = req.body;
   const targetModel = model || 'llama3:8b';
-  let routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
+  const routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
 
   if (!routable.length) {
     const available = getRoutableModels();
@@ -3290,50 +3643,14 @@ app.post('/api/generate', userAuth, requireScopes('ollama:generate'), applyLimit
     });
   }
 
-  // Selected node (least connections)
-  const selectedNode = routable.sort((a, b) => a.active_connections - b.active_connections)[0];
-  selectedNode.active_connections++;
+  // §7.4/§7.6: балансировщик (selectNode + circuit breaker) с ретраем на
+  // следующий узел вместо простого sort по active_connections.
+  if (await proxyToPoolPassthrough(req, res, '/api/generate', req.body, targetModel)) return;
 
-  // Try real upstream proxy to the Ollama node
-  try {
-    const upstreamRes = await fetch(`${selectedNode.endpoint}/api/generate`, nodeFetchOpts({
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body),
-      signal: AbortSignal.timeout(120_000),
-      ...dispatcherFor(selectedNode.endpoint, Math.max(1, selectedNode.max_concurrency || 4)),
-    }));
-
-    if (upstreamRes.ok) {
-      res.status(upstreamRes.status);
-      const ct = upstreamRes.headers.get('content-type');
-      if (ct) res.setHeader('Content-Type', ct);
-
-      if (stream === false) {
-        selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
-        const data = await upstreamRes.json();
-        return res.json(data);
-      }
-
-      if (upstreamRes.body) {
-        const reader = (upstreamRes.body as any).getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(value);
-        }
-        selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
-        return res.end();
-      }
-    }
-  } catch (err) {
-    // upstream not reachable or timed out, fallback to gateway response
-  }
-
+  const selectedNode = routable[0];
   const responseText = `[Ответ шлюза FOA через узел ${selectedNode.display_name}]: Запрос к модели ${targetModel} успешно обработан. Ваш запрос: "${(prompt || '').slice(0, 100)}..."`;
 
   if (stream === false) {
-    selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
     return res.json({
       model: targetModel,
       created_at: new Date().toISOString(),
@@ -3366,7 +3683,6 @@ app.post('/api/generate', userAuth, requireScopes('ollama:generate'), applyLimit
       idx++;
     } else {
       clearInterval(interval);
-      selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
       const finalChunk = {
         model: targetModel,
         created_at: new Date().toISOString(),
@@ -3384,7 +3700,7 @@ app.post('/api/generate', userAuth, requireScopes('ollama:generate'), applyLimit
 app.post('/api/chat', userAuth, requireScopes('ollama:generate'), applyLimits({ perModel: true, body: 'chat' }), async (req, res) => {
   const { model, messages, stream } = req.body;
   const targetModel = model || 'llama3:8b';
-  let routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
+  const routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
 
   if (!routable.length) {
     const available = getRoutableModels();
@@ -3393,50 +3709,15 @@ app.post('/api/chat', userAuth, requireScopes('ollama:generate'), applyLimits({ 
     });
   }
 
-  const selectedNode = routable.sort((a, b) => a.active_connections - b.active_connections)[0];
-  selectedNode.active_connections++;
+  // §7.4/§7.6: балансировщик + breaker + retry на следующий узел. Ответ
+  // узла (включая 4xx вроде «model not found») транслируется как есть.
+  if (await proxyToPoolPassthrough(req, res, '/api/chat', req.body, targetModel)) return;
 
-  // Try real upstream proxy to the Ollama node
-  try {
-    const upstreamRes = await fetch(`${selectedNode.endpoint}/api/chat`, nodeFetchOpts({
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body),
-      signal: AbortSignal.timeout(120_000),
-      ...dispatcherFor(selectedNode.endpoint, Math.max(1, selectedNode.max_concurrency || 4)),
-    }));
-
-    if (upstreamRes.ok) {
-      res.status(upstreamRes.status);
-      const ct = upstreamRes.headers.get('content-type');
-      if (ct) res.setHeader('Content-Type', ct);
-
-      if (stream === false) {
-        selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
-        const data = await upstreamRes.json();
-        return res.json(data);
-      }
-
-      if (upstreamRes.body) {
-        const reader = (upstreamRes.body as any).getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(value);
-        }
-        selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
-        return res.end();
-      }
-    }
-  } catch (err) {
-    // upstream not reachable or timed out, fallback to gateway response
-  }
-
+  const selectedNode = routable[0];
   const lastMsg = Array.isArray(messages) && messages.length ? messages[messages.length - 1].content : 'Привет';
   const replyContent = `[FOA Gateway / ${selectedNode.display_name}]: Ответ на ваше сообщение ("${lastMsg}") через авторизованный узел ${selectedNode.endpoint}.`;
 
   if (stream === false) {
-    selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
     return res.json({
       model: targetModel,
       created_at: new Date().toISOString(),
@@ -3466,7 +3747,6 @@ app.post('/api/chat', userAuth, requireScopes('ollama:generate'), applyLimits({ 
       idx++;
     } else {
       clearInterval(interval);
-      selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
       res.write(
         JSON.stringify({
           model: targetModel,
@@ -3494,6 +3774,25 @@ app.post('/api/embed', userAuth, requireScopes('ollama:embed', 'ollama:generate'
 });
 
 // --- OpenAI Compatible API (/v1/*) ---
+// ЯВНЫЙ ПОРЯДОК РЕГИСТРАЦИИ МАРШРУТОВ /v1/models (см. требование):
+//   1) GET /v1/models/:model — детальная информация о модели;
+//   2) GET /v1/models — общий список моделей пула.
+// Оба публичных маршрута защищены пользовательским API-ключом (userAuth,
+// заголовок Authorization: Bearer foa_live_...). Ключ админ-панели сюда НЕ
+// подходит — именно поэтому раньше «проверка» из панели получала 401
+// «Недействительный API-ключ»: запрос шёл на /v1/models вместо админского
+// прокси /admin/nodes/:id/v1/models (adminAuth). Для проверки узла из
+// панели используйте админские алиасы — они зарегистрированы выше и в
+// этот блок намеренно НЕ входят.
+// Подбор живого маршрутизируемого узла, на котором есть данная модель
+// (используется GET /v1/models/:model). При пустом пуле — undefined.
+function pickNodeForModel(model: string): NodeItem | undefined {
+  const candidates = Array.from(nodes.values())
+    .filter((n) => n.routable && isModelSupportedByNode(n, model))
+    .sort((a, b) => (b.effective_weight || 0) - (a.effective_weight || 0));
+  return candidates[0];
+}
+
 app.get('/v1/models', userAuth, requireScopes('ollama:read'), applyLimits(), (req, res) => {
   const modelNames = getRoutableModels();
   res.json({
@@ -3510,10 +3809,31 @@ app.get('/v1/models', userAuth, requireScopes('ollama:read'), applyLimits(), (re
   });
 });
 
-app.post('/v1/chat/completions', userAuth, requireScopes('ollama:generate'), applyLimits({ perModel: true, body: 'openai' }), (req, res) => {
-  const { model, messages, stream } = req.body;
+app.get('/v1/models/:model', userAuth, requireScopes('ollama:read'), applyLimits(), async (req, res) => {
+  // Проксируем запрос к ближайшему живому узлу, у которого есть модель;
+  // если таких нет — отвечаем 404 в формате OpenAI.
+  const target = pickNodeForModel(req.params.model);
+  if (!target) return sendApiError(req, res, 404, `Модель '${req.params.model}' не найдена ни на одном доступном узле`);
+  try {
+    const { res: upstreamRes } = await nodeFetch(`${target.endpoint.replace(/\/+$/, '')}/v1/models/${encodeURIComponent(req.params.model)}`, {
+      method: 'GET',
+      headers: upstreamHeaders(req),
+      timeoutMs: NODE_PROXY_GET_TIMEOUT_MS,
+    }, { maxConcurrency: Math.max(1, target.max_concurrency || 4), forceInsecureTls: target.insecure_tls === true });
+    res.status(upstreamRes.status).json(await upstreamRes.json().catch(() => ({ raw: '' })));
+  } catch (err: any) {
+    res.status(502).json({ error: `Запрос /v1/models к узлу не выполнен: ${err?.message === 'fetch failed' ? describeFetchError(err) : (err?.message || 'неизвестная ошибка')}` });
+  }
+});
+
+// Алиасы Ollama-эндпоинтов для панели/отладки регистрируются в блоке
+// /admin/nodes/:id/* выше (см. nodeProxyAlias); из этого публичного блока
+// они исключены, чтобы не нарушать явный порядок маршрутов /v1/models*.
+
+app.post('/v1/chat/completions', userAuth, requireScopes('ollama:generate'), applyLimits({ perModel: true, body: 'openai' }), async (req, res) => {
+  const { model, messages } = req.body;
   const targetModel = model || 'llama3:8b';
-  let routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
+  const routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
 
   if (!routable.length) {
     const available = getRoutableModels();
@@ -3525,11 +3845,17 @@ app.post('/v1/chat/completions', userAuth, requireScopes('ollama:generate'), app
     });
   }
 
+  // §7.4/§7.6: запрос проксируется на выбранный балансировщиком узел через
+  // OpenAI-совместимый путь Ollama (/v1/chat/completions) с ретраем на
+  // следующий узел при сетевом сбое/5xx. Ответ транслируется как есть —
+  // NDJSON для stream=true и JSON для stream=false корректны оба.
+  if (await proxyToPoolPassthrough(req, res, '/v1/chat/completions', req.body, targetModel)) return;
+
   const selectedNode = routable[0];
   const lastMsg = Array.isArray(messages) && messages.length ? messages[messages.length - 1].content : '';
   const text = `[FOA Gateway via ${selectedNode.display_name}]: Processed OpenAI-compatible completion for: "${lastMsg}"`;
 
-  if (stream) {
+  if (req.body.stream) {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -3692,4 +4018,11 @@ async function main(): Promise<void> {
   });
 }
 
-main();
+// Экспортируем для e2e-тестов (test/test.js): импорт модуля НЕ должен сам
+// запускать сервер — main() вызывается только при прямом запуске файла.
+export { app as foaApp, bootstrap, startBackgroundLoops };
+
+const isDirectRun = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
+if (isDirectRun) {
+  main();
+}

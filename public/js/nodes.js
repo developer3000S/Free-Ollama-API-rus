@@ -65,7 +65,7 @@ function updateBulkToolbar() {
       <button class="btn btn-sm" onclick="exportNodesCsv(true)" title="Экспорт выбранных узлов в формате CSV">📥 Export CSV (${selectedNodes.size})</button>
       <button class="btn btn-sm btn-success" onclick="bulkAction('auto-verify')" title="Автоматическая верификация и включение в пул">⚡ Авто-верификация</button>
       <button class="btn btn-sm btn-primary" onclick="bulkAction('manual-verify')" title="Ручное подтверждение верификации (согласовано)">✓ Ручная верификация</button>
-      <button class="btn btn-sm" onclick="bulkAction('health-check')">🩺 Health Check</button>
+      <button class="btn btn-sm" onclick="bulkHealthCheck(false)" title="Перепроверить статус выбранных узлов">🔄 Проверить статусы (${selectedNodes.size})</button>
       <button class="btn btn-sm btn-danger" onclick="bulkAction('revoke')">⛔ Revoke</button>
       <button class="btn btn-sm btn-danger" onclick="bulkAction('blacklist')">🚫 Blacklist</button>
       <button class="btn btn-sm btn-danger" onclick="bulkAction('delete')">🗑 Удалить</button>
@@ -493,9 +493,44 @@ async function renderNodes(container) {
     h('button', {class: `btn ${nodesViewMode === 'map' ? 'btn-primary' : ''}`, onClick: () => { nodesViewMode = 'map'; renderNodes(container); }}, '🗺 Карта'),
     h('button', {class: `btn ${nodesViewMode === 'performance' ? 'btn-primary' : ''}`, onClick: () => { nodesViewMode = 'performance'; renderNodes(container); }}, '📈 Производительность'),
     h('button', {class: 'btn', id: 'btn-export-nodes-top', onClick: () => exportNodesCsv(), title: 'Экспорт текущих узлов в формате CSV'}, '📥 Export CSV'),
+    h('button', {class: 'btn', id: 'btn-recheck-statuses', title: 'Перепроверить статус узлов: выбранные или все сразу'}, '🔄 Проверить статусы ▾'),
     h('button', {class: 'btn btn-primary', onClick: () => showRegisterNodeModal()}, '+ Зарегистрировать узел')
   );
   $('#topbar-actions').appendChild(actionsWrap);
+
+  // Выпадающее меню перепроверки статуса: один/несколько выбранных узлов или все сразу.
+  const recheckBtn = actionsWrap.querySelector('#btn-recheck-statuses');
+  if (recheckBtn) {
+    recheckBtn.onclick = (e) => {
+      e.stopPropagation();
+      let menu = document.getElementById('recheck-menu');
+      if (menu) { menu.remove(); return; }
+      const total = currentNodesList.length;
+      const sel = selectedNodes.size;
+      menu = document.createElement('div');
+      menu.id = 'recheck-menu';
+      menu.className = 'dropdown-menu';
+      menu.style.cssText = 'position:absolute;top:calc(100% + 6px);right:0;z-index:60;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);box-shadow:0 8px 24px rgba(0,0,0,.35);min-width:260px;padding:6px;';
+      menu.innerHTML = `
+        <button class="dropdown-item" data-mode="selected" ${sel ? '' : 'disabled style="opacity:.45;cursor:not-allowed;"'}>🔄 Перепроверить выбранные (${sel})</button>
+        <button class="dropdown-item" data-mode="all">🌐 Перепроверить все узлы (${total})</button>
+      `;
+      const wrap = recheckBtn.parentElement;
+      if (wrap) wrap.style.position = 'relative';
+      wrap?.appendChild(menu);
+      menu.querySelectorAll('.dropdown-item[data-mode]').forEach(item => {
+        item.addEventListener('click', () => {
+          if (item.hasAttribute('disabled')) return;
+          menu.remove();
+          bulkHealthCheck(item.dataset.mode === 'all');
+        });
+      });
+      const closeOnDoc = (ev) => {
+        if (!menu.contains(ev.target)) { menu.remove(); document.removeEventListener('click', closeOnDoc); }
+      };
+      setTimeout(() => document.addEventListener('click', closeOnDoc), 0);
+    };
+  }
 
   try {
     const data = await API.get('/admin/nodes', {detailed: true});
@@ -923,6 +958,17 @@ async function showNodeDetail(nodeId) {
         h('button', {class: 'btn btn-xs btn-icon btn-primary', title: 'Логи', onClick: () => { closeModal(); showNodeLogsModal(nodeId); }}, '📄'),
         h('button', {class: 'btn btn-xs btn-icon btn-success', title: 'Верификация', onClick: () => { closeModal(); showVerificationModal(nodeId, false); }}, '✓'),
         h('button', {class: 'btn btn-xs btn-icon', title: 'Health Check', onClick: () => { closeModal(); nodeAction('health-check', nodeId); }}, '🩺'),
+        h('button', {
+          class: 'btn btn-xs btn-icon' + (isNodeInsecureTls(nodeId) ? ' btn-warning' : ''),
+          title: 'Доверять самоподписанному TLS-сертификату узла (вкл/выкл)',
+          onClick: () => {
+            const on = toggleNodeInsecureTls(nodeId);
+            toast(on ? 'TLS для узла: доверять без проверки CA — запускаю health-check…'
+                     : 'TLS для узла: обычная проверка сертификата', 'success');
+            closeModal();
+            nodeAction('health-check', nodeId);
+          }
+        }, '🔓'),
         h('button', {class: 'btn btn-xs btn-icon btn-danger', title: 'Revoke (отозвать авторизацию)', onClick: () => { closeModal(); nodeAction('revoke', nodeId); }}, '⛔'),
         h('button', {class: 'btn btn-xs btn-icon btn-danger', title: 'Blacklist (в чёрный список)', onClick: () => { closeModal(); nodeBlacklist(nodeId); }}, '🚫'),
         h('button', {class: 'btn btn-xs btn-icon', title: 'Закрыть', onClick: closeModal}, '✕'),
@@ -1442,10 +1488,56 @@ async function toggleAutoVerifyDiscovery() {
 
 async function nodeAction(action, nodeId) {
   try {
-    const data = await API.post(`/admin/nodes/${nodeId}/${action}`, {});
+    // health-check умеет принимать per-node флаг insecure_tls (доверять
+    // самоподписанному TLS-сертификату узла).
+    const body = action === 'health-check' ? { insecure_tls: isNodeInsecureTls(nodeId) } : {};
+    if (action === 'health-check') toast('Проверяю статус узла…', 'info');
+    const data = await API.post(`/admin/nodes/${nodeId}/${action}`, body);
     toast(`${action}: ${data.status || 'ok'}`, 'success');
     if (currentPage === 'nodes') renderNodes($('#content'));
   } catch (e) { toast(e.message, 'error'); }
+}
+
+// Перепроверка статуса узлов через bulk-health-check: один/несколько выбранных
+// (чекбоксами в таблице) или все зарегистрированные узлы сразу (all=true).
+async function bulkHealthCheck(all) {
+  const ids = Array.from(selectedNodes);
+  if (!all && !ids.length) {
+    toast('Сначала выберите узлы чекбоксами в таблице (или используйте «Перепроверить все узлы»)', 'error');
+    return;
+  }
+  const scope = all ? currentNodesList.length : ids.length;
+  toast(`Проверяю статус${all ? ' всех узлов' : ' выбранных узлов'} (${scope})…`, 'info');
+  try {
+    const res = await API.post('/admin/nodes/bulk-health-check', all ? { all: true } : { node_ids: ids });
+    const results = res.results || [];
+    const healthy = results.filter(r => r.status === 'healthy').length;
+    const degraded = results.filter(r => r.status === 'degraded').length;
+    const unhealthy = results.filter(r => r.status === 'unhealthy').length;
+    toast(`Готово: проверено ${res.checked ?? results.length} — 🟢 ${healthy}, 🟡 ${degraded}, 🔴 ${unhealthy}`,
+      unhealthy > 0 ? 'error' : 'success');
+    if (currentPage === 'nodes') renderNodes($('#content'));
+  } catch (e) {
+    toast(`Ошибка перепроверки: ${e.message}`, 'error');
+  }
+}
+
+// Per-node настройка «Доверять самоподписанному TLS» хранится в localStorage
+// и передаётся в health-check; сервер также умеет принимать её при регистрации.
+const INSECURE_TLS_KEY = 'foa_insecure_tls_nodes';
+function insecureTlsSet() {
+  try { return JSON.parse(localStorage.getItem(INSECURE_TLS_KEY) || '[]'); } catch { return []; }
+}
+function isNodeInsecureTls(nodeId) {
+  return insecureTlsSet().includes(String(nodeId));
+}
+function toggleNodeInsecureTls(nodeId) {
+  const set = insecureTlsSet();
+  const id = String(nodeId);
+  const on = !set.includes(id);
+  const next = on ? [...set, id] : set.filter(x => x !== id);
+  try { localStorage.setItem(INSECURE_TLS_KEY, JSON.stringify(next)); } catch { /* ignore */ }
+  return on;
 }
 
 async function nodeDelete(nodeId) {
@@ -1510,6 +1602,12 @@ function showRegisterNodeModal() {
       )
     ),
     h('div', {class: 'form-group'},
+      h('label', {for: 'reg-insecure-tls', style: {display: 'flex', alignItems: 'center', gap: '8px'}},
+        h('input', {type: 'checkbox', id: 'reg-insecure-tls'}),
+        'Доверять самоподписанному TLS-сертификату узла (https с self-signed)'
+      )
+    ),
+    h('div', {class: 'form-group'},
       h('label', null, 'Weight'),
       h('input', {class: 'form-control', id: 'reg-weight', type: 'number', value: '1', min: '1', max: '100'})
     ),
@@ -1531,6 +1629,7 @@ async function submitRegisterNode() {
     max_concurrency: parseInt($('#reg-concurrency').value) || 2,
     consent_method: $('#reg-consent').value,
     weight: parseInt($('#reg-weight').value) || 1,
+    insecure_tls: !!($('#reg-insecure-tls') && $('#reg-insecure-tls').checked),
   };
   if (!body.endpoint) { toast('Endpoint обязателен', 'error'); return; }
   try {

@@ -8,8 +8,11 @@
 > (Express, один файл `server.ts`), сменившая первоначальный Python-вариант
 > (коммит `4790479 build: migrate from Python to Node.js`). Реализованы
 > пользовательский и OpenAI-совместимый контракты, административный API,
-> веб-панель и модуль discovery; состояние хранится **в оперативной памяти**
-> процесса, поэтому перезапуск сбрасывает его к демо-данным. Что именно
+> прокси полного набора Ollama-эндпоинтов на выбранный узел
+> (`/admin/nodes/:id/api/*`, `/v1/*`, `/proxy/*`), веб-панель и модуль
+> discovery; состояние хранится **в оперативной памяти** процесса, поэтому
+> перезапуск сбрасывает его к чистому пулу (демо-данные больше не засеваются).
+> Что именно
 > реализовано, а что осталось на этапе прототипа — см. раздел
 > [Статус реализации по ТЗ](#статус-реализации-по-тз) и
 > [Ограничения](#ограничения-и-что-не-реализовано).
@@ -481,16 +484,83 @@ SPA в `public/index.html` (React + Recharts + Chart.js + D3 + карта Leafle
 | `POST /admin/nodes/:id/challenge` | перевыпуск challenge |
 | `POST /admin/nodes/:id/verify` | подтверждение владения (`mode: auto\|manual`): пробует прочитать `/api/tags` узла, переводит в `verified`/`routable` |
 | `POST /admin/nodes/bulk-verify` | групповая верификация (`node_ids`, `mode`) |
-| `POST /admin/nodes/:id/health-check` | проверка доступности узла |
+| `POST /admin/nodes/:id/health-check` | проверка доступности узла (`/api/version` + обновление моделей из `/api/tags`; учитывает per-node флаг `insecure_tls`) |
+| `POST /admin/nodes/bulk-health-check` | массовая перепроверка статусов: `{node_ids:[...]}` или `{all:true}`; параллельно (до 5 узлов), ответ `{checked, results:[{node_id,status,latency_ms,models,error}]}`. В панели — кнопка «🔄 Проверить статусы» (выбранные/все) |
+| `GET /admin/nodes/:id/models` | список моделей узла (кэш `node.models`, при пустоте опрос `GET <endpoint>/api/tags` с обновлением кэша) — используется выпадающим списком в чате панели |
+| `POST /admin/nodes/:id/chat` | чат с конкретным узлом в обход пользовательских ключей: тело `{messages:[...], model}` (или `{message}`), ответ `{reply, model, node_id}`; проксирует на `<endpoint>/api/chat`, таймаут 120 с. Используется панелью (админский Bearer-токен) |
 | `POST /admin/nodes/:id/revoke` | отзыв согласия → узел исключается из маршрутизации |
 | `POST /admin/nodes/:id/blacklist` | блокировка узла |
 | `POST /admin/nodes/:id/unblacklist` | снятие блокировки |
 | `DELETE /admin/nodes/:id` | удаление узла |
 | `POST /admin/nodes/:id/labels` | управление метками |
 | `GET /admin/nodes/:id/logs` | журнал событий узла |
-| `GET /admin/nodes/metrics` | метрики по узлам |
+| `GET /admin/nodes/metrics` | метрики по узлам: реальная история CPU/Mem (`metrics[].history[{time,cpu,memory}]`, `timestamps[]`, `interval_ms`, флаг `real` по узлу; источник — Ollama `GET /api/ps`, шаг сэмплинга 5 с, окно ~120 точек) |
 | `GET /admin/nodes/latency-distribution` | распределение задержек по всем маршрутизируемым узлам |
 | `GET /admin/nodes/:id/latency-distribution` | то же по одному узлу |
+
+### Прокси Ollama API выбранного узла (панель / диагностика)
+
+Полный набор эндпоинтов Ollama
+([native API](https://docs.ollama.com/api/introduction),
+[OpenAI-совместимость](https://docs.ollama.com/api/openai-compatibility))
+доступен как прямой прокси на конкретный узел под админским Bearer-токеном.
+Ответ — нативный JSON узла без изменений; заголовки `Content-Type` и тело
+передаются как есть. Все маршруты наследуют per-node настройки TLS
+(`insecure_tls`), пул соединений и автоматические повторы сетевых ошибок
+(ECONNRESET/EPIPE). Таймауты: GET — 30 с, POST — 120 с (pull/push/generate
+могут идти долго).
+
+| Метод / путь шлюза | Путь Ollama на узле |
+|---|---|
+| `GET  /admin/nodes/:id/api/tags` | `/api/tags` — список моделей |
+| `GET  /admin/nodes/:id/api/ps` | `/api/ps` — загруженные модели |
+| `GET  /admin/nodes/:id/api/version` | `/api/version` |
+| `GET  /admin/nodes/:id/api/show?model=…` или `/api/show/:model` | `/api/show` — детали модели |
+| `GET  /admin/nodes/:id/api/usage` | `/api/usage` |
+| `GET  /admin/nodes/:id/api/balance` | `/api/balance` |
+| `POST /admin/nodes/:id/api/generate` | `/api/generate` |
+| `POST /admin/nodes/:id/api/chat` | `/api/chat` |
+| `POST /admin/nodes/:id/api/embed` | `/api/embed` — эмбеддинги |
+| `POST /admin/nodes/:id/api/create` | `/api/create` — создание модели из Modelfile |
+| `POST /admin/nodes/:id/api/copy` | `/api/copy` — копирование модели |
+| `POST /admin/nodes/:id/api/pull` | `/api/pull` — загрузка модели (долгий запрос) |
+| `POST /admin/nodes/:id/api/push` | `/api/push` — публикация модели (долгий запрос) |
+| `POST /admin/nodes/:id/api/delete` (и `DELETE`) | `/api/delete` — удаление модели (Ollama ожидает POST; алиас `DELETE` добавлен для удобства UI) |
+| `GET  /admin/nodes/:id/v1/models` | `/v1/models` — список моделей в формате OpenAI |
+| `GET  /admin/nodes/:id/v1/models/:model` | `/v1/models/{model}` |
+| `POST /admin/nodes/:id/v1/chat/completions` | `/v1/chat/completions` |
+| `POST /admin/nodes/:id/v1/responses` | `/v1/responses` |
+| `GET  /admin/nodes/:id/v1/systemone` | `/v1/systemone` |
+| `ALL  /admin/nodes/:id/proxy/<путь>` | любой поддерживаемый путь Ollama (универсальный прокси) |
+| `GET  /admin/ollama/endpoints` | машиночитаемая справка по всем маршрутам (для UI/автотестов) |
+
+Примеры:
+
+```bash
+export FOA_ADMIN_TOKEN="foa-admin-secret"
+NODE=node_5ff733a93d
+
+# какие модели загружены в память узла
+curl -s "http://localhost:8080/admin/nodes/$NODE/api/ps" \
+  -H "Authorization: Bearer $FOA_ADMIN_TOKEN" | jq
+
+# скачать модель на узел (долгий запрос, до 120 с)
+curl -s -X POST "http://localhost:8080/admin/nodes/$NODE/api/pull" \
+  -H "Authorization: Bearer $FOA_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"llama3:8b"}' | jq
+
+# эмбеддинги через универсальный прокси
+curl -s -X POST "http://localhost:8080/admin/nodes/$NODE/proxy/api/embed" \
+  -H "Authorization: Bearer $FOA_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nomic-embed-text","input":"привет"}' | jq
+```
+
+Ошибки сети проксирует расшифрованными: `DEPTH_ZERO_SELF_SIGNED_CERT` →
+включите 🔓 «Доверять самоподписанному TLS» на карточке узла; `ECONNREFUSED` →
+проверьте `OLLAMA_HOST=0.0.0.0` и файрвол; `ECONNRESET` повторяется
+автоматически (разрыв keep-alive).
 
 ### Согласия, блэклист, ключи, аудит, конфигурация
 
@@ -703,12 +773,12 @@ update.sh             скрипт отправки изменений на GitH
 
 | Область ТЗ | Статус |
 |---|---|
-| Пользовательский Ollama API (§9) | частично: эндпоинты и аутентификация по Bearer-ключу есть; скоупы, лимиты и `show`/`ps` — нет |
-| OpenAI-контракт (§18) | частично: демо-ответы, реальной конвертации нет |
+| Пользовательский Ollama API (§9) | частично: эндпоинты и аутентификация по Bearer-ключу есть; скоупы, лимиты — нет. Полный прокси нативного Ollama API на конкретный узел реализован в админ-контуре (`/admin/nodes/:id/api/*`, `/v1/*`, `/proxy/*`) |
+| OpenAI-контракт (§18) | частично: публичные `/v1/*` отдают симулированные ответы; реальное OpenAI-совместимое обращение к узлу доступно через прокси `/admin/nodes/:id/v1/chat/completions`, `/v1/responses`, `/v1/models` (нативный формат узла) |
 | Административный API (§9.6) | реализован (токен должен точно совпадать с `FOA_ADMIN_TOKEN`/`FOA_AUDITOR_TOKEN`; разделения скоупов админа/аудитора нет) |
 | Владелец узла, CLI (§5) | частично: challenge/verify через админ-API; CLI `foa-owner` отсутствует |
 | Discovery (§4) | реализован для источников с ключами (кандидаты в памяти) |
-| Health-check (§6) | частично: ручная проверка через `/admin/nodes/:id/health-check` |
+| Health-check (§6) | реализован: ручная проверка одного узла (`/admin/nodes/:id/health-check`) и массовая перепроверка выбранных/всех узлов (`POST /admin/nodes/bulk-health-check`, кнопка «🔄 Проверить статусы» в панели); автопериодический фоновый обход — нет |
 | Балансировщик (§7) | частично: least-connections по активным соединениям |
 | Согласие, хранение, журналирование (§5, §12) | частично: in-memory, без персистентности и JSON-журнала |
 | Масштабирование, БД, Redis (§14) | не реализовано (сервисы в compose зарезервированы) |
@@ -722,12 +792,14 @@ update.sh             скрипт отправки изменений на GitH
   не применяются: аутентификация есть, авторизация по скоупам — нет.
 - **Лимиты, квоты, circuit breaker, повторы** (§7, §12.4) присутствуют только в
   конфиге, к трафику не применяются.
-- **Состояние в памяти**: рестарт = сброс к демо-данным; персистентности нет,
-  `GATEWAY_DB_URL` / `GATEWAY_REDIS_URL` ни на что не влияют, `postgres` и
-  `redis` из compose бездействуют.
+- **Состояние в памяти**: рестарт = сброс к чистому пулу (демо-узлы больше не
+  засеваются); персистентности нет, `GATEWAY_DB_URL` / `GATEWAY_REDIS_URL` ни на
+  что не влияют, `postgres` и `redis` из compose бездействуют.
 - **Ответ `/api/generate` и `/api/chat`** — демо-заглушка, если узел недостижим;
-  засеянные узлы используют тестовые IP из RFC 5737, поэтому реальный трафик
-  невозможен, пока не зарегистрирован настоящий узел.
+  реальный трафик требует зарегистрированного настоящего узла
+  (`POST /admin/nodes`, например локальная Ollama `http://localhost:11434`).
+  Для диагностики и прямого управления узлом используйте прокси
+  `/admin/nodes/:id/...` (см. раздел «Прокси Ollama API выбранного узла»).
 - **`/v1/*`** отдаёт симулированные ответы; полноценный конвертер Ollama ↔ OpenAI
   (маппинг параметров, tool calls, `usage`, SSE из NDJSON) не реализован.
 - **CLI владельца узла `foa-owner`** отсутствует — все операции доступны через
