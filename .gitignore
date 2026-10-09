@@ -1,2 +1,6 @@
-node_modules
 .env
+.DS_Store
+graphify-out/
+graphify-out
+node_modules
+node_modules/
