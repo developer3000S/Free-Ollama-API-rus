@@ -29,7 +29,10 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // server.ts
 var server_exports = {};
 __export(server_exports, {
-  reloadEnv: () => reloadEnv
+  bootstrap: () => bootstrap,
+  foaApp: () => app,
+  reloadEnv: () => reloadEnv,
+  startBackgroundLoops: () => startBackgroundLoops
 });
 module.exports = __toCommonJS(server_exports);
 var import_express = __toESM(require("express"), 1);
@@ -712,26 +715,6 @@ var RpmLocalFallback = class {
   }
 };
 var rpmLocalFallback = new RpmLocalFallback();
-async function seedRpmDemoData() {
-  if (!enabled2 || !client) return;
-  try {
-    const seeded = await client.setnx("foa:rpm:seeded", "1");
-    if (!seeded) return;
-    const currentMin = Math.floor(Date.now() / 6e4);
-    const pipeline = client.multi();
-    for (let i = RPM_BUCKETS - 1; i >= 0; i--) {
-      const wave = Math.sin(i / RPM_BUCKETS * Math.PI * 4) * 22;
-      const wave2 = Math.cos(i / RPM_BUCKETS * Math.PI * 2) * 12;
-      const jitter = Math.floor(Math.random() * 14) - 7;
-      const value = Math.max(15, Math.round(72 + wave + wave2 + jitter));
-      const key = `foa:rpm:${currentMin - i}`;
-      pipeline.set(key, value, "EX", RPM_BUCKETS * 70);
-    }
-    await pipeline.exec();
-  } catch (err) {
-    logger.warn("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u0441\u0435\u044F\u0442\u044C \u0434\u0435\u043C\u043E RPM \u0432 Redis", { error: err.message });
-  }
-}
 var GATEWAY_TTL_SEC = 30;
 async function registerGateway(gatewayId, meta = {}) {
   if (!enabled2 || !client) return;
@@ -795,6 +778,19 @@ function prune(list, windowMs, now) {
   const cutoff = now - windowMs;
   return list.filter((t) => t > cutoff);
 }
+function isBreakerOpen(nodeId, config, now = Date.now()) {
+  const state = getBreaker(nodeId);
+  if (state.openedAt === null) return false;
+  const elapsedSec = (now - state.openedAt) / 1e3;
+  if (elapsedSec < config.open_duration_seconds) {
+    return state.probesInflight >= config.half_open_probes;
+  }
+  state.openedAt = null;
+  state.failures = [];
+  state.successes = [];
+  state.probesInflight = 0;
+  return false;
+}
 function recordSuccess(nodeId, latencyMs, config, now = Date.now()) {
   const state = getBreaker(nodeId);
   state.successes = prune(state.successes, config.window_seconds * 1e3, now);
@@ -819,9 +815,41 @@ function recordFailure(nodeId, config, now = Date.now()) {
 function resetBreaker(nodeId) {
   breakers.delete(nodeId);
 }
+function scoreNode(node) {
+  const weight = node.weight > 0 ? node.weight : 1;
+  const latency = node.ewma_latency_ms || node.active_connections > 0 ? Math.max(10, node.ewma_latency_ms || 50) : 50;
+  const latencyFactor = 1e3 / (1e3 + latency);
+  const freeCapacity = Math.max(
+    0.05,
+    1 - node.active_connections / Math.max(1, node.max_concurrency || 1)
+  );
+  return weight * latencyFactor * freeCapacity;
+}
+function selectNode(candidates2, config, now = Date.now()) {
+  const usable = candidates2.filter((n) => {
+    if (!n.routable) return false;
+    if (n.status === "blacklisted" || n.status === "unhealthy") return false;
+    if (n.active_connections >= Math.max(1, n.max_concurrency || 1)) return false;
+    return !isBreakerOpen(n.node_id, config, now);
+  });
+  if (!usable.length) return null;
+  const scored = usable.map((n) => ({ node: n, score: scoreNode(n) }));
+  const total = scored.reduce((sum, s) => sum + s.score, 0);
+  if (total <= 0) return scored[0].node;
+  let r = Math.random() * total;
+  for (const s of scored) {
+    r -= s.score;
+    if (r <= 0) return s.node;
+  }
+  return scored[scored.length - 1].node;
+}
 
 // src/pool.ts
 var import_undici = require("undici");
+function insecureTlsEnabled() {
+  const v = String(process.env.FOA_INSECURE_TLS || "").toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
 var agents = /* @__PURE__ */ new Map();
 function getAgentForEndpoint(endpoint, options = {}) {
   const key = endpoint.replace(/\/+$/, "");
@@ -830,7 +858,9 @@ function getAgentForEndpoint(endpoint, options = {}) {
   if (existing) return existing;
   const agent = new import_undici.Agent({
     connect: {
-      timeout: options.connectTimeoutMs ?? 4e3
+      timeout: options.connectTimeoutMs ?? 4e3,
+      // Самоподписанный сертификат узла (FOA_INSECURE_TLS=true) — не отклонять.
+      rejectUnauthorized: !insecureTlsEnabled()
     },
     connections: maxConnections,
     keepAliveTimeout: options.keepAliveTimeoutMs ?? 3e4,
@@ -852,8 +882,110 @@ function closeAgentForEndpoint(endpoint) {
 function dispatcherFor(endpoint, maxConcurrency, options = {}) {
   return { dispatcher: getAgentForEndpoint(endpoint, { ...options, maxConnections: Math.max(1, maxConcurrency) }) };
 }
+function isTlsCertError(err) {
+  const codes = [
+    "CERT_HAS_EXPIRED",
+    "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "SELF_SIGNED_CERT",
+    "SELF_SIGNED_CERT_IN_CHAIN",
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "UNKNOWN_CA",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+    "HR_BAD_VERIFY",
+    "CW_SYSKEY_NOT_FOUND"
+  ];
+  const chain = [err?.code, err?.cause?.code, err?.name, err?.cause?.name];
+  if (chain.some((c) => c && codes.includes(String(c)))) return true;
+  const msg = String(err?.message || "") + " " + String(err?.cause?.message || "");
+  return /self[- ]signed|certificate|SSL routines|altname/i.test(msg);
+}
+var RETRYABLE_NET_CODES = [
+  "ECONNRESET",
+  "EPIPE",
+  "ECONNABORTED",
+  "UND_ERR_SOCKET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT"
+];
+function retryableNetError(err) {
+  const codes = [err?.code, err?.cause?.code, err?.errno];
+  return codes.some((c) => c && RETRYABLE_NET_CODES.includes(String(c)));
+}
+async function nodeFetch(url, init, opts = {}) {
+  const endpoint = url.replace(/^(https?:\/\/[^/]+).*$/, "$1");
+  const { timeoutMs = 12e4, ...fetchInit } = init;
+  let bodyBuf;
+  if (typeof fetchInit.body === "string") bodyBuf = fetchInit.body;
+  else if (fetchInit.body != null) {
+    try {
+      bodyBuf = JSON.stringify(fetchInit.body);
+    } catch {
+    }
+  }
+  const baseInit = { ...fetchInit, ...bodyBuf !== void 0 ? { body: bodyBuf } : {} };
+  let soft = null;
+  const getSoft = () => {
+    if (!soft) {
+      soft = new import_undici.Agent({
+        connect: { timeout: 4e3, rejectUnauthorized: false },
+        connections: Math.max(1, opts.maxConcurrency || 4),
+        keepAliveTimeout: 3e4,
+        keepAliveMaxTimeout: 6e4,
+        pipelining: 1
+      });
+    }
+    return soft;
+  };
+  const run = (dispatcher) => fetch(url, {
+    ...baseInit,
+    signal: AbortSignal.timeout(timeoutMs),
+    ...dispatcher ? { dispatcher } : dispatcherFor(endpoint, opts.maxConcurrency || 4)
+  });
+  const noTlsFallback = opts.allowInsecureFallback === false;
+  try {
+    if (!noTlsFallback && (insecureTlsEnabled() || opts.forceInsecureTls)) {
+      const res2 = await run(getSoft());
+      return { res: res2, tlsInsecureUsed: true };
+    }
+    const res = await run();
+    return { res, tlsInsecureUsed: false };
+  } catch (err) {
+    if (!noTlsFallback && isTlsCertError(err)) {
+      const res = await run(getSoft());
+      return { res, tlsInsecureUsed: true };
+    }
+    if (retryableNetError(err)) {
+      closeAgentForEndpoint(endpoint);
+      await new Promise((r) => setTimeout(r, 350));
+      try {
+        if (!noTlsFallback && (insecureTlsEnabled() || opts.forceInsecureTls)) {
+          const res2 = await run(getSoft());
+          return { res: res2, tlsInsecureUsed: true };
+        }
+        const res = await run();
+        return { res, tlsInsecureUsed: false };
+      } catch (err2) {
+        if (!noTlsFallback && isTlsCertError(err2)) {
+          const res = await run(getSoft());
+          return { res, tlsInsecureUsed: true };
+        }
+        throw err2;
+      }
+    }
+    throw err;
+  } finally {
+    if (soft) {
+      const s = soft;
+      soft = null;
+      s.close().catch(() => {
+      });
+    }
+  }
+}
 
 // server.ts
+var import_meta = {};
 function reloadEnv() {
   try {
     const envPath = import_path.default.join(process.cwd(), ".env");
@@ -949,6 +1081,54 @@ var LATENCY_BINS = [
   { id: "b_1500_plus", label: "> 1500ms", min: 1500, max: Infinity }
 ];
 var nodeLatencySamples = /* @__PURE__ */ new Map();
+var NODE_METRICS_INTERVAL_MS = 5e3;
+var NODE_METRICS_MAX_SAMPLES = 120;
+var nodeMetricsHistory = /* @__PURE__ */ new Map();
+var nodeMetricsLastTs = null;
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = h * 31 + s.charCodeAt(i) >>> 0;
+  return h;
+}
+async function sampleNodeMetricsOnce() {
+  const tsLabel = (/* @__PURE__ */ new Date()).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  nodeMetricsLastTs = Date.now();
+  const tasks = Array.from(nodes.values()).map(async (node) => {
+    let cpu = null;
+    let memory = null;
+    let real = false;
+    try {
+      const psRes = await fetch(`${node.endpoint}/api/ps`, nodeFetchOpts({
+        signal: AbortSignal.timeout(3e3),
+        ...dispatcherFor(node.endpoint, Math.max(1, node.max_concurrency || 4))
+      }));
+      if (psRes.ok) {
+        const psData = await psRes.json();
+        const models = Array.isArray(psData.models) ? psData.models : [];
+        const gpuTotal = models.reduce((a, m) => a + (Number(m.size_vram) || 0), 0);
+        const cpuTotal = models.reduce((a, m) => a + (Number(m.size) || 0) - (Number(m.size_vram) || 0), 0);
+        const vramCap = 24 * 1024 * 1024 * 1024;
+        cpu = Math.min(98, Math.max(3, Math.round(gpuTotal / vramCap * 100)));
+        memory = Math.min(98, Math.max(5, Math.round((gpuTotal + Math.max(0, cpuTotal)) / vramCap * 100)));
+        real = true;
+      }
+    } catch {
+    }
+    if (!real) {
+      const seed = hashStr(node.node_id);
+      const phase = nodeMetricsLastTs / NODE_METRICS_INTERVAL_MS + seed % 60;
+      const baseCpu = 20 + seed % 45;
+      const baseMem = 30 + seed % 35;
+      cpu = Math.min(97, Math.max(4, Math.round(baseCpu + Math.sin(phase / 6 + seed) * 14)));
+      memory = Math.min(97, Math.max(8, Math.round(baseMem + Math.cos(phase / 8 + seed) * 9)));
+    }
+    const arr = nodeMetricsHistory.get(node.node_id) || [];
+    arr.push({ time: tsLabel, cpu, memory, real });
+    if (arr.length > NODE_METRICS_MAX_SAMPLES) arr.splice(0, arr.length - NODE_METRICS_MAX_SAMPLES);
+    nodeMetricsHistory.set(node.node_id, arr);
+  });
+  await Promise.allSettled(tasks);
+}
 function generateDefaultSamplesForNode(node) {
   const base = Math.max(20, node.latency_ms || 60);
   const count = 120;
@@ -980,17 +1160,6 @@ function recordNodeLatencySample(nodeId, latencyMs) {
 var RPM_BUCKETS_COUNT = 60;
 var localRpmFallback = new Array(RPM_BUCKETS_COUNT).fill(0);
 var localRpmLastMinute = Math.floor(Date.now() / 6e4);
-var rpmSeededLocally = false;
-function seedLocalRpm() {
-  if (rpmSeededLocally) return;
-  rpmSeededLocally = true;
-  for (let i = 0; i < RPM_BUCKETS_COUNT; i++) {
-    const wave = Math.sin(i / 60 * Math.PI * 4) * 22;
-    const wave2 = Math.cos(i / 60 * Math.PI * 2) * 12;
-    const jitter = Math.floor(Math.random() * 14) - 7;
-    localRpmFallback[i] = Math.max(15, Math.round(72 + wave + wave2 + jitter));
-  }
-}
 function shiftLocalRpm(currentMin) {
   const diff = currentMin - localRpmLastMinute;
   if (diff > 0) {
@@ -1007,7 +1176,6 @@ function recordRequestForRpm(count = 1) {
     recordRpm(count).catch(() => shiftLocalRpm(Math.floor(Date.now() / 6e4)));
     return;
   }
-  seedLocalRpm();
   shiftLocalRpm(Math.floor(Date.now() / 6e4));
   localRpmFallback[localRpmFallback.length - 1] += count;
 }
@@ -1020,7 +1188,6 @@ async function getRpm60mData() {
       values = new Array(RPM_BUCKETS_COUNT).fill(0).map((_, i) => values[i] || 0);
     }
   } else {
-    seedLocalRpm();
     shiftLocalRpm(Math.floor(Date.now() / 6e4));
     values = [...localRpmFallback];
   }
@@ -1108,248 +1275,12 @@ function addAudit(event, actor, subject_type, subject_id, detail = {}) {
   );
 }
 async function seedInitialData() {
-  const freshNodes = await nodes.list();
-  const freshKeys = await apiKeys.list();
-  if (freshNodes.length > 0) {
-    return false;
-  }
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const sampleNodes = [];
-  const pushNode = (node) => {
-    sampleNodes.push(node);
-    nodeLatencySamples.set(node.node_id, generateDefaultSamplesForNode(node));
-    consentsSeed.push({
-      consent_id: `cst_${node.node_id}`,
-      node_id: node.node_id,
-      owner_id: node.owner_id,
-      status: node.consent_status === "verified" ? "active" : "pending",
-      method: "http_well_known",
-      allowed_models: node.models,
-      max_concurrency: node.max_concurrency,
-      issued_at: now,
-      expires_at: new Date(Date.now() + 90 * 864e5).toISOString(),
-      version: 1,
-      history: [{ event: "seed_init", actor: "system", created_at: now }]
-    });
-  };
-  pushNode({
-    node_id: "node_us_east1",
-    endpoint: "http://198.51.100.22:11434",
-    display_name: "US-East FastCluster",
-    owner_id: "ops@cloudscale.net",
-    models: ["llama3", "llama3:8b", "llama3:70b", "mistral", "mistral:7b"],
-    max_concurrency: 4,
-    active_connections: 1,
-    latency_ms: 45,
-    error_rate: 2e-3,
-    weight: 10,
-    status: "healthy",
-    consent_status: "verified",
-    routable: true,
-    created_at: now,
-    updated_at: now,
-    state: "healthy",
-    active: 1,
-    ewma_latency_ms: 45,
-    effective_weight: 10,
-    country: "US",
-    ip: "198.51.100.22"
-  });
-  pushNode({
-    node_id: "node_us_west2",
-    endpoint: "http://198.51.100.58:11434",
-    display_name: "US-West Inference Hub",
-    owner_id: "ops@cloudscale.net",
-    models: ["llama3", "llama3:8b", "qwen2", "qwen2:7b"],
-    max_concurrency: 2,
-    active_connections: 0,
-    latency_ms: 62,
-    error_rate: 0,
-    weight: 8,
-    status: "healthy",
-    consent_status: "verified",
-    routable: true,
-    created_at: now,
-    updated_at: now,
-    state: "healthy",
-    active: 0,
-    ewma_latency_ms: 62,
-    effective_weight: 8,
-    country: "US",
-    ip: "198.51.100.58"
-  });
-  pushNode({
-    node_id: "node_de_fra1",
-    endpoint: "http://203.0.113.14:11434",
-    display_name: "DE-Frankfurt Dedicated",
-    owner_id: "berlin-lab@research.de",
-    models: ["llama3", "llama3:8b", "mixtral:8x7b", "phi3:mini"],
-    max_concurrency: 4,
-    active_connections: 2,
-    latency_ms: 88,
-    error_rate: 5e-3,
-    weight: 12,
-    status: "healthy",
-    consent_status: "verified",
-    routable: true,
-    created_at: now,
-    updated_at: now,
-    state: "healthy",
-    active: 2,
-    ewma_latency_ms: 88,
-    effective_weight: 12,
-    country: "DE",
-    ip: "203.0.113.14"
-  });
-  pushNode({
-    node_id: "node_de_mun2",
-    endpoint: "http://203.0.113.88:11434",
-    display_name: "DE-Munich GPU Rig",
-    owner_id: "berlin-lab@research.de",
-    models: ["codellama:13b", "llama3:8b"],
-    max_concurrency: 2,
-    active_connections: 0,
-    latency_ms: 145,
-    error_rate: 0.02,
-    weight: 5,
-    status: "degraded",
-    consent_status: "verified",
-    routable: true,
-    created_at: now,
-    updated_at: now,
-    state: "degraded",
-    active: 0,
-    ewma_latency_ms: 145,
-    effective_weight: 5,
-    country: "DE",
-    ip: "203.0.113.88"
-  });
-  pushNode({
-    node_id: "node_jp_tyo1",
-    endpoint: "http://192.0.2.77:11434",
-    display_name: "JP-Tokyo Edge Node",
-    owner_id: "tokyo-edge@ai-pacific.jp",
-    models: ["llama3:8b", "qwen2:72b", "gemma2:9b"],
-    max_concurrency: 4,
-    active_connections: 1,
-    latency_ms: 120,
-    error_rate: 1e-3,
-    weight: 10,
-    status: "healthy",
-    consent_status: "verified",
-    routable: true,
-    created_at: now,
-    updated_at: now,
-    state: "healthy",
-    active: 1,
-    ewma_latency_ms: 120,
-    effective_weight: 10,
-    country: "JP",
-    ip: "192.0.2.77"
-  });
-  pushNode({
-    node_id: "node_nl_ams1",
-    endpoint: "http://192.0.2.140:11434",
-    display_name: "NL-Amsterdam Relay",
-    owner_id: "community@foa-relay.eu",
-    models: ["llama3:8b", "mistral:7b"],
-    max_concurrency: 2,
-    active_connections: 0,
-    latency_ms: 76,
-    error_rate: 0,
-    weight: 6,
-    status: "healthy",
-    consent_status: "verified",
-    routable: true,
-    created_at: now,
-    updated_at: now,
-    state: "healthy",
-    active: 0,
-    ewma_latency_ms: 76,
-    effective_weight: 6,
-    country: "NL",
-    ip: "192.0.2.140"
-  });
-  pushNode(
-    {
-      node_id: "node_fr_par1",
-      endpoint: "http://192.0.2.215:11434",
-      display_name: "FR-Paris Micro Compute",
-      owner_id: "community@foa-relay.eu",
-      models: ["phi3:mini", "llama3:8b"],
-      max_concurrency: 2,
-      active_connections: 0,
-      latency_ms: 82,
-      error_rate: 0,
-      weight: 4,
-      status: "healthy",
-      consent_status: "challenge_sent",
-      routable: false,
-      created_at: now,
-      updated_at: now,
-      state: "pending_consent",
-      active: 0,
-      ewma_latency_ms: 82,
-      effective_weight: 0,
-      country: "FR",
-      ip: "192.0.2.215"
-    }
-  );
-  const sampleCandidates = [
-    {
-      candidate_id: "cand_discovery_us1",
-      source: "censys",
-      sources: ["censys"],
-      ip: "198.51.100.99",
-      port: 11434,
-      protocol: "http",
-      dns_names: ["ai-edge-pool.us.cloud"],
-      country: "US",
-      asn: "AS15169 Google LLC",
-      service_hint: "Ollama API v0.1.32",
-      risk_score: 12,
-      requires_manual_review: false,
-      status: "candidate",
-      observed_at: now
-    },
-    {
-      candidate_id: "cand_discovery_de1",
-      source: "shodan",
-      sources: ["shodan"],
-      ip: "203.0.113.190",
-      port: 11434,
-      protocol: "http",
-      dns_names: ["gpu-cluster-fra.de"],
-      country: "DE",
-      asn: "AS24940 Hetzner Online GmbH",
-      service_hint: "Ollama API (Llama3, Mixtral)",
-      risk_score: 8,
-      requires_manual_review: false,
-      status: "candidate",
-      observed_at: now
-    }
-  ];
   addAudit("gateway_boot", "system", "gateway", GATEWAY_ID, {
     version: VERSION,
-    pool_size: sampleNodes.length,
+    pool_size: nodes.size,
     status: "clean_initialized"
   });
-  await tx(async (client2) => {
-    for (const node of sampleNodes) {
-      await nodes.set(node, client2);
-    }
-    for (const consent of consentsSeed) {
-      await consents.set(consent, client2);
-    }
-    for (const cand of sampleCandidates) {
-      await candidates.set(cand, client2);
-    }
-  }).catch((err) => {
-    logger.warn("\u0421\u0438\u0434\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u0435 \u0432 PG \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u2014 \u0434\u0430\u043D\u043D\u044B\u0435 \u043E\u0441\u0442\u0430\u043D\u0443\u0442\u0441\u044F \u0432 \u043F\u0430\u043C\u044F\u0442\u0438", { error: err.message });
-  });
-  return true;
 }
-var consentsSeed = [];
 async function bootstrap() {
   const pgOk = await initDb();
   const redisOk = await initRedis();
@@ -1367,7 +1298,6 @@ async function bootstrap() {
   await seedInitialData();
   rebuildKeyHashIndex();
   if (redisOk) {
-    await seedRpmDemoData();
     await registerGateway(GATEWAY_ID, {
       version: VERSION,
       started_at: (/* @__PURE__ */ new Date()).toISOString(),
@@ -1542,6 +1472,7 @@ function markKeyUsed(keyId) {
       apiKeys.set(update).catch((err) => logger.warn("last_used_at flush failed", { error: err.message }));
     }
   }, 15e3);
+  keyFlushTimer.unref();
 }
 async function persistNode(node) {
   if (!node) return;
@@ -1899,26 +1830,37 @@ app.get("/admin/nodes/latency-distribution", adminAuth, (req, res) => {
     timestamp: (/* @__PURE__ */ new Date()).toISOString()
   });
 });
-app.get("/admin/nodes/metrics", adminAuth, (req, res) => {
-  const timestamps = ["10:00", "10:05", "10:10", "10:15", "10:20", "10:25", "10:30", "10:35", "10:40", "10:45"];
+app.get("/admin/nodes/metrics", adminAuth, async (req, res) => {
+  await sampleNodeMetricsOnce().catch(() => {
+  });
+  const timestampsSet = /* @__PURE__ */ new Set();
+  for (const arr of nodeMetricsHistory.values()) {
+    for (const p of arr) timestampsSet.add(p.time);
+  }
+  const timestamps = Array.from(timestampsSet);
   const nodeMetrics = [];
   for (const node of nodes.values()) {
-    let baseCpu = 25 + Math.abs(node.node_id.split("").reduce((acc, c) => acc + c.charCodeAt(0), 0) % 45);
-    let baseMem = 35 + Math.abs(node.node_id.split("").reduce((acc, c) => acc + c.charCodeAt(0), 0) % 35);
-    const history = timestamps.map((time, idx) => {
-      const cpu = Math.min(100, Math.max(5, Math.round(baseCpu + Math.sin(idx + node.node_id.length) * 15)));
-      const memory = Math.min(100, Math.max(10, Math.round(baseMem + Math.cos(idx + node.node_id.length) * 10)));
-      return { time, cpu, memory, latency_ms: node.latency_ms || Math.round(20 + Math.random() * 40) };
-    });
+    const hist = nodeMetricsHistory.get(node.node_id) || [];
     nodeMetrics.push({
       node_id: node.node_id,
       display_name: node.display_name || node.node_id,
       status: node.status,
       country: node.country || "US",
-      history
+      real: hist.length > 0 && hist[hist.length - 1].real,
+      history: hist.map((p) => ({
+        time: p.time,
+        cpu: p.cpu,
+        memory: p.memory,
+        latency_ms: node.latency_ms || 0
+      }))
     });
   }
-  res.json({ metrics: nodeMetrics, timestamps, timestamp: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({
+    metrics: nodeMetrics,
+    timestamps,
+    interval_ms: NODE_METRICS_INTERVAL_MS,
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
+  });
 });
 app.get("/admin/nodes/:id/latency-distribution", adminAuth, (req, res) => {
   const node = nodes.get(req.params.id);
@@ -1940,7 +1882,7 @@ app.get("/admin/nodes/:id/latency-distribution", adminAuth, (req, res) => {
   });
 });
 app.post("/admin/nodes", adminAuth, async (req, res) => {
-  const { endpoint, display_name, owner_id, models, max_concurrency, consent_method, weight, country, labels } = req.body;
+  const { endpoint, display_name, owner_id, models, max_concurrency, consent_method, weight, country, labels, insecure_tls } = req.body;
   if (!endpoint) {
     return res.status(400).json({ error: "Endpoint \u043E\u0431\u044F\u0437\u0430\u0442\u0435\u043B\u0435\u043D" });
   }
@@ -1968,7 +1910,8 @@ app.post("/admin/nodes", adminAuth, async (req, res) => {
     ewma_latency_ms: 0,
     effective_weight: 0,
     country: (country || req.body.country || "US").toUpperCase(),
-    labels: Array.isArray(labels) ? labels : []
+    labels: Array.isArray(labels) ? labels : [],
+    insecure_tls: insecure_tls === true
   };
   nodeLatencySamples.set(nodeId, generateDefaultSamplesForNode(newNode));
   const newConsent = {
@@ -1988,10 +1931,15 @@ app.post("/admin/nodes", adminAuth, async (req, res) => {
     ]
   };
   try {
-    await tx(async (client2) => {
-      await nodes.set(newNode, client2);
-      await consents.set(newConsent, client2);
-    });
+    if (dbEnabled()) {
+      await tx(async (client2) => {
+        await nodes.set(newNode, client2);
+        await consents.set(newConsent, client2);
+      });
+    } else {
+      await nodes.set(newNode);
+      await consents.set(newConsent);
+    }
   } catch (err) {
     logger.error("node registration failed", { error: err.message, node_id: nodeId });
     return res.status(500).json({ error: "\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0443\u0437\u0435\u043B", detail: err.message });
@@ -2066,7 +2014,7 @@ app.post("/admin/nodes/:id/verify", adminAuth, async (req, res) => {
   if (max_concurrency) node.max_concurrency = max_concurrency;
   if (Array.isArray(models) && models.length) node.models = models;
   try {
-    const probeRes = await fetch(`${node.endpoint}/api/tags`, { signal: AbortSignal.timeout(3e3) });
+    const probeRes = await fetch(`${node.endpoint}/api/tags`, nodeFetchOpts({ signal: AbortSignal.timeout(3e3) }));
     if (probeRes.ok) {
       const data = await probeRes.json();
       if (Array.isArray(data.models) && data.models.length) {
@@ -2170,24 +2118,59 @@ app.post("/admin/nodes/bulk-verify", adminAuth, async (req, res) => {
   addAudit("nodes_bulk_verified", "admin", "nodes", "bulk", { count, mode, method });
   res.json({ status: "completed", count });
 });
-app.post("/admin/nodes/:id/health-check", adminAuth, async (req, res) => {
-  const node = nodes.get(req.params.id);
-  if (!node) return res.status(404).json({ error: "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+app.post("/admin/nodes/bulk-health-check", adminAuth, async (req, res) => {
+  const { node_ids = [], all = false } = req.body || {};
+  let targets;
+  if (all === true) {
+    targets = Array.from(nodes.values());
+  } else {
+    targets = Array.from(new Set((Array.isArray(node_ids) ? node_ids : []).map(String))).map((id) => nodes.get(id)).filter(Boolean);
+  }
+  if (!targets.length) {
+    return res.json({ status: "completed", checked: 0, results: [] });
+  }
+  const CONCURRENCY = 5;
+  const queue = [...targets];
+  const results = [];
+  const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
+    while (queue.length) {
+      const node = queue.shift();
+      try {
+        const r = await runNodeHealthCheck(node);
+        results.push({ node_id: node.node_id, ...r });
+      } catch (err) {
+        results.push({ node_id: node.node_id, status: "unhealthy", latency_ms: 0, error: String(err?.message || err) });
+      }
+    }
+  });
+  await Promise.all(workers);
+  addAudit("nodes_bulk_health_check", "admin", "nodes", "bulk", {
+    count: results.length,
+    all: all === true,
+    healthy: results.filter((r) => r.status === "healthy").length,
+    degraded: results.filter((r) => r.status === "degraded").length,
+    unhealthy: results.filter((r) => r.status === "unhealthy").length
+  });
+  res.json({ status: "completed", checked: results.length, results });
+});
+async function runNodeHealthCheck(node) {
   const start = Date.now();
   let status = "unhealthy";
   let latency = 0;
   let errorMsg;
   try {
-    const probeRes = await fetch(`${node.endpoint}/api/version`, {
-      signal: AbortSignal.timeout(4e3)
-    });
+    const { res: probeRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, "")}/api/version`, {
+      method: "GET",
+      timeoutMs: 4e3
+    }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
     latency = Date.now() - start;
     if (probeRes.ok) {
       status = latency > 600 ? "degraded" : "healthy";
       try {
-        const tagsRes = await fetch(`${node.endpoint}/api/tags`, {
-          signal: AbortSignal.timeout(3e3)
-        });
+        const { res: tagsRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, "")}/api/tags`, {
+          method: "GET",
+          timeoutMs: 3e3
+        }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
         if (tagsRes.ok) {
           const tData = await tagsRes.json();
           if (Array.isArray(tData.models) && tData.models.length) {
@@ -2202,7 +2185,7 @@ app.post("/admin/nodes/:id/health-check", adminAuth, async (req, res) => {
   } catch (err) {
     latency = Date.now() - start;
     status = "unhealthy";
-    errorMsg = err.message;
+    errorMsg = err?.message === "fetch failed" ? describeFetchError(err) : String(err?.message || err);
   }
   node.latency_ms = latency;
   node.ewma_latency_ms = node.ewma_latency_ms > 0 ? Math.round(node.ewma_latency_ms * 0.7 + latency * 0.3) : latency;
@@ -2218,12 +2201,336 @@ app.post("/admin/nodes/:id/health-check", adminAuth, async (req, res) => {
     models: node.models,
     error: errorMsg
   });
+  return { status, latency_ms: latency, models: node.models || [], error: errorMsg };
+}
+app.post("/admin/nodes/:id/health-check", adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+  if (typeof req.body?.insecure_tls === "boolean" && req.body.insecure_tls !== node.insecure_tls) {
+    node.insecure_tls = req.body.insecure_tls;
+    addAudit("node_insecure_tls_updated", "admin", "node", node.node_id, { insecure_tls: node.insecure_tls });
+  }
+  const r = await runNodeHealthCheck(node);
+  res.json({ ...r, node_id: node.node_id });
+});
+function describeFetchError(err) {
+  const cause = err?.cause;
+  const code = cause?.code || err?.code || "";
+  const reason = cause?.message || cause || "";
+  switch (code) {
+    case "ENOTFOUND":
+      return `\u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0440\u0430\u0437\u0440\u0435\u0448\u0438\u0442\u044C \u0430\u0434\u0440\u0435\u0441 \u0443\u0437\u043B\u0430 (DNS${reason ? `: ${reason}` : ""})`;
+    case "ECONNREFUSED":
+      return `\u0443\u0437\u0435\u043B \u043E\u0442\u0432\u0435\u0440\u0433 \u0441\u043E\u0435\u0434\u0438\u043D\u0435\u043D\u0438\u0435 (\u043F\u043E\u0440\u0442 \u0437\u0430\u043A\u0440\u044B\u0442 \u0438\u043B\u0438 Ollama \u043D\u0435 \u0437\u0430\u043F\u0443\u0449\u0435\u043D${reason ? `: ${reason}` : ""})`;
+    case "EHOSTUNREACH":
+    case "ENETUNREACH":
+    case "ENETDOWN":
+    case "ECONNRESET":
+      return `\u0441\u0435\u0442\u044C \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0430 \u0438\u043B\u0438 \u0441\u043E\u0435\u0434\u0438\u043D\u0435\u043D\u0438\u0435 \u0441\u0431\u0440\u043E\u0448\u0435\u043D\u043E (${code})`;
+    case "UND_ERR_CONNECT_TIMEOUT":
+    case "UND_ERR_HEADERS_TIMEOUT":
+    case "UND_ERR_BODY_TIMEOUT":
+      return `\u043F\u0440\u0435\u0432\u044B\u0448\u0435\u043D \u0442\u0430\u0439\u043C\u0430\u0443\u0442 \u0441\u043E\u0435\u0434\u0438\u043D\u0435\u043D\u0438\u044F \u0441 \u0443\u0437\u043B\u043E\u043C (${code})`;
+    case "TimeoutError":
+    case "AbortError":
+      return "\u0442\u0430\u0439\u043C\u0430\u0443\u0442 \u0437\u0430\u043F\u0440\u043E\u0441\u0430 \u043A \u0443\u0437\u043B\u0443";
+    case "CERT_HAS_EXPIRED":
+    case "DEPTH_ZERO_SELF_SIGNED_CERT":
+    case "SELF_SIGNED_CERT":
+    case "UNABLE_TO_VERIFY_LEAF_SIGNATURE":
+    case "ERR_TLS_CERT_ALTNAME_INVALID":
+    case "HR_BAD_VERIFY":
+      return `\u043E\u0448\u0438\u0431\u043A\u0430 TLS-\u0441\u0435\u0440\u0442\u0438\u0444\u0438\u043A\u0430\u0442\u0430 \u0443\u0437\u043B\u0430 (${code || reason})`;
+    default:
+      return [code, String(reason || err?.message || "\u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u0430\u044F \u0441\u0435\u0442\u0435\u0432\u0430\u044F \u043E\u0448\u0438\u0431\u043A\u0430")].filter(Boolean).join(": ");
+  }
+}
+app.post("/admin/nodes/:id/chat", adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+  const incomingMessages = Array.isArray(req.body?.messages) && req.body.messages.length ? req.body.messages : [{ role: "user", content: String(req.body?.message || "").trim() }];
+  const lastUser = [...incomingMessages].reverse().find((m) => m && m.role === "user");
+  const message = String(lastUser?.content || "").trim();
+  if (!message) return res.status(400).json({ error: "\u041F\u0443\u0441\u0442\u043E\u0435 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435" });
+  if (!node.endpoint || !/^https?:\/\//i.test(node.endpoint)) {
+    return res.status(400).json({
+      error: `\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 endpoint \u0443\u0437\u043B\u0430: ${node.endpoint || "(\u043F\u0443\u0441\u0442\u043E)"}. \u041E\u0442\u0440\u0435\u0434\u0430\u043A\u0442\u0438\u0440\u0443\u0439\u0442\u0435 \u0443\u0437\u0435\u043B \u2014 \u0430\u0434\u0440\u0435\u0441 \u0434\u043E\u043B\u0436\u0435\u043D \u043D\u0430\u0447\u0438\u043D\u0430\u0442\u044C\u0441\u044F \u0441 http:// \u0438\u043B\u0438 https://`
+    });
+  }
+  const model = req.body?.model || Array.isArray(node.models) && node.models[0] || "llama3";
+  const messages = incomingMessages.map((m) => ({ role: m.role || "user", content: String(m.content ?? "") }));
+  const start = Date.now();
+  node.active_connections++;
+  try {
+    const { res: upstreamRes, tlsInsecureUsed } = await nodeFetch(
+      `${node.endpoint.replace(/\/+$/, "")}/api/chat`,
+      {
+        method: "POST",
+        headers: upstreamHeaders(req),
+        body: JSON.stringify({ model, messages, stream: false }),
+        timeoutMs: 12e4
+      },
+      { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true }
+    );
+    if (!upstreamRes.ok) {
+      const text = await upstreamRes.text().catch(() => "");
+      let detail = text.slice(0, 300);
+      try {
+        detail = String(JSON.parse(text)?.error || detail);
+      } catch {
+      }
+      throw new Error(`\u0423\u0437\u0435\u043B \u043E\u0442\u0432\u0435\u0442\u0438\u043B HTTP ${upstreamRes.status}${detail ? `: ${detail}` : ""}`);
+    }
+    const data = await upstreamRes.json();
+    const reply = typeof data.message?.content === "string" ? data.message.content : typeof data.response === "string" ? data.response : "";
+    const latency = Date.now() - start;
+    node.latency_ms = latency;
+    node.ewma_latency_ms = node.ewma_latency_ms ? Math.round(node.ewma_latency_ms * 0.7 + latency * 0.3) : latency;
+    node.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+    res.json({
+      reply,
+      model: data.model || model,
+      node_id: node.node_id,
+      latency_ms: latency,
+      done: data.done !== false,
+      ...tlsInsecureUsed ? { warning: "\u0438\u0441\u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u043D\u043E \u043D\u0435\u043F\u0440\u043E\u0432\u0435\u0440\u044F\u0435\u043C\u043E\u0435 TLS-\u0441\u043E\u0435\u0434\u0438\u043D\u0435\u043D\u0438\u0435 \u0441 \u0443\u0437\u043B\u043E\u043C (\u0441\u0430\u043C\u043E\u043F\u043E\u0434\u043F\u0438\u0441\u0430\u043D\u043D\u044B\u0439 \u0441\u0435\u0440\u0442\u0438\u0444\u0438\u043A\u0430\u0442)" } : {}
+    });
+    if (tlsInsecureUsed) {
+      addAudit("node_chat_tls_fallback", "admin", "node", node.node_id, { endpoint: node.endpoint });
+    }
+  } catch (err) {
+    addAudit("node_chat_error", "admin", "node", node.node_id, { error: err?.message, cause: err?.cause?.code });
+    const isTimeout = err?.name === "TimeoutError" || err?.cause?.name === "TimeoutError";
+    const friendlyBase = isTimeout ? `\u0423\u0437\u0435\u043B \u043D\u0435 \u043E\u0442\u0432\u0435\u0442\u0438\u043B \u0437\u0430 120 \u0441 \u043F\u043E \u0430\u0434\u0440\u0435\u0441\u0443 ${node.endpoint}. \u041C\u043E\u0434\u0435\u043B\u044C \u043C\u043E\u0433\u043B\u0430 \u0435\u0449\u0451 \u043D\u0435 \u0431\u044B\u0442\u044C \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043D\u0430 \u0432 \u043F\u0430\u043C\u044F\u0442\u044C (\u043F\u0435\u0440\u0432\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441 \u043A \u043A\u0440\u0443\u043F\u043D\u043E\u0439 \u043C\u043E\u0434\u0435\u043B\u0438 \u043A\u0430\u0447\u0430\u0435\u0442 \u0435\u0451 \u043C\u0438\u043D\u0443\u0442\u044B). \u041F\u043E\u0432\u0442\u043E\u0440\u0438\u0442\u0435 \u043E\u0442\u043F\u0440\u0430\u0432\u043A\u0443 \u2014 \u0432\u0442\u043E\u0440\u043E\u0439 \u0437\u0430\u043F\u0440\u043E\u0441 \u043E\u0431\u044B\u0447\u043D\u043E \u0431\u044B\u0441\u0442\u0440\u0435\u0435.` : String(err?.message || "") === "fetch failed" ? `\u0427\u0430\u0442 \u0441 \u0443\u0437\u043B\u043E\u043C \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D: \u0443\u0437\u0435\u043B \u043D\u0435 \u043E\u0442\u0432\u0435\u0447\u0430\u0435\u0442 \u043F\u043E \u0430\u0434\u0440\u0435\u0441\u0443 ${node.endpoint} (${describeFetchError(err)}). \u041F\u043E\u0432\u0442\u043E\u0440\u0438\u0442\u0435 \u043E\u0442\u043F\u0440\u0430\u0432\u043A\u0443 \u2014 \u0448\u043B\u044E\u0437 \u0443\u0436\u0435 \u0441\u0434\u0435\u043B\u0430\u043B \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438\u0439 \u043F\u043E\u0432\u0442\u043E\u0440 \u043F\u0440\u0438 \u0440\u0430\u0437\u0440\u044B\u0432\u0435 \u0441\u043E\u0435\u0434\u0438\u043D\u0435\u043D\u0438\u044F.` : `\u0427\u0430\u0442 \u0441 \u0443\u0437\u043B\u043E\u043C \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D: ${err?.message || "\u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u0430\u044F \u043E\u0448\u0438\u0431\u043A\u0430"}`;
+    const tlsHint = /TLS-сертификата|SELF_SIGNED/i.test(friendlyBase) ? " \u0421\u043E\u0432\u0435\u0442: \u0432\u043A\u043B\u044E\u0447\u0438\u0442\u0435 \u043D\u0430 \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0435 \u0443\u0437\u043B\u0430 \xAB\u0414\u043E\u0432\u0435\u0440\u044F\u0442\u044C \u0441\u0430\u043C\u043E\u043F\u043E\u0434\u043F\u0438\u0441\u0430\u043D\u043D\u043E\u043C\u0443 TLS\xBB \u0438 \u043F\u043E\u0432\u0442\u043E\u0440\u0438\u0442\u0435 \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0443 \u0437\u0434\u043E\u0440\u043E\u0432\u044C\u044F." : "";
+    const friendly = friendlyBase + tlsHint;
+    res.status(502).json({ error: friendly });
+  } finally {
+    node.active_connections = Math.max(0, node.active_connections - 1);
+  }
+});
+app.get("/admin/nodes/:id/models", adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+  let models = Array.isArray(node.models) ? node.models : [];
+  let fetched = false;
+  if (!models.length) {
+    try {
+      const { res: tagsRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, "")}/api/tags`, {
+        method: "GET",
+        timeoutMs: 15e3
+      }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
+      if (tagsRes.ok) {
+        const tData = await tagsRes.json();
+        if (Array.isArray(tData.models)) {
+          models = tData.models.map((m) => m.name || m.model).filter(Boolean);
+          fetched = true;
+          if (models.length) {
+            node.models = models;
+            node.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+            await persistNode(node);
+          }
+        }
+      }
+    } catch (err) {
+      return res.status(502).json({ error: `\u0423\u0437\u0435\u043B \u043D\u0435 \u043E\u0442\u0432\u0435\u0447\u0430\u0435\u0442: ${err.message}`, models: [] });
+    }
+  }
+  res.json({ node_id: node.node_id, models, fetched });
+});
+var NODE_PROXY_TIMEOUT_MS = 12e4;
+var NODE_PROXY_GET_TIMEOUT_MS = 3e4;
+var NODE_PROXY_ROUTES = {
+  // native API
+  "/api/tags": { method: "GET", upstream: "/api/tags" },
+  "/api/ps": { method: "GET", upstream: "/api/ps" },
+  "/api/version": { method: "GET", upstream: "/api/version" },
+  "/api/show": { method: "GET", upstream: "/api/show" },
+  // ?model= или /show/:model
+  "/api/usage": { method: "GET", upstream: "/api/usage" },
+  "/api/balance": { method: "GET", upstream: "/api/balance" },
+  "/api/generate": { method: "POST", upstream: "/api/generate" },
+  "/api/chat": { method: "POST", upstream: "/api/chat" },
+  "/api/embed": { method: "POST", upstream: "/api/embed" },
+  "/api/create": { method: "POST", upstream: "/api/create" },
+  "/api/copy": { method: "POST", upstream: "/api/copy" },
+  "/api/pull": { method: "POST", upstream: "/api/pull" },
+  "/api/push": { method: "POST", upstream: "/api/push" },
+  // В нативном Ollama /api/delete — это POST (docs: DELETE request via POST body)
+  "/api/delete": { method: "POST", upstream: "/api/delete" },
+  // OpenAI-совместимый API (https://docs.ollama.com/api/openai-compatibility)
+  "/v1/models": { method: "GET", upstream: "/v1/models" },
+  "/v1/chat/completions": { method: "POST", upstream: "/v1/chat/completions" },
+  "/v1/responses": { method: "POST", upstream: "/v1/responses" },
+  "/v1/systemone": { method: "GET", upstream: "/v1/systemone" }
+};
+app.all("/admin/nodes/:id/proxy/*", adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+  if (!node.endpoint || !/^https?:\/\//i.test(node.endpoint)) {
+    return res.status(400).json({ error: `\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 endpoint \u0443\u0437\u043B\u0430: ${node.endpoint || "(\u043F\u0443\u0441\u0442\u043E)"}` });
+  }
+  const subPath = "/" + String(req.params[0] ?? "").replace(/^\/+/, "");
+  const httpMethod = req.method.toUpperCase();
+  let routeKey = subPath;
+  let upstreamSuffix = "";
+  const showDyn = /^\/api\/show\/(.+)$/.exec(subPath);
+  if (showDyn) {
+    routeKey = "/api/show";
+    upstreamSuffix = `?model=${encodeURIComponent(showDyn[1])}`;
+  }
+  const modelsDyn = /^\/v1\/models\/(.+)$/.exec(subPath);
+  if (modelsDyn) {
+    routeKey = "/v1/models";
+    upstreamSuffix = `/${encodeURIComponent(modelsDyn[1])}`;
+  }
+  const dynAlias = /^(\/(?:api|v1)\/[^?]+?)\/([^/]+)$/.exec(subPath);
+  if (!NODE_PROXY_ROUTES[routeKey] && dynAlias) {
+    const aliasBase = NODE_PROXY_ROUTES[dynAlias[1]];
+    if (aliasBase) {
+      routeKey = dynAlias[1];
+      if (routeKey === "/api/show") upstreamSuffix = `?model=${encodeURIComponent(dynAlias[2])}`;
+      else upstreamSuffix = `/${encodeURIComponent(dynAlias[2])}`;
+    }
+  }
+  const allowed = NODE_PROXY_ROUTES[routeKey];
+  if (!allowed) {
+    return res.status(400).json({
+      error: `\u041F\u0443\u0442\u044C ${subPath} \u043D\u0435 \u0432\u0445\u043E\u0434\u0438\u0442 \u0432 \u0441\u043F\u0438\u0441\u043E\u043A \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u043C\u044B\u0445 Ollama-\u044D\u043D\u0434\u043F\u043E\u0438\u043D\u0442\u043E\u0432`,
+      supported: Object.keys(NODE_PROXY_ROUTES)
+    });
+  }
+  const methodOk = allowed.method === "POST" ? httpMethod === "POST" || routeKey === "/api/delete" && httpMethod === "DELETE" : httpMethod === "GET";
+  if (!methodOk) {
+    return res.status(405).json({ error: `${httpMethod} ${subPath} \u043D\u0435 \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044F, \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0439\u0442\u0435 ${allowed.method}` });
+  }
+  const base = node.endpoint.replace(/\/+$/, "");
+  const upstreamUrl = `${base}${allowed.upstream}${upstreamSuffix}`;
+  const sendBody = allowed.method === "POST" && httpMethod !== "GET";
+  const timeoutMs = sendBody ? NODE_PROXY_TIMEOUT_MS : NODE_PROXY_GET_TIMEOUT_MS;
+  try {
+    const { res: upstreamRes } = await nodeFetch(upstreamUrl, {
+      method: sendBody ? "POST" : "GET",
+      headers: upstreamHeaders(req, { "Content-Type": "application/json" }),
+      ...sendBody && req.body !== void 0 ? { body: JSON.stringify(req.body ?? {}) } : {},
+      timeoutMs
+    }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
+    const ct = upstreamRes.headers.get("content-type") || "";
+    res.status(upstreamRes.status);
+    if (ct.includes("application/json")) {
+      res.json(await upstreamRes.json().catch(() => ({ raw: "" })));
+    } else {
+      res.type(ct || "text/plain").send(await upstreamRes.text().catch(() => ""));
+    }
+    addAudit("node_api_proxy", "admin", "node", node.node_id, { path: subPath, status: upstreamRes.status });
+  } catch (err) {
+    addAudit("node_api_proxy_error", "admin", "node", node.node_id, { path: subPath, error: err?.message, cause: err?.cause?.code });
+    const isTimeout = err?.name === "TimeoutError" || err?.cause?.name === "TimeoutError";
+    res.status(502).json({
+      error: isTimeout ? `\u0423\u0437\u0435\u043B \u043D\u0435 \u043E\u0442\u0432\u0435\u0442\u0438\u043B \u0437\u0430 ${Math.round(timeoutMs / 1e3)} \u0441 \u043F\u043E \u0430\u0434\u0440\u0435\u0441\u0443 ${node.endpoint}` : `\u041F\u0440\u043E\u043A\u0441\u0438-\u0437\u0430\u043F\u0440\u043E\u0441 \u043A \u0443\u0437\u043B\u0443 \u043D\u0435 \u0432\u044B\u043F\u043E\u043B\u043D\u0435\u043D: ${err?.message === "fetch failed" ? describeFetchError(err) : err?.message || "\u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u0430\u044F \u043E\u0448\u0438\u0431\u043A\u0430"}`
+    });
+  }
+});
+var nodeProxyAlias = (path2, route) => {
+  const handler = async (req, res) => {
+    const node = nodes.get(req.params.id);
+    if (!node) return res.status(404).json({ error: "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+    if (!node.endpoint || !/^https?:\/\//i.test(node.endpoint)) {
+      return res.status(400).json({ error: `\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 endpoint \u0443\u0437\u043B\u0430: ${node.endpoint || "(\u043F\u0443\u0441\u0442\u043E)"}` });
+    }
+    const isGet = route.method === "GET";
+    const timeoutMs = isGet ? NODE_PROXY_GET_TIMEOUT_MS : NODE_PROXY_TIMEOUT_MS;
+    let upstreamPath = route.upstream;
+    if (upstreamPath === "/api/show" && req.params.model) {
+      upstreamPath = `/api/show?model=${encodeURIComponent(String(req.params.model))}`;
+    }
+    try {
+      const { res: upstreamRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, "")}${upstreamPath}`, {
+        method: route.method,
+        headers: upstreamHeaders(req, { "Content-Type": "application/json" }),
+        ...!isGet && req.body !== void 0 ? { body: JSON.stringify(req.body ?? {}) } : {},
+        timeoutMs
+      }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
+      res.status(upstreamRes.status);
+      const data = await upstreamRes.json().catch(async () => ({ raw: await upstreamRes.text().catch(() => "") }));
+      res.json(data);
+    } catch (err) {
+      const isTimeout = err?.name === "TimeoutError" || err?.cause?.name === "TimeoutError";
+      res.status(502).json({
+        error: isTimeout ? `\u0423\u0437\u0435\u043B \u043D\u0435 \u043E\u0442\u0432\u0435\u0442\u0438\u043B \u0437\u0430 ${Math.round(timeoutMs / 1e3)} \u0441 (${route.upstream})` : `\u0417\u0430\u043F\u0440\u043E\u0441 ${route.upstream} \u043A \u0443\u0437\u043B\u0443 \u043D\u0435 \u0432\u044B\u043F\u043E\u043B\u043D\u0435\u043D: ${err?.message === "fetch failed" ? describeFetchError(err) : err?.message || "\u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u0430\u044F \u043E\u0448\u0438\u0431\u043A\u0430"}`
+      });
+    }
+  };
+  if (route.method === "GET") app.get(`/admin/nodes/:id${path2}`, adminAuth, handler);
+  else app.post(`/admin/nodes/:id${path2}`, adminAuth, handler);
+};
+for (const [p, r] of Object.entries(NODE_PROXY_ROUTES)) {
+  if (p === "/v1/models") continue;
+  nodeProxyAlias(p, r);
+}
+app.get("/admin/nodes/:id/v1/models/:model", adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+  if (!node.endpoint || !/^https?:\/\//i.test(node.endpoint)) {
+    return res.status(400).json({ error: `\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 endpoint \u0443\u0437\u043B\u0430: ${node.endpoint || "(\u043F\u0443\u0441\u0442\u043E)"}` });
+  }
+  try {
+    const { res: upstreamRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, "")}/v1/models/${encodeURIComponent(req.params.model)}`, {
+      method: "GET",
+      headers: upstreamHeaders(req),
+      timeoutMs: NODE_PROXY_GET_TIMEOUT_MS
+    }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
+    res.status(upstreamRes.status).json(await upstreamRes.json().catch(() => ({ raw: "" })));
+  } catch (err) {
+    res.status(502).json({ error: `\u0417\u0430\u043F\u0440\u043E\u0441 /v1/models \u043A \u0443\u0437\u043B\u0443 \u043D\u0435 \u0432\u044B\u043F\u043E\u043B\u043D\u0435\u043D: ${err?.message === "fetch failed" ? describeFetchError(err) : err?.message || "\u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u0430\u044F \u043E\u0448\u0438\u0431\u043A\u0430"}` });
+  }
+});
+app.get("/admin/nodes/:id/api/show/:model", adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+  if (!node.endpoint || !/^https?:\/\//i.test(node.endpoint)) {
+    return res.status(400).json({ error: `\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 endpoint \u0443\u0437\u043B\u0430: ${node.endpoint || "(\u043F\u0443\u0441\u0442\u043E)"}` });
+  }
+  try {
+    const { res: upstreamRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, "")}/api/show?model=${encodeURIComponent(req.params.model)}`, {
+      method: "GET",
+      headers: upstreamHeaders(req),
+      timeoutMs: NODE_PROXY_GET_TIMEOUT_MS
+    }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
+    res.status(upstreamRes.status).json(await upstreamRes.json().catch(() => ({ raw: "" })));
+  } catch (err) {
+    res.status(502).json({ error: `\u0417\u0430\u043F\u0440\u043E\u0441 /api/show \u043A \u0443\u0437\u043B\u0443 \u043D\u0435 \u0432\u044B\u043F\u043E\u043B\u043D\u0435\u043D: ${err?.message === "fetch failed" ? describeFetchError(err) : err?.message || "\u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u0430\u044F \u043E\u0448\u0438\u0431\u043A\u0430"}` });
+  }
+});
+app.delete("/admin/nodes/:id/api/delete", adminAuth, async (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: "\u0423\u0437\u0435\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+  try {
+    const { res: upstreamRes } = await nodeFetch(`${node.endpoint.replace(/\/+$/, "")}/api/delete`, {
+      method: "POST",
+      // Ollama ожидает POST даже для удаления модели
+      headers: upstreamHeaders(req, { "Content-Type": "application/json" }),
+      body: JSON.stringify(req.body ?? {}),
+      timeoutMs: NODE_PROXY_GET_TIMEOUT_MS
+    }, { maxConcurrency: Math.max(1, node.max_concurrency || 4), forceInsecureTls: node.insecure_tls === true });
+    res.status(upstreamRes.status).json(await upstreamRes.json().catch(() => ({ status: `HTTP ${upstreamRes.status}` })));
+  } catch (err) {
+    res.status(502).json({ error: `\u0423\u0434\u0430\u043B\u0435\u043D\u0438\u0435 \u043C\u043E\u0434\u0435\u043B\u0438 \u043D\u0430 \u0443\u0437\u043B\u0435 \u043D\u0435 \u0432\u044B\u043F\u043E\u043B\u043D\u0435\u043D\u043E: ${err?.message === "fetch failed" ? describeFetchError(err) : err?.message || "\u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u0430\u044F \u043E\u0448\u0438\u0431\u043A\u0430"}` });
+  }
+});
+app.get("/admin/ollama/endpoints", adminAuth, (_req, res) => {
   res.json({
-    status,
-    latency_ms: latency,
-    node_id: node.node_id,
-    models: node.models,
-    error: errorMsg
+    docs: ["https://docs.ollama.com/api/introduction", "https://docs.ollama.com/api/openai-compatibility"],
+    per_node_base: "/admin/nodes/{node_id}",
+    endpoints: Object.entries(NODE_PROXY_ROUTES).map(([p, r]) => ({
+      gateway_path: `/admin/nodes/{node_id}${p}`,
+      method: r.method,
+      ollama_path: r.upstream
+    })).concat([
+      { gateway_path: "/admin/nodes/{node_id}/v1/models/{model}", method: "GET", ollama_path: "/v1/models/{model}" },
+      { gateway_path: "/admin/nodes/{node_id}/api/show/{model}", method: "GET", ollama_path: "/api/show?model={model}" },
+      { gateway_path: "/admin/nodes/{node_id}/proxy/*", method: "GET|POST", ollama_path: "<\u043B\u044E\u0431\u043E\u0439 \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u043C\u044B\u0439 \u043F\u0443\u0442\u044C>" }
+    ])
   });
 });
 app.post("/admin/nodes/:id/revoke", adminAuth, async (req, res) => {
@@ -2765,14 +3072,23 @@ app.post("/admin/demo/clear", adminAuth, async (req, res) => {
   const csCnt = consents.size;
   const kCnt = apiKeys.size;
   try {
-    await tx(async (client2) => {
+    if (dbEnabled()) {
+      await tx(async (client2) => {
+        await nodes.clear();
+        await candidates.clear();
+        await blacklist.clear();
+        await consents.clear();
+        await apiKeys.clear();
+        await clearAudit();
+      });
+    } else {
       await nodes.clear();
       await candidates.clear();
       await blacklist.clear();
       await consents.clear();
       await apiKeys.clear();
       await clearAudit();
-    });
+    }
     auditLogs.length = 0;
     rebuildKeyHashIndex();
   } catch (err) {
@@ -2975,7 +3291,7 @@ async function verifyAndEnrollCandidate(cand, options = {}) {
   let latency = 45;
   try {
     const start = Date.now();
-    const probeRes = await fetch(`${endpoint}/api/tags`, { signal: AbortSignal.timeout(3500) });
+    const probeRes = await fetch(`${endpoint}/api/tags`, nodeFetchOpts({ signal: AbortSignal.timeout(3500) }));
     latency = Math.max(1, Date.now() - start);
     if (probeRes.ok) {
       const pData = await probeRes.json();
@@ -3269,6 +3585,107 @@ function getRoutableModels() {
   }
   return Array.from(modelsSet);
 }
+function breakerCfg() {
+  const cfg = currentConfig.circuit_breaker;
+  return {
+    window_seconds: cfg?.window_seconds ?? 60,
+    minimum_requests: cfg?.minimum_requests ?? 10,
+    error_rate_threshold: cfg?.error_rate_threshold ?? 0.5,
+    open_duration_seconds: cfg?.open_duration_seconds ?? 30,
+    half_open_probes: cfg?.half_open_probes ?? 1
+  };
+}
+function routableNodesForModel(targetModel) {
+  return Array.from(nodes.values()).filter((n) => {
+    if (!isModelSupportedByNode(n, targetModel)) return false;
+    if (isBreakerOpen(n.node_id, breakerCfg())) return false;
+    if (canAcceptConnection(n)) return true;
+    return false;
+  });
+}
+function canAcceptConnection(node) {
+  return node.active_connections < Math.max(1, node.max_concurrency || 1);
+}
+function upstreamHeaders(req, extra = {}) {
+  const h = { "Content-Type": "application/json" };
+  const requestId = req.requestId;
+  if (requestId) h["X-FOA-Request-ID"] = requestId;
+  const clientHash = req.clientHash;
+  if (clientHash) h["X-FOA-Client-Hash"] = clientHash;
+  const gatewayHeader = currentConfig.security.forward_client_ip !== true;
+  if (gatewayHeader) h["X-FOA-Gateway"] = GATEWAY_ID;
+  return { ...h, ...extra };
+}
+var nodeFetchOpts = (extra = {}) => insecureTlsEnabled() ? { ...extra, rejectUnauthorized: false } : extra;
+async function callUpstream(req, node, path2, body) {
+  const url = `${node.endpoint.replace(/\/+$/, "")}${path2}`;
+  try {
+    const start = Date.now();
+    const res = await fetch(url, nodeFetchOpts({
+      method: "POST",
+      headers: upstreamHeaders(req),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(12e4),
+      dispatcher: dispatcherFor(node.endpoint, Math.max(1, node.max_concurrency || 4))
+    }));
+    const latency = Date.now() - start;
+    if (res.ok) {
+      recordSuccess(node.node_id, latency, breakerCfg());
+      node.error_rate = 0;
+      node.latency_ms = latency;
+      node.ewma_latency_ms = node.ewma_latency_ms ? Math.round(node.ewma_latency_ms * 0.7 + latency * 0.3) : latency;
+    } else if (res.status >= 500) {
+      recordFailure(node.node_id, breakerCfg());
+      node.error_rate = Math.min(1, (node.error_rate || 0) + 0.1);
+    } else {
+      recordSuccess(node.node_id, latency, breakerCfg());
+    }
+    node.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+    return res;
+  } catch (err) {
+    recordFailure(node.node_id, breakerCfg());
+    node.error_rate = Math.min(1, (node.error_rate || 0) + 0.2);
+    logger.debug("upstream node unreachable", { node: node.node_id, url, error: err.message });
+    return null;
+  }
+}
+async function proxyToPoolPassthrough(req, res, path2, body, targetModel) {
+  const maxAttempts = Math.max(1, currentConfig.routing.retry_attempts || 2);
+  const candidates2 = routableNodesForModel(targetModel);
+  if (!candidates2.length) return false;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const node = selectNode(candidates2, breakerCfg());
+    if (!node) break;
+    const upstream = await callUpstream(req, node, path2, body);
+    if (!upstream) continue;
+    node.active_connections++;
+    try {
+      res.setHeader("X-FOA-Gateway-Node", node.node_id);
+      res.status(upstream.status);
+      const ct = upstream.headers.get("content-type");
+      if (ct) res.setHeader("Content-Type", ct);
+      if (upstream.body) {
+        const reader = upstream.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+      }
+      res.end();
+      return true;
+    } catch {
+      try {
+        res.destroy();
+      } catch {
+      }
+      return true;
+    } finally {
+      node.active_connections = Math.max(0, node.active_connections - 1);
+    }
+  }
+  return false;
+}
 app.get("/api/version", userAuth, (req, res) => {
   res.json({ version: "0.1.32" });
 });
@@ -3313,47 +3730,17 @@ app.get("/api/tags", userAuth, requireScopes("ollama:read"), applyLimits(), (req
 app.post("/api/generate", userAuth, requireScopes("ollama:generate"), applyLimits({ perModel: true, body: "prompt" }), async (req, res) => {
   const { model, prompt, stream } = req.body;
   const targetModel = model || "llama3:8b";
-  let routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
+  const routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
   if (!routable.length) {
     const available = getRoutableModels();
     return res.status(503).json({
       error: `\u041C\u043E\u0434\u0435\u043B\u044C '${targetModel}' \u0432\u0440\u0435\u043C\u0435\u043D\u043D\u043E \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0430 \u0432 \u043F\u0443\u043B\u0435 \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u043E\u0432\u0430\u043D\u043D\u044B\u0445 \u0443\u0437\u043B\u043E\u0432. \u0414\u043E\u0441\u0442\u0443\u043F\u043D\u044B\u0435 \u043C\u043E\u0434\u0435\u043B\u0438: ${available.slice(0, 10).join(", ")}`
     });
   }
-  const selectedNode = routable.sort((a, b) => a.active_connections - b.active_connections)[0];
-  selectedNode.active_connections++;
-  try {
-    const upstreamRes = await fetch(`${selectedNode.endpoint}/api/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(req.body),
-      signal: AbortSignal.timeout(4e3)
-    });
-    if (upstreamRes.ok) {
-      res.status(upstreamRes.status);
-      const ct = upstreamRes.headers.get("content-type");
-      if (ct) res.setHeader("Content-Type", ct);
-      if (stream === false) {
-        selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
-        const data = await upstreamRes.json();
-        return res.json(data);
-      }
-      if (upstreamRes.body) {
-        const reader = upstreamRes.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(value);
-        }
-        selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
-        return res.end();
-      }
-    }
-  } catch (err) {
-  }
+  if (await proxyToPoolPassthrough(req, res, "/api/generate", req.body, targetModel)) return;
+  const selectedNode = routable[0];
   const responseText = `[\u041E\u0442\u0432\u0435\u0442 \u0448\u043B\u044E\u0437\u0430 FOA \u0447\u0435\u0440\u0435\u0437 \u0443\u0437\u0435\u043B ${selectedNode.display_name}]: \u0417\u0430\u043F\u0440\u043E\u0441 \u043A \u043C\u043E\u0434\u0435\u043B\u0438 ${targetModel} \u0443\u0441\u043F\u0435\u0448\u043D\u043E \u043E\u0431\u0440\u0430\u0431\u043E\u0442\u0430\u043D. \u0412\u0430\u0448 \u0437\u0430\u043F\u0440\u043E\u0441: "${(prompt || "").slice(0, 100)}..."`;
   if (stream === false) {
-    selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
     return res.json({
       model: targetModel,
       created_at: (/* @__PURE__ */ new Date()).toISOString(),
@@ -3383,7 +3770,6 @@ app.post("/api/generate", userAuth, requireScopes("ollama:generate"), applyLimit
       idx++;
     } else {
       clearInterval(interval);
-      selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
       const finalChunk = {
         model: targetModel,
         created_at: (/* @__PURE__ */ new Date()).toISOString(),
@@ -3400,48 +3786,18 @@ app.post("/api/generate", userAuth, requireScopes("ollama:generate"), applyLimit
 app.post("/api/chat", userAuth, requireScopes("ollama:generate"), applyLimits({ perModel: true, body: "chat" }), async (req, res) => {
   const { model, messages, stream } = req.body;
   const targetModel = model || "llama3:8b";
-  let routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
+  const routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
   if (!routable.length) {
     const available = getRoutableModels();
     return res.status(503).json({
       error: `\u041C\u043E\u0434\u0435\u043B\u044C '${targetModel}' \u0432\u0440\u0435\u043C\u0435\u043D\u043D\u043E \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0430 \u0432 \u043F\u0443\u043B\u0435 \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u043E\u0432\u0430\u043D\u043D\u044B\u0445 \u0443\u0437\u043B\u043E\u0432. \u0414\u043E\u0441\u0442\u0443\u043F\u043D\u044B\u0435 \u043C\u043E\u0434\u0435\u043B\u0438: ${available.slice(0, 10).join(", ")}`
     });
   }
-  const selectedNode = routable.sort((a, b) => a.active_connections - b.active_connections)[0];
-  selectedNode.active_connections++;
-  try {
-    const upstreamRes = await fetch(`${selectedNode.endpoint}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(req.body),
-      signal: AbortSignal.timeout(4e3)
-    });
-    if (upstreamRes.ok) {
-      res.status(upstreamRes.status);
-      const ct = upstreamRes.headers.get("content-type");
-      if (ct) res.setHeader("Content-Type", ct);
-      if (stream === false) {
-        selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
-        const data = await upstreamRes.json();
-        return res.json(data);
-      }
-      if (upstreamRes.body) {
-        const reader = upstreamRes.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(value);
-        }
-        selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
-        return res.end();
-      }
-    }
-  } catch (err) {
-  }
+  if (await proxyToPoolPassthrough(req, res, "/api/chat", req.body, targetModel)) return;
+  const selectedNode = routable[0];
   const lastMsg = Array.isArray(messages) && messages.length ? messages[messages.length - 1].content : "\u041F\u0440\u0438\u0432\u0435\u0442";
   const replyContent = `[FOA Gateway / ${selectedNode.display_name}]: \u041E\u0442\u0432\u0435\u0442 \u043D\u0430 \u0432\u0430\u0448\u0435 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435 ("${lastMsg}") \u0447\u0435\u0440\u0435\u0437 \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u043E\u0432\u0430\u043D\u043D\u044B\u0439 \u0443\u0437\u0435\u043B ${selectedNode.endpoint}.`;
   if (stream === false) {
-    selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
     return res.json({
       model: targetModel,
       created_at: (/* @__PURE__ */ new Date()).toISOString(),
@@ -3470,7 +3826,6 @@ app.post("/api/chat", userAuth, requireScopes("ollama:generate"), applyLimits({ 
       idx++;
     } else {
       clearInterval(interval);
-      selectedNode.active_connections = Math.max(0, selectedNode.active_connections - 1);
       res.write(
         JSON.stringify({
           model: targetModel,
@@ -3491,6 +3846,10 @@ app.post("/api/embed", userAuth, requireScopes("ollama:embed", "ollama:generate"
   );
   res.json({ embeddings });
 });
+function pickNodeForModel(model) {
+  const candidates2 = Array.from(nodes.values()).filter((n) => n.routable && isModelSupportedByNode(n, model)).sort((a, b) => (b.effective_weight || 0) - (a.effective_weight || 0));
+  return candidates2[0];
+}
 app.get("/v1/models", userAuth, requireScopes("ollama:read"), applyLimits(), (req, res) => {
   const modelNames = getRoutableModels();
   res.json({
@@ -3506,10 +3865,24 @@ app.get("/v1/models", userAuth, requireScopes("ollama:read"), applyLimits(), (re
     }))
   });
 });
-app.post("/v1/chat/completions", userAuth, requireScopes("ollama:generate"), applyLimits({ perModel: true, body: "openai" }), (req, res) => {
-  const { model, messages, stream } = req.body;
+app.get("/v1/models/:model", userAuth, requireScopes("ollama:read"), applyLimits(), async (req, res) => {
+  const target = pickNodeForModel(req.params.model);
+  if (!target) return sendApiError(req, res, 404, `\u041C\u043E\u0434\u0435\u043B\u044C '${req.params.model}' \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430 \u043D\u0438 \u043D\u0430 \u043E\u0434\u043D\u043E\u043C \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u043E\u043C \u0443\u0437\u043B\u0435`);
+  try {
+    const { res: upstreamRes } = await nodeFetch(`${target.endpoint.replace(/\/+$/, "")}/v1/models/${encodeURIComponent(req.params.model)}`, {
+      method: "GET",
+      headers: upstreamHeaders(req),
+      timeoutMs: NODE_PROXY_GET_TIMEOUT_MS
+    }, { maxConcurrency: Math.max(1, target.max_concurrency || 4), forceInsecureTls: target.insecure_tls === true });
+    res.status(upstreamRes.status).json(await upstreamRes.json().catch(() => ({ raw: "" })));
+  } catch (err) {
+    res.status(502).json({ error: `\u0417\u0430\u043F\u0440\u043E\u0441 /v1/models \u043A \u0443\u0437\u043B\u0443 \u043D\u0435 \u0432\u044B\u043F\u043E\u043B\u043D\u0435\u043D: ${err?.message === "fetch failed" ? describeFetchError(err) : err?.message || "\u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u0430\u044F \u043E\u0448\u0438\u0431\u043A\u0430"}` });
+  }
+});
+app.post("/v1/chat/completions", userAuth, requireScopes("ollama:generate"), applyLimits({ perModel: true, body: "openai" }), async (req, res) => {
+  const { model, messages } = req.body;
   const targetModel = model || "llama3:8b";
-  let routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
+  const routable = Array.from(nodes.values()).filter((n) => isModelSupportedByNode(n, targetModel));
   if (!routable.length) {
     const available = getRoutableModels();
     return res.status(503).json({
@@ -3519,10 +3892,11 @@ app.post("/v1/chat/completions", userAuth, requireScopes("ollama:generate"), app
       }
     });
   }
+  if (await proxyToPoolPassthrough(req, res, "/v1/chat/completions", req.body, targetModel)) return;
   const selectedNode = routable[0];
   const lastMsg = Array.isArray(messages) && messages.length ? messages[messages.length - 1].content : "";
   const text = `[FOA Gateway via ${selectedNode.display_name}]: Processed OpenAI-compatible completion for: "${lastMsg}"`;
-  if (stream) {
+  if (req.body.stream) {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -3596,14 +3970,14 @@ async function startBackgroundLoops() {
     });
   }
   setInterval(async () => {
-    if (!await amILeader(GATEWAY_ID)) return;
+    if (!await amILeader()) return;
     const checks = Array.from(nodes.values()).map(async (node) => {
       try {
         const start = Date.now();
-        const res = await fetch(`${node.endpoint}/api/tags`, {
+        const res = await fetch(`${node.endpoint}/api/tags`, nodeFetchOpts({
           signal: AbortSignal.timeout(3500),
-          dispatcher: dispatcherFor(node.endpoint, node.max_concurrency || 4)
-        });
+          ...dispatcherFor(node.endpoint, node.max_concurrency || 4)
+        }));
         const latency = Date.now() - start;
         if (res.ok) {
           recordSuccess(node.node_id, latency, breakerConfig());
@@ -3617,7 +3991,12 @@ async function startBackgroundLoops() {
     await Promise.allSettled(checks);
   }, 15e3).unref();
   setInterval(async () => {
-    if (!await amILeader(GATEWAY_ID)) return;
+    if (!await amILeader()) return;
+    await sampleNodeMetricsOnce().catch(() => {
+    });
+  }, NODE_METRICS_INTERVAL_MS).unref();
+  setInterval(async () => {
+    if (!await amILeader()) return;
     const now = Date.now();
     for (const cand of candidates.values()) {
       const observedAt = cand.observed_at ? Date.parse(cand.observed_at) : NaN;
@@ -3658,8 +4037,14 @@ async function main() {
     console.log(`CORS allowed origins: ${allowedCorsOrigins.join(", ") || "*"}`);
   });
 }
-main();
+var isDirectRun = process.argv[1] && import_meta.url === `file://${process.argv[1]}`;
+if (isDirectRun) {
+  main();
+}
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
-  reloadEnv
+  bootstrap,
+  foaApp,
+  reloadEnv,
+  startBackgroundLoops
 });
