@@ -9,8 +9,8 @@
     "build": "esbuild server.ts --bundle --platform=node --format=cjs --packages=external --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
     "lint": "tsc --noEmit",
-    "test": "node --test test/",
-    "test:unit": "node --test test/"
+    "test": "node --import tsx --test test/",
+    "test:unit": "node --import tsx --test test/"
   },
   "dependencies": {
     "cors": "^2.8.5",
