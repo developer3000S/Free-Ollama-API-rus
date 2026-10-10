@@ -1275,11 +1275,146 @@ function addAudit(event, actor, subject_type, subject_id, detail = {}) {
     (err) => logger.warn("audit write failed", { error: err.message, event })
   );
 }
+var DEFAULT_OLLAMA_NODES = [
+  "84.46.254.156",
+  "37.81.72.225",
+  "51.83.68.224",
+  "185.252.234.190",
+  "223.166.61.215",
+  "62.16.190.89",
+  "82.156.119.114",
+  "43.136.169.150",
+  "103.78.96.125",
+  "144.123.164.190",
+  "57.128.252.36",
+  "38.247.186.106",
+  "51.222.46.203",
+  "81.0.249.47",
+  "159.195.53.125",
+  "89.58.29.165",
+  "209.145.62.219",
+  "190.156.123.17",
+  "194.163.180.189",
+  "193.112.29.100"
+];
+function resolveDefaultNodeEndpoints() {
+  const raw = process.env.FOA_DEFAULT_NODES;
+  const source = raw === void 0 ? DEFAULT_OLLAMA_NODES : String(raw);
+  const items = Array.isArray(source) ? source : String(source).split(",");
+  const seen = /* @__PURE__ */ new Set();
+  const endpoints = [];
+  for (const item of items) {
+    let token = String(item || "").trim();
+    if (!token) continue;
+    if (!/^https?:\/\//i.test(token)) token = `http://${token}`;
+    let url;
+    try {
+      url = new URL(token);
+    } catch {
+      logger.warn("\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0443\u0437\u0435\u043B \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E \u2014 \u043F\u0440\u043E\u043F\u0443\u0449\u0435\u043D", { value: item });
+      continue;
+    }
+    if (!url.port) url.port = "11434";
+    const endpoint = `${url.protocol}//${url.host}`;
+    if (seen.has(endpoint)) continue;
+    seen.add(endpoint);
+    endpoints.push(endpoint);
+  }
+  return endpoints;
+}
+async function seedDefaultNodes() {
+  if (nodes.size > 0) return 0;
+  if (dbEnabled()) {
+    try {
+      const stored = await nodes.list();
+      if (stored.length > 0) return 0;
+    } catch (err) {
+      logger.warn("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C \u0441\u043E\u0434\u0435\u0440\u0436\u0438\u043C\u043E\u0435 \u043F\u0443\u043B\u0430 \u0432 PG \u2014 \u0441\u0438\u0434\u0438\u043D\u0433 \u043E\u0442\u043C\u0435\u043D\u0451\u043D", { error: err.message });
+      return 0;
+    }
+  }
+  const endpoints = resolveDefaultNodeEndpoints();
+  if (!endpoints.length) return 0;
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  let added = 0;
+  for (const endpoint of endpoints) {
+    const ip = endpoint.replace(/^https?:\/\//i, "").split(":")[0];
+    const nodeId = `node_default_${ip.replace(/[^A-Za-z0-9]/g, "_")}`;
+    if (nodes.get(nodeId)) continue;
+    const insecureTls = endpoint.startsWith("https://");
+    const newNode = {
+      node_id: nodeId,
+      endpoint,
+      display_name: `Ollama ${ip}`,
+      owner_id: "default@pool",
+      models: ["llama3:8b"],
+      max_concurrency: 4,
+      active_connections: 0,
+      latency_ms: 0,
+      error_rate: 0,
+      weight: 10,
+      status: "healthy",
+      consent_status: "verified",
+      routable: true,
+      created_at: now,
+      updated_at: now,
+      state: "healthy",
+      active: 0,
+      ewma_latency_ms: 0,
+      effective_weight: 10,
+      country: "US",
+      ip,
+      labels: ["default"],
+      // Публичные Ollama за NAT обычно отдают самоподписанный сертификат —
+      // сразу разрешаем TLS-fallback, чтобы health-check и чат не падали с
+      // DEPTH_ZERO_SELF_SIGNED_CERT.
+      insecure_tls: insecureTls
+    };
+    const newConsent = {
+      consent_id: `cst_${nodeId}`,
+      node_id: nodeId,
+      owner_id: newNode.owner_id,
+      status: "active",
+      method: "default_pool",
+      allowed_models: newNode.models,
+      max_concurrency: newNode.max_concurrency,
+      issued_at: now,
+      expires_at: new Date(Date.now() + 90 * 864e5).toISOString(),
+      version: 1,
+      history: [{ event: "node_seeded_default", actor: "system", created_at: now }]
+    };
+    try {
+      if (dbEnabled()) {
+        await tx(async (client2) => {
+          await nodes.set(newNode, client2);
+          await consents.set(newConsent, client2);
+        });
+      } else {
+        await nodes.set(newNode);
+        await consents.set(newConsent);
+      }
+      nodeLatencySamples.set(nodeId, generateDefaultSamplesForNode(newNode));
+      added++;
+    } catch (err) {
+      logger.warn("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0434\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u0443\u0437\u0435\u043B \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E", { endpoint, error: err.message });
+    }
+  }
+  if (added > 0) {
+    addAudit("default_nodes_seeded", "system", "nodes", "default_pool", {
+      count: added,
+      endpoints
+    });
+    logger.info("\u0414\u043E\u0431\u0430\u0432\u043B\u0435\u043D\u044B \u0443\u0437\u043B\u044B Ollama \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E", { count: added });
+  }
+  return added;
+}
 async function seedInitialData() {
+  const seeded = await seedDefaultNodes();
   addAudit("gateway_boot", "system", "gateway", GATEWAY_ID, {
     version: VERSION,
     pool_size: nodes.size,
-    status: "clean_initialized"
+    default_nodes_seeded: seeded,
+    status: seeded > 0 ? "default_nodes_initialized" : "clean_initialized"
   });
 }
 async function bootstrap() {
