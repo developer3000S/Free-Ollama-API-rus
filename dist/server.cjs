@@ -1295,7 +1295,8 @@ var DEFAULT_OLLAMA_NODES = [
   "209.145.62.219",
   "190.156.123.17",
   "194.163.180.189",
-  "193.112.29.100"
+  "193.112.29.100",
+  "173.224.115.253"
 ];
 function resolveDefaultNodeEndpoints() {
   const raw = process.env.FOA_DEFAULT_NODES;
