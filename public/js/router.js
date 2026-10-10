@@ -15,7 +15,6 @@ const pages = {
   dashboard: { title: 'Dashboard', icon: '📊', renderName: 'renderDashboard' },
   monitor:   { title: 'Monitor', icon: '📈', renderName: 'renderMonitor' },
   nodes:     { title: 'Узлы', icon: '🖥️', renderName: 'renderNodes' },
-  consents:  { title: 'Согласия', icon: '✅', renderName: 'renderConsents' },
   blacklist: { title: 'Чёрный список', icon: '🚫', renderName: 'renderBlacklist' },
   discovery: { title: 'Discovery', icon: '🔍', renderName: 'renderDiscovery' },
   keys:      { title: 'API-ключи', icon: '🔑', renderName: 'renderKeys' },

@@ -533,19 +533,178 @@ function addAudit(event: string, actor: string, subject_type: string, subject_id
   );
 }
 
-// Инициализация чистого старта для FOA Gateway.
+// --- Узлы Ollama по умолчанию ----------------------------------------------
 //
-// Демо-узлы (RFC 5737 TEST-NET: 198.51.100.x / 203.0.113.x / 192.0.2.x),
-// демо-кандидаты discovery и их согласия из пула удалены — они были
-// физически недостижимы и вызывали в чате «fetch failed». Шлюз стартует с
-// пустым пулом; настоящие узлы регистрируются через POST /admin/nodes или
-// раздел «Обнаружение».
+// Список публичных Ollama-узлов, которые шлюз добавляет в пул при старте, если
+// пул пуст (в памяти и в PostgreSQL — повторный старт ничего не дублирует).
+// Переопределяется переменной окружения FOA_DEFAULT_NODES (список через запятую:
+// "ip:port", "http://ip:port" или "https://ip:port"). Пустое значение
+// («FOA_DEFAULT_NODES=») полностью отключает сидинг.
+const DEFAULT_OLLAMA_NODES: string[] = [
+  '84.46.254.156',
+  '37.81.72.225',
+  '51.83.68.224',
+  '185.252.234.190',
+  '223.166.61.215',
+  '62.16.190.89',
+  '82.156.119.114',
+  '43.136.169.150',
+  '103.78.96.125',
+  '144.123.164.190',
+  '57.128.252.36',
+  '38.247.186.106',
+  '51.222.46.203',
+  '81.0.249.47',
+  '159.195.53.125',
+  '89.58.29.165',
+  '209.145.62.219',
+  '190.156.123.17',
+  '194.163.180.189',
+  '193.112.29.100',
+];
+
+// Разбор FOA_DEFAULT_NODES / встроенного списка в нормализованные эндпоинты.
+function resolveDefaultNodeEndpoints(): string[] {
+  const raw = process.env.FOA_DEFAULT_NODES;
+  const source = raw === undefined ? DEFAULT_OLLAMA_NODES : String(raw);
+  const items = Array.isArray(source) ? source : String(source).split(',');
+  const seen = new Set<string>();
+  const endpoints: string[] = [];
+  for (const item of items) {
+    let token = String(item || '').trim();
+    if (!token) continue;
+    if (!/^https?:\/\//i.test(token)) token = `http://${token}`;
+    let url: URL;
+    try {
+      url = new URL(token);
+    } catch {
+      logger.warn('Некорректный узел по умолчанию — пропущен', { value: item });
+      continue;
+    }
+    if (!url.port) url.port = '11434'; // стандартный порт Ollama
+    const endpoint = `${url.protocol}//${url.host}`;
+    if (seen.has(endpoint)) continue;
+    seen.add(endpoint);
+    endpoints.push(endpoint);
+  }
+  return endpoints;
+}
+
+// Добавление узлов по умолчанию в пустой пул. Пишем через обычные записи
+// Store (write-through в PG при его наличии), поэтому на следующем старте
+// пул уже не пуст и повторного сидинга не происходит — даже при нескольких
+// репликах шлюза за nginx.
+async function seedDefaultNodes(): Promise<number> {
+  // Пул считается заполненным, если в нём есть хоть один узел (в кэше или в PG).
+  if (nodes.size > 0) return 0;
+  if (dbEnabled()) {
+    try {
+      const stored = await nodes.list();
+      if (stored.length > 0) return 0;
+    } catch (err: any) {
+      logger.warn('Не удалось проверить содержимое пула в PG — сидинг отменён', { error: err.message });
+      return 0;
+    }
+  }
+
+  const endpoints = resolveDefaultNodeEndpoints();
+  if (!endpoints.length) return 0;
+
+  const now = new Date().toISOString();
+  let added = 0;
+  for (const endpoint of endpoints) {
+    const ip = endpoint.replace(/^https?:\/\//i, '').split(':')[0];
+    const nodeId = `node_default_${ip.replace(/[^A-Za-z0-9]/g, '_')}`;
+    if (nodes.get(nodeId)) continue;
+
+    const insecureTls = endpoint.startsWith('https://');
+    const newNode: NodeItem = {
+      node_id: nodeId,
+      endpoint,
+      display_name: `Ollama ${ip}`,
+      owner_id: 'default@pool',
+      models: ['llama3:8b'],
+      max_concurrency: 4,
+      active_connections: 0,
+      latency_ms: 0,
+      error_rate: 0,
+      weight: 10,
+      status: 'healthy',
+      consent_status: 'verified',
+      routable: true,
+      created_at: now,
+      updated_at: now,
+      state: 'healthy',
+      active: 0,
+      ewma_latency_ms: 0,
+      effective_weight: 10,
+      country: 'US',
+      ip,
+      labels: ['default'],
+      // Публичные Ollama за NAT обычно отдают самоподписанный сертификат —
+      // сразу разрешаем TLS-fallback, чтобы health-check и чат не падали с
+      // DEPTH_ZERO_SELF_SIGNED_CERT.
+      insecure_tls: insecureTls,
+    };
+
+    const newConsent: ConsentItem = {
+      consent_id: `cst_${nodeId}`,
+      node_id: nodeId,
+      owner_id: newNode.owner_id,
+      status: 'active',
+      method: 'default_pool',
+      allowed_models: newNode.models,
+      max_concurrency: newNode.max_concurrency,
+      issued_at: now,
+      expires_at: new Date(Date.now() + 90 * 86400000).toISOString(),
+      version: 1,
+      history: [{ event: 'node_seeded_default', actor: 'system', created_at: now }],
+    };
+
+    try {
+      if (dbEnabled()) {
+        await tx(async (client) => {
+          await nodes.set(newNode, client);
+          await consents.set(newConsent, client);
+        });
+      } else {
+        await nodes.set(newNode);
+        await consents.set(newConsent);
+      }
+      nodeLatencySamples.set(nodeId, generateDefaultSamplesForNode(newNode));
+      added++;
+    } catch (err: any) {
+      logger.warn('Не удалось добавить узел по умолчанию', { endpoint, error: err.message });
+    }
+  }
+
+  if (added > 0) {
+    addAudit('default_nodes_seeded', 'system', 'nodes', 'default_pool', {
+      count: added,
+      endpoints,
+    });
+    logger.info('Добавлены узлы Ollama по умолчанию', { count: added });
+  }
+  return added;
+}
+
+// Инициализация старта для FOA Gateway.
+//
+// Демо-узлы (RFC 5737 TEST-NET: 198.51.100.x / 203.0.113.x / 192.0.2.x) и
+// демо-кандидаты discovery из пула удалены — они были физически недостижимы и
+// вызывали в чате «fetch failed». Вместо них пул пополняется реальными узлами
+// по умолчанию (см. DEFAULT_OLLAMA_NODES / FOA_DEFAULT_NODES); остальные узлы
+// регистрируются через POST /admin/nodes или раздел «Обнаружение».
 async function seedInitialData() {
-  // Аудит первой загрузки шлюза (без сидинга данных).
+  // Сидинг узлов по умолчанию выполняется только в пустой пул.
+  const seeded = await seedDefaultNodes();
+
+  // Аудит первой загрузки шлюза.
   addAudit('gateway_boot', 'system', 'gateway', GATEWAY_ID, {
     version: VERSION,
     pool_size: nodes.size,
-    status: 'clean_initialized',
+    default_nodes_seeded: seeded,
+    status: seeded > 0 ? 'default_nodes_initialized' : 'clean_initialized',
   });
 }
 
