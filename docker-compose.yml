@@ -1,6 +1,4 @@
 # Free Ollama API Gateway — Docker Compose Topology
-version: '3.8'
-
 services:
   gateway-common: &gateway-common
     build:
@@ -8,9 +6,7 @@ services:
       dockerfile: Dockerfile
     image: free-ollama-api-gateway:1.0.0
   restart: unless-stopped
-  env_file:
-    - path: .env
-      required: false
+  env_file: .env
   environment: &gateway-env
     PORT: "3000"
     NODE_ENV: "production"
@@ -31,7 +27,8 @@ services:
       condition: service_healthy
     redis:
       condition: service_healthy
-  networks: [foa]
+  networks:
+    - foa
 
   # -- Основные узлы шлюза (Node.js / Express Gateway) -------------------- #
   gateway-a:
@@ -55,6 +52,7 @@ services:
     image: postgres:16-alpine
     container_name: foa-postgres
     restart: unless-stopped
+    env_file: .env
     environment:
       POSTGRES_DB: foa
       POSTGRES_USER: foa
@@ -66,7 +64,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-    networks: [foa]
+    networks:
+    - foa
 
   # -- Кэширование и лимиты Redis ----------------------------------------- #
   redis:
@@ -81,7 +80,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-    networks: [foa]
+    networks:
+    - foa
 
   # -- Наблюдаемость (Prometheus) ----------------------------------------- #
   prometheus:
@@ -94,7 +94,8 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.retention.time=15d
-    networks: [foa]
+    networks:
+    - foa
 
   # -- Nginx TLS Ingress -------------------------------------------------- #
   nginx:
@@ -114,7 +115,8 @@ services:
     depends_on:
       - gateway-a
       - gateway-b
-    networks: [foa]
+    networks:
+    - foa
 
 networks:
   foa:
