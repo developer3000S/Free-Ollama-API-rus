@@ -1,11 +1,12 @@
 # Free Ollama API Gateway — Docker Compose Topology
-name: free-ollama-api-gateway
+version: '3.8'
 
-x-gateway-common: &gateway-common
-  build:
-    context: .
-    dockerfile: Dockerfile
-  image: free-ollama-api-gateway:1.0.0
+services:
+  gateway-common: &gateway-common
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: free-ollama-api-gateway:1.0.0
   restart: unless-stopped
   env_file:
     - path: .env

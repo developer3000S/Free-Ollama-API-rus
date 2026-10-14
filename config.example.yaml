@@ -38,7 +38,7 @@ security:
 
 limits:
   requests_per_minute_per_user: 60
-  concurrent_requests_per_user: 2
+  concurrent_requests_per_user: 5
   max_prompt_bytes: 1048576
   max_num_predict: 2048
   max_generation_seconds: 300
@@ -48,7 +48,7 @@ limits:
   max_request_bytes: 1048576
   max_messages: 200
   max_message_bytes: 262144
-  concurrent_stream_requests_per_user: 2
+  concurrent_stream_requests_per_user: 5
 
 health:
   liveness_interval_seconds: 15
