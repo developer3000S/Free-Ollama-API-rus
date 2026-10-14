@@ -33,7 +33,6 @@ services:
       condition: service_healthy
   networks: [foa]
 
-services:
   # -- Основные узлы шлюза (Node.js / Express Gateway) -------------------- #
   gateway-a:
     <<: *gateway-common
